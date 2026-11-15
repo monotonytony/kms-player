@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.so
+/player-next/kms-subd
+/player-next/kms-keys
+/player-next/kms-planes
+/player-next/kms-inject
+!libkmsshare.so
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime / local
+*.log
+*.srt
