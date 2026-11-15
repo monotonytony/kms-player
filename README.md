@@ -182,6 +182,8 @@ state and the pipeline position, not by looking at the screen.
 
 GNU General Public License v3.0 or later — see [LICENSE](LICENSE).
 
+Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
 In short: you may use, study, modify and redistribute this software, but if you
 distribute a modified version you must publish its source under the same license.
 Running a modified copy privately carries no obligation to publish.
