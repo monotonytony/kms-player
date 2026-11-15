@@ -1,0 +1,12 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
+# Test launcher: runs the player from /usr/local/src/player-next (kms-play-py,
+# kms-subd, kms-keys, kms-planes) and leaves the installed copies untouched.
+# Used to validate a change before promoting it with install.sh.
+D=/usr/local/src/player-next
+exec env LD_PRELOAD=/usr/local/lib/libkmsshare.so \
+         KMS_SHARE_SOCK="/tmp/kms-subd-$(id -u).sock" \
+         KMS_PLAY_SUBD=$D/kms-subd KMS_PLAY_KEYS=$D/kms-keys KMS_PLAY_PLANES=$D/kms-planes \
+         /usr/bin/python3 $D/kms-play-py "$@"

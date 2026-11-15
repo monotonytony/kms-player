@@ -173,10 +173,29 @@ These cost real debugging time; do not rediscover them.
 
 ## Status
 
-Under active development. The three-plane path (video + subtitles + OSD) and the full
-keyboard map are being implemented; see the commit history and `docs/` for the current
-state. Measurements, not impressions: every feature is validated by reading the DRM
-state and the pipeline position, not by looking at the screen.
+Working and installed on the board. The three-plane path, the full keyboard map, the
+cumulative seek ladder and the two independent volumes are implemented and measured.
+
+Verified from the hardware, not from impressions:
+
+| What | Measurement |
+|---|---|
+| Video plane | `plane[57] format=NV15 allocated by = vqueue:src` — decoder buffer, zero copy |
+| Overlay planes | `plane[69]` subtitles, `plane[75]` OSD, both `AR24`, no overlap with the glyph area |
+| Keypress → visible change | 64-131 ms, typical 65-85 ms |
+| CPU, 4K 10-bit, subtitles + OSD active | 0.19 core |
+| CPU, 1080p 10-bit | 0.08 core |
+| ESC → original VT | 352 ms (dominated by `chvt`) |
+
+The cumulative seek scale is checked by `src/test-seek-scale.py`, which injects real
+uinput key presses and asserts the progression 0.5 / 1 / 10 / 30 / 60 / 120 / 240 s,
+the reset after one second of inactivity and the reset on a direction change.
+
+**Not verified by a machine**: how the OSD and the subtitles actually look. Nobody in
+this pipeline sees the screen; that judgement belongs to a human sitting in front of it.
+
+Detailed component documentation, build instructions and pitfalls live in
+[`src/README.md`](src/README.md).
 
 ## License
 

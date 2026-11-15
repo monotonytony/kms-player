@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
+"""kms-play-py - full screen KMS player with three hardware planes.
+
+============================================================================
+ARCHITECTURE
+============================================================================
+The display is composed by the Rockchip VOP from three DRM planes, bottom to
+top:
+
+    video plane   NV15 (10-bit) or NV12 (8-bit), fed by kmssink directly from
+                  the decoder's DMA-BUFs: zero copy, no CPU conversion.
+    "sub" plane   ARGB8888 subtitles, pre-multiplied alpha, blended by the VOP.
+    "osd" plane   ARGB8888 OSD (progress bar, volume, track labels).
+
+Only the two text planes are ever written by the CPU, and they are small bands
+(a few hundred rows), so the video never travels through system memory.
+
+Process layout, and why:
+
+    kms-play-py (this file, unprivileged user)
+      |- kms-subd   owns the DRM master, drives the two ARGB planes, serves its
+      |             DRM fd over a unix socket with SCM_RIGHTS.
+      |- kms-keys   reads every /dev/input/event*, prints "key NAME 0|1|2".
+      |- gst pipeline (playbin -> kmssink), a child of this process.
+
+The player itself has no DRM master: libkmsshare.so (LD_PRELOAD, set by the
+kms-play wrapper) intercepts its open("/dev/dri/card*") and hands it a copy of
+kms-subd's fd. That is also why the VT switch must happen BEFORE drmSetMaster
+(see switch_vt): the VT that currently owns the console keeps the master
+locked, and the ioctl fails with EACCES.
+
+============================================================================
+KEYBOARD MODEL
+============================================================================
+kms-keys emits a press (1), a release (0) and, while a key is held, repeats
+(2) that it generates itself. This file treats press and repeat as "taps" for
+the seek keys, so holding an arrow walks up the seek scale exactly like
+pressing it repeatedly. All discrete actions (A, S, SPACE, ...) only react to
+value 1, so a held key cannot toggle something in a loop.
+
+============================================================================
+WHAT THIS FILE IS *NOT*
+============================================================================
+It does not see the screen either. Every visual claim has to be backed by
+~/.cache/kms-play/last.log or by kms-planes output.
+"""
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gst, GLib, Pango, PangoCairo  # noqa: E402
+import cairo  # noqa: E402
+
+Gst.init(None)
+
+UID = os.getuid()
+CACHE_DIR = os.path.expanduser("~/.cache/kms-play")
+os.makedirs(CACHE_DIR, exist_ok=True)
+LOG_PATH = os.path.join(CACHE_DIR, "last.log")
+
+# Helper binaries. Overridable so that a build in /usr/local/src/player-next
+# can be tested without touching the installed copies (kms-play-next does it).
+SUBDAEMON = os.environ.get("KMS_PLAY_SUBD", "/usr/local/bin/kms-subd")
+KEYS_DAEMON = os.environ.get("KMS_PLAY_KEYS", "/usr/local/bin/kms-keys")
+PLANES_TOOL = os.environ.get("KMS_PLAY_PLANES", "/usr/local/bin/kms-planes")
+
+SOCK_PATH = "/tmp/kms-subd-%d.sock" % UID
+RAW_SUB = "/dev/shm/kms-sub-%d.raw" % UID      # tmpfs: no eMMC wear, no disk I/O
+RAW_OSD = "/dev/shm/kms-osd-%d.raw" % UID
+
+# Children must NOT inherit LD_PRELOAD/KMS_SHARE_SOCK: libkmsshare would make
+# them try to steal the master fd, and kms-subd is the legitimate owner.
+CHILD_ENV = {k: v for k, v in os.environ.items()
+             if k not in ("LD_PRELOAD", "KMS_SHARE_SOCK")}
+
+# ---------------------------------------------------------------------------
+# Seek scale
+# ---------------------------------------------------------------------------
+# Cumulative scale on successive presses in the SAME direction, as specified:
+#   1st press 0.5 s, 2nd 1 s, 3rd 10 s, 4th 30 s, 5th 60 s, 6th 120 s,
+#   7th and beyond 240 s (clamped to the last entry).
+# Each accepted press jumps exactly the current rung, then advances the rung.
+# The index returns to the first rung after SEEK_RESET_AFTER without a press,
+# or as soon as the direction changes (LEFT after RIGHT).
+SEEK_SCALE = (0.5, 1.0, 10.0, 30.0, 60.0, 120.0, 240.0)
+
+# Minimum delay between two accepted steps. Kernel/hardware repeat can be as
+# fast as 30-40 ms; without this, one held key would consume two rungs per
+# event pair. 120 ms also means a held arrow advances ~8 rungs/s, which is
+# fast but still controllable.
+SEEK_DEBOUNCE = 0.120
+
+# Idle time after which the scale restarts at 0.5 s.
+SEEK_RESET_AFTER = 1.0
+
+# ---------------------------------------------------------------------------
+# Software gain
+# ---------------------------------------------------------------------------
+# Arrow Up/Down drive the pipeline's "volume" element, i.e. a software gain,
+# independent from the PipeWire sink volume used by the multimedia keys.
+# It starts at 85 % instead of 100 % on purpose: the ceiling is 100 %, so
+# starting saturated would make the first Up presses silent no-ops. 15 % of
+# headroom leaves room to demonstrate both directions.
+SOFTWARE_GAIN_START = 0.85
+SOFTWARE_GAIN_MAX = 1.0
+SOFTWARE_GAIN_STEP = 0.05       # 5 % per press
+
+# Truncate then reopen in append mode: kms-subd also writes to this descriptor
+# (stderr), and append avoids NUL holes if the file is truncated mid-flight.
+open(LOG_PATH, "w").close()
+log_file = open(LOG_PATH, "a", buffering=1)
+
+
+def monotonic():
+    return time.monotonic()
+
+
+def log(*args):
+    print("[%.3f]" % monotonic(), *args, file=log_file)
+
+
+# Last resort VT restore: die() can be called before the Player object exists
+# (bad arguments, missing file), so the VT number lives at module level.
+ORIGINAL_VT = [None]
+
+
+def die(message, code=1):
+    log("ERROR:", message)
+    if ORIGINAL_VT[0]:
+        subprocess.run(["sudo", "-n", "/usr/bin/chvt", ORIGINAL_VT[0]], check=False)
+    sys.exit(code)
+
+
+# Displayed on screen, therefore intentionally French: these are user-facing
+# labels, the only place where French is allowed in this project.
+LANGUAGE_NAMES = {
+    "fre": "Français", "fra": "Français", "eng": "Anglais", "en": "Anglais",
+    "spa": "Espagnol", "ger": "Allemand", "deu": "Allemand", "ita": "Italien",
+    "jpn": "Japonais", "chi": "Chinois", "zho": "Chinois", "kor": "Coréen",
+    "por": "Portugais", "rus": "Russe", "ara": "Arabe", "nld": "Néerlandais",
+    "dut": "Néerlandais", "pol": "Polonais", "swe": "Suédois", "dan": "Danois",
+    "nor": "Norvégien", "fin": "Finnois", "tur": "Turc", "hin": "Hindi",
+    "und": "Indéterminé",
+}
+
+
+def language_name(tags):
+    """Return (display name, raw title) for a stream's tags.
+
+    The name is localized for the screen; the title is passed through so the
+    caller can build "Français — VFF". Unknown language codes are shown as the
+    upper-cased tag rather than being hidden."""
+    lang = (tags.get("language") or "").lower()
+    title = tags.get("title") or ""
+    return LANGUAGE_NAMES.get(lang, lang.upper() if lang else "Inconnu"), title
+
+
+def short_title(title):
+    """Strip the technical bitrate suffix (" @ 640 kbps") from a track title.
+
+    ffprobe often reports titles such as "VFF @ 640 kbps"; the bitrate is
+    noise on screen and makes the OSD label longer than the bar."""
+    t = re.sub(r"\s*@\s*[\d.,]+\s*kbps\s*$", "", (title or "").strip(), flags=re.I)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def track_label(name, title):
+    """Build the audio label: "Français — VFF" when a distinct title exists."""
+    t = short_title(title)
+    if t and t.lower() != name.lower():
+        return "%s — %s" % (name, t)
+    return name
+
+
+def hms(seconds):
+    """Format a duration as m:ss or h:mm:ss."""
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
+def format_step(delta):
+    """Format a seek step with its sign, French decimal comma on screen.
+
+    The sign matters: "−0,5 s" and "+0,5 s" are different actions and the OSD
+    is the only feedback the user gets."""
+    sign = "+" if delta >= 0 else "−"
+    value = abs(delta)
+    if value >= 1.0:
+        return "%s%d s" % (sign, int(value))
+    return ("%s%.1f s" % (sign, value)).replace(".", ",")
+
+
+# ---------------------------------------------------------------------------
+# Container probing
+# ---------------------------------------------------------------------------
+
+def probe_media(path):
+    """List audio and text subtitle streams of the container.
+
+    Only text codecs are kept: image-based subtitles (PGS/DVD) cannot be
+    rendered by Pango and would need a bitmap path we do not implement.
+    Returns (audio_streams, subtitle_streams), each a list of dicts."""
+    proc = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                           "stream=index,codec_type,codec_name:stream_tags=language,title",
+                           "-of", "json", path], capture_output=True, text=True)
+    try:
+        streams = json.loads(proc.stdout or "{}").get("streams", [])
+    except Exception as exc:
+        log("ffprobe output unreadable:", exc)
+        return [], []
+    audio, subs = [], []
+    for stream in streams:
+        if stream.get("codec_type") == "audio":
+            audio.append(stream)
+        elif stream.get("codec_type") == "subtitle" and stream.get("codec_name") in (
+                "subrip", "ass", "ssa", "mov_text", "webvtt"):
+            subs.append(stream)
+    return audio, subs
+
+
+def screen_size():
+    """Scanout resolution, taken from the connector's preferred mode.
+
+    kmssink picks the preferred mode too, so this matches what the VOP will
+    actually display. Falls back to 1920x1080 if no HDMI modes file is found
+    (headless testing)."""
+    import glob
+    for path in sorted(glob.glob("/sys/class/drm/card*-HDMI-A-*/modes")):
+        try:
+            with open(path) as handle:
+                mode = handle.readline().strip()
+        except OSError:
+            continue
+        if "x" in mode:
+            width, height = mode.split("x")[:2]
+            return int(width), int(height)
+    return 1920, 1080
+
+
+def pick_video_plane():
+    """Return the DRM plane id able to scan NV15, lowest zpos first.
+
+    It must be the lowest plane: the ARGB overlays have to sit above it.
+    kms-planes --short reports nv15=1 for every plane that accepts 10-bit
+    video; among those we keep the one with the smallest zpos."""
+    try:
+        out = subprocess.run([PLANES_TOOL, "--short"], capture_output=True, text=True,
+                             timeout=5, env=CHILD_ENV).stdout
+    except Exception:
+        out = ""
+    best, best_zpos = 0, None
+    for line in out.splitlines():
+        if "nv15=1" not in line:
+            continue
+        match = re.search(r"plane (\d+) zpos=(\d+)", line)
+        if match:
+            plane_id, zpos = int(match.group(1)), int(match.group(2))
+            if best_zpos is None or zpos < best_zpos:
+                best, best_zpos = plane_id, zpos
+    if best:
+        return best
+    # Legacy fallback: an older helper that printed one line per plane.
+    try:
+        out = subprocess.run(["/usr/local/bin/drm-plane-formats"], capture_output=True,
+                             text=True, timeout=5, env=CHILD_ENV).stdout
+    except Exception:
+        return 0
+    for line in out.splitlines():
+        if "NV15" in line:
+            match = re.search(r"plan (\d+)", line)
+            if match:
+                return int(match.group(1))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subtitles
+# ---------------------------------------------------------------------------
+
+CUE_RE = re.compile(
+    r"(\d+)\s*\n(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def to_seconds(hours, minutes, seconds, millis):
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+
+
+def parse_srt(path):
+    """Parse an SRT file into a sorted list of (start, end, text).
+
+    Formatting tags are stripped: Pango would render "<i>" literally. Cues are
+    sorted because some muxers emit them out of order."""
+    text = open(path, "r", encoding="utf-8", errors="replace").read().replace("\r", "")
+    cues = []
+    for block in re.split(r"\n\s*\n", text):
+        match = CUE_RE.search(block)
+        if not match:
+            continue
+        start = to_seconds(match.group(2), match.group(3), match.group(4), match.group(5))
+        end = to_seconds(match.group(6), match.group(7), match.group(8), match.group(9))
+        body = TAG_RE.sub("", block[match.end():]).strip()
+        if body:
+            cues.append((start, end, body))
+    cues.sort()
+    return cues
+
+
+def extract_srt(media_path, stream_index):
+    """Extract one text subtitle stream to a cached .srt file.
+
+    The cache key includes path, size, mtime and stream index, so editing or
+    replacing the file invalidates it. Extraction runs ffmpeg synchronously in
+    a worker thread (callers use a thread), never on the GLib loop."""
+    stat = os.stat(media_path)
+    key = hashlib.md5(("%s|%d|%d|%s" % (media_path, stat.st_size,
+                                       int(stat.st_mtime), stream_index)).encode()).hexdigest()[:16]
+    srt_path = os.path.join(CACHE_DIR, key + ".srt")
+    if os.path.exists(srt_path) and os.path.getsize(srt_path) > 0:
+        return srt_path
+    try:
+        subprocess.run(["notify-send", "-t", "4000", "kms-play",
+                        "Préparation des sous-titres…"], check=False, timeout=3)
+    except Exception:
+        pass
+    tmp_path = srt_path + ".tmp"
+    started = monotonic()
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                             "-i", media_path, "-map", "0:%s" % stream_index,
+                             "-f", "srt", tmp_path], check=False)
+    if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+        os.replace(tmp_path, srt_path)
+        log("srt extraction for stream %s in %.0f ms" % (stream_index,
+                                                         (monotonic() - started) * 1000))
+    else:
+        log("srt extraction incomplete (code %s)" % result.returncode)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    if os.path.exists(srt_path) and os.path.getsize(srt_path) > 0:
+        return srt_path
+    return None
+
+
+class Subtitles:
+    """Render subtitle cues into the ARGB "sub" plane.
+
+    The surface is a full-width band of fixed height at the bottom of the
+    screen, fully transparent except for the glyphs. Only the band is updated,
+    so a cue change costs one SetPlane over ~220 rows instead of a full screen.
+    """
+
+    def __init__(self, subdaemon, width, screen_height, band_height=220):
+        self.subdaemon = subdaemon
+        self.width = width
+        self.band_height = band_height
+        self.y = screen_height - band_height
+        self.cues = []
+        self.current = None
+        self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width, self.band_height)
+        self.layout = PangoCairo.create_layout(cairo.Context(self.surface))
+        # Bold Sans 26 with a 60 px margin is readable at 1080p and 4K.
+        self.layout.set_font_description(Pango.FontDescription("Sans Bold 26"))
+        self.layout.set_alignment(Pango.Alignment.CENTER)
+        self.layout.set_width((self.width - 120) * Pango.SCALE)
+        self.layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+
+    def _draw(self, text):
+        """Paint one cue: clear the band, draw a black outline, then the text.
+
+        The outline is six offset copies of the same layout (cheap and good
+        enough); it keeps subtitles readable over bright scenes without a
+        background box. OPERATOR_SOURCE is used only for the clear, so the rest
+        of the band keeps real alpha=0."""
+        started = monotonic()
+        ctx = cairo.Context(self.surface)
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        self.layout.set_text(text, -1)
+        x = 60
+        y = 8                       # top of the band: leaves room for the OSD
+        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (3, 3), (-3, -3)):
+            ctx.move_to(x + dx, y + dy)
+            ctx.set_source_rgba(0, 0, 0, 0.95)
+            PangoCairo.show_layout(ctx, self.layout)
+        ctx.move_to(x, y)
+        ctx.set_source_rgba(1, 1, 1, 1)
+        PangoCairo.show_layout(ctx, self.layout)
+
+        self.surface.flush()
+        with open(RAW_SUB, "wb") as handle:
+            handle.write(bytes(self.surface.get_data()))
+        self.subdaemon.stdin.write("sub cue %d %d %d %d %s\n"
+                                   % (0, self.y, self.width, self.band_height, RAW_SUB))
+        self.subdaemon.stdin.flush()
+        log("cue:", text[:60].replace("\n", " "),
+            "| render %.1f ms" % ((monotonic() - started) * 1000))
+
+    def _clear(self):
+        self.subdaemon.stdin.write("sub clear\n")
+        self.subdaemon.stdin.flush()
+
+    def update(self, position_s):
+        """Show the cue covering position_s, or clear the plane.
+
+        Called at 12.5 Hz; the expensive path only runs when the active cue
+        actually changes (self.current), so static dialogue costs nothing."""
+        if not self.cues:
+            return
+        active = None
+        for start, end, text in self.cues:
+            if start <= position_s < end:
+                active = text
+                break
+            if start > position_s:
+                break
+        if active == self.current:
+            return
+        self.current = active
+        if active:
+            self._draw(active)
+        else:
+            log("clear")
+            self._clear()
+
+
+# ---------------------------------------------------------------------------
+# OSD
+# ---------------------------------------------------------------------------
+
+class OnScreenDisplay:
+    """Discrete on-screen display on its own ARGB plane.
+
+    A single thin band at the bottom of the screen (default 76 px) containing:
+      - an optional progress bar (seek position, or volume level),
+      - a left label, e.g. "+10 s", "Pause", "Sous-titres : Français",
+      - an optional right label, e.g. "12:34 / 48:45".
+
+    It is refreshed at most 10 times per second (see show()): a faster rate
+    would burn CPU on cairo and SetPlane for no visible benefit.
+    """
+
+    def __init__(self, subdaemon, width, screen_height, band_height=None):
+        self.subdaemon = subdaemon
+        self.width = width
+        self.band_height = band_height or int(os.environ.get("KMS_OSD_HEIGHT", "76"))
+        self.y = screen_height - self.band_height
+        self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width, self.band_height)
+        self.ctx = cairo.Context(self.surface)
+        self.layout = PangoCairo.create_layout(self.ctx)
+        self.layout.set_font_description(Pango.FontDescription("Sans 14"))
+        self.layout.set_width(-1)
+        self.state = {}
+        self.visible = False
+        self.persistent = False
+        self.hide_at = 0.0
+        self.last_render = 0.0
+        self.pending = False
+        self.enabled = True         # toggled by ENTER
+
+    def _render(self):
+        """Draw the current state and push it to the plane. Returns draw ms."""
+        started = monotonic()
+        ctx = self.ctx
+        width, height = self.width, self.band_height
+        state = self.state
+        fraction = state.get("fraction")
+        margin, bar_y, bar_h = 24, 14, 5
+
+        # 55 % black: readable over any scene, still lets the video through.
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0.55)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+
+        if fraction is not None:
+            fraction = max(0.0, min(1.0, float(fraction)))
+            ctx.set_source_rgba(1, 1, 1, 0.20)
+            ctx.rectangle(margin, bar_y, width - 2 * margin, bar_h)
+            ctx.fill()
+            if fraction > 0:
+                ctx.set_source_rgba(1, 1, 1, 0.90)
+                ctx.rectangle(margin, bar_y, (width - 2 * margin) * fraction, bar_h)
+                ctx.fill()
+
+        ctx.set_source_rgba(1, 1, 1, 0.92)
+        ctx.move_to(margin, 32)
+        self.layout.set_text(state.get("label", "") or "", -1)
+        PangoCairo.show_layout(ctx, self.layout)
+
+        right = state.get("right", "") or ""
+        if right:
+            self.layout.set_text(right, -1)
+            _, extents = self.layout.get_pixel_extents()
+            ctx.move_to(width - margin - extents.width, 32)
+            PangoCairo.show_layout(ctx, self.layout)
+
+        self.surface.flush()
+        with open(RAW_OSD, "wb") as handle:
+            handle.write(bytes(self.surface.get_data()))
+        self.subdaemon.stdin.write("osd cue %d %d %d %d %s\n"
+                                   % (0, self.y, self.width, self.band_height, RAW_OSD))
+        self.subdaemon.stdin.flush()
+        self.visible = True
+        self.last_render = monotonic()
+        return (self.last_render - started) * 1000
+
+    def show(self, label="", fraction=None, right="", duration=1.2, persistent=False):
+        """Display a message for `duration` seconds (or until replaced).
+
+        Rate limited to ~10 Hz: if a render happened less than 95 ms ago, the
+        request is only remembered (self.pending) and tick() renders it later.
+        This keeps fast key bursts from flooding the DRM plane."""
+        if not self.enabled:
+            return
+        self.state = {"label": label, "fraction": fraction, "right": right}
+        self.persistent = persistent
+        self.hide_at = monotonic() + duration
+        if monotonic() - self.last_render < 0.095:
+            self.pending = True
+            return
+        elapsed_ms = self._render()
+        log("osd:", label or "-", right, "| render %.1f ms" % elapsed_ms)
+
+    def toggle(self):
+        self.enabled = not self.enabled
+        if not self.enabled:
+            self.hide()
+        return self.enabled
+
+    def hide(self):
+        self.pending = False
+        if not self.visible:
+            return
+        self.visible = False
+        self.state = {}
+        self.subdaemon.stdin.write("osd clear\n")
+        self.subdaemon.stdin.flush()
+        log("osd: hidden")
+
+    def tick(self, now):
+        """Housekeeping called at 10 Hz from the GLib loop."""
+        if self.pending:
+            self.pending = False
+            if self.state and (self.persistent or now < self.hide_at):
+                self._render()
+        if self.visible and not self.persistent and now >= self.hide_at:
+            self.hide()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Player
+# ---------------------------------------------------------------------------
+
+class Player:
+    def __init__(self, media_path):
+        self.media_path = media_path
+        self.width, self.height = screen_size()
+        log("screen:", self.width, "x", self.height)
+
+        self.audio, self.subs = probe_media(media_path)
+        log("audio streams:", [(s["index"], language_name(s.get("tags") or {})[0])
+                               for s in self.audio])
+        log("subtitle streams:", [(s["index"], (s.get("tags") or {}).get("title", ""),
+                                   (s.get("tags") or {}).get("language", ""))
+                                  for s in self.subs])
+
+        self.video_plane = pick_video_plane()
+        if not self.video_plane:
+            die("no NV15-capable DRM plane")
+        log("video plane:", self.video_plane)
+
+        # Default subtitle track: the first one whose title does not contain
+        # "forced" (forced tracks only carry signs and foreign dialogue).
+        self.sub_index = 0
+        for index, stream in enumerate(self.subs):
+            title = ((stream.get("tags") or {}).get("title") or "").lower()
+            if "forced" not in title:
+                self.sub_index = index
+                break
+        self.subtitles_enabled = bool(self.subs)
+
+        self.subdaemon = None
+        self.subtitles = None
+        self.osd = None
+        self.pipeline = None
+        self.main_loop = GLib.MainLoop()
+        self.finished = False
+        self.inhibit_cookie = None
+        self.previous_vt = None
+        self.gain = SOFTWARE_GAIN_START
+        self.volume_element = None
+        self.duration = None
+        self.target_position = 0.0
+        self.target_set_at = 0.0
+        self.paused = False
+
+        # Seek scale state. seek_direction is 0 while no arrow has been used.
+        self.seek_direction = 0
+        self.seek_index = 0
+        self.seek_last_at = 0.0
+        self.keyboard = None
+
+    # -- infrastructure ----------------------------------------------------
+
+    def switch_vt(self):
+        """Move to a free VT before anyone calls drmSetMaster.
+
+        The VT that owns the console holds the DRM master; without switching
+        away, drmSetMaster returns EACCES. The previous VT is remembered so it
+        can be restored on exit. sudo is restricted to /usr/bin/chvt by
+        /etc/sudoers.d/kms-play - nothing else is allowed there."""
+        active = subprocess.run(["cat", "/sys/class/tty/tty0/active"],
+                                capture_output=True, text=True).stdout.strip()
+        self.previous_vt = active.replace("tty", "") or "2"
+        ORIGINAL_VT[0] = self.previous_vt
+        target = "4" if self.previous_vt == "3" else "3"
+        subprocess.run(["sudo", "-n", "/usr/bin/chvt", target], check=False)
+        for _ in range(25):
+            if open("/sys/class/tty/tty0/active").read().strip() == "tty" + target:
+                break
+            time.sleep(0.2)
+        time.sleep(0.5)
+        log("active VT:", open("/sys/class/tty/tty0/active").read().strip())
+
+    def start_subdaemon(self):
+        """Start kms-subd and wait for its socket.
+
+        Any leftover daemon of the same user is killed first: it may still hold
+        the DRM master from a previous crash, which would block this one."""
+        subprocess.run(["pkill", "-9", "-x", "kms-subd"], check=False)
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+        self.subdaemon = subprocess.Popen([SUBDAEMON, SOCK_PATH, str(self.video_plane)],
+                                          stdin=subprocess.PIPE, stderr=log_file, text=True,
+                                          env=CHILD_ENV, bufsize=1)
+        for _ in range(100):
+            if os.path.exists(SOCK_PATH):
+                break
+            time.sleep(0.05)
+        if not os.path.exists(SOCK_PATH):
+            die("kms-subd did not start")
+        self.subtitles = Subtitles(self.subdaemon, self.width, self.height)
+        self.osd = OnScreenDisplay(self.subdaemon, self.width, self.height)
+
+    def inhibit_session(self):
+        """Ask GNOME to inhibit suspend/idle for the duration of the film.
+
+        Purely best effort: the player works without a session bus. The cookie
+        must be released in release_inhibit(), otherwise the inhibition would
+        leak until logout."""
+        try:
+            from gi.repository import Gio
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            result = bus.call_sync("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                                   "org.gnome.SessionManager", "Inhibit",
+                                   GLib.Variant("(susu)", ("kms-play", 0, "lecture video", 12)),
+                                   GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None)
+            self.inhibit_cookie = result.unpack()[0]
+            log("session inhibition set, cookie:", self.inhibit_cookie)
+        except Exception as exc:
+            log("no GNOME session inhibition:", exc)
+
+    def release_inhibit(self):
+        if not self.inhibit_cookie:
+            return
+        try:
+            from gi.repository import Gio
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bus.call_sync("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                          "org.gnome.SessionManager", "Uninhibit",
+                          GLib.Variant("(u)", (self.inhibit_cookie,)), None,
+                          Gio.DBusCallFlags.NONE, 2000, None)
+        except Exception:
+            pass
+
+    # -- pipeline ----------------------------------------------------------
+
+    def build_pipeline(self):
+        """Build playbin with kmssink on the video plane and a gain element.
+
+        flags: VIDEO | AUDIO only. TEXT is deliberately cleared because
+        playbin would try to render subtitles itself through a text sink; this
+        player draws them on its own plane instead.
+
+        audio-sink: the "volume" element exposes a software gain (0..10 in
+        GStreamer units) in front of the real sink; we drive it 0..1."""
+        pipeline = Gst.ElementFactory.make("playbin", "player")
+        if not pipeline:
+            die("playbin unavailable")
+        pipeline.set_property("uri", Gst.filename_to_uri(self.media_path))
+        # GST_PLAY_FLAG_VIDEO = 1, GST_PLAY_FLAG_AUDIO = 2, GST_PLAY_FLAG_TEXT = 4
+        pipeline.set_property("flags", 0x1 | 0x2)
+        video_sink = Gst.parse_bin_from_description(
+            "kmssink plane-id=%d" % self.video_plane, True)
+        pipeline.set_property("video-sink", video_sink)
+        audio_description = "volume name=gain ! audioconvert ! audioresample ! autoaudiosink"
+        audio_bin = Gst.parse_bin_from_description(audio_description, True)
+        pipeline.set_property("audio-sink", audio_bin)
+        self.volume_element = audio_bin.get_by_name("gain")
+        self.volume_element.set_property("volume", self.gain)
+        log("software gain at start: %d %%" % round(self.gain * 100))
+
+        # Caps probes: this is the only reliable proof that the decoder output
+        # reaches kmssink as DMABuf memory (zero copy) and in which format.
+        pad = video_sink.get_static_pad("sink")
+        pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_caps)
+        audio_pad = audio_bin.get_static_pad("sink")
+        audio_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_audio_caps)
+
+        log("pipeline: playbin uri=%s flags=video+audio video-sink=kmssink plane-id=%d audio=%s"
+            % (self.media_path, self.video_plane, audio_description))
+        self.pipeline = pipeline
+
+    def _on_video_caps(self, pad, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            caps = event.parse_caps()
+            if caps and caps.get_size():
+                structure = caps.get_structure(0)
+                fmt = structure.get_value("format") if structure.has_field("format") else "?"
+                memory = "DMABuf" if "memory:DMABuf" in caps.to_string() else "system"
+                if getattr(self, "_last_video_caps", None) != (fmt, memory):
+                    self._last_video_caps = (fmt, memory)
+                    log("video caps:", structure.get_name(), "format=" + str(fmt),
+                        "memory=" + memory)
+        return Gst.PadProbeReturn.OK
+
+    def _on_audio_caps(self, pad, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            caps = event.parse_caps()
+            if caps and caps.get_size():
+                structure = caps.get_structure(0)
+                log("audio caps:", structure.get_name(),
+                    "rate=" + str(structure.get_value("rate")
+                                  if structure.has_field("rate") else "?"))
+        return Gst.PadProbeReturn.OK
+
+    # -- seek / volume -----------------------------------------------------
+
+    def position(self):
+        """Current playback position in seconds.
+
+        Right after a seek the pipeline still reports the old position for a
+        moment; during that window the requested target is returned instead so
+        that successive seeks accumulate exactly on the scale."""
+        if self.target_position and monotonic() - self.target_set_at < 0.8:
+            return self.target_position
+        ok, pos = self.pipeline.query_position(Gst.Format.TIME)
+        return pos / Gst.SECOND if ok and pos >= 0 else self.target_position
+
+    def duration_s(self):
+        if self.duration:
+            return self.duration
+        ok, duration = self.pipeline.query_duration(Gst.Format.TIME)
+        if ok and duration > 0:
+            self.duration = duration / Gst.SECOND
+        return self.duration
+
+    def seek_step(self, direction):
+        """Return the signed step to apply, or None if the press is debounced.
+
+        THE SCALE (validated by Thony, 2026-11-15), not a hold acceleration:
+          - each accepted press jumps the CURRENT rung and then advances one
+            rung: 0.5, 1, 10, 30, 60, 120, 240 s, clamped at 240 s;
+          - the index restarts at 0.5 s after SEEK_RESET_AFTER without a press;
+          - it restarts at 0.5 s as soon as the direction flips;
+          - press and autorepeat are both "presses": a held arrow walks the
+            scale, exactly like tapping it;
+          - SEEK_DEBOUNCE prevents one physical press (press event followed by
+            fast repeats) from consuming two rungs.
+
+        The direction is tracked here, so a change of direction is detected
+        even if the other key's release was lost."""
+        now = monotonic()
+        if direction != self.seek_direction:
+            self.seek_direction = direction
+            self.seek_index = 0
+            self.seek_last_at = 0.0
+        elif now - self.seek_last_at > SEEK_RESET_AFTER:
+            # Idle: back to the smallest step, silently.
+            self.seek_index = 0
+        if self.seek_last_at and now - self.seek_last_at < SEEK_DEBOUNCE:
+            log("seek: debounced (%.0f ms)" % ((now - self.seek_last_at) * 1000))
+            return None
+        rung = self.seek_index
+        step = SEEK_SCALE[rung]
+        self.seek_index = min(rung + 1, len(SEEK_SCALE) - 1)
+        self.seek_last_at = now
+        log("seek: rung %d/%d = %.1f s" % (rung + 1, len(SEEK_SCALE), step))
+        return direction * step
+
+    def seek(self, delta, origin="key"):
+        """Jump `delta` seconds from the current position.
+
+        The OSD is updated BEFORE the pipeline seek so feedback never waits for
+        the decoder. The target is clamped to [0, duration - 0.25 s]: seeking
+        to the very end would raise EOS and stop playback."""
+        base = self.position()
+        target = base + delta
+        duration = self.duration_s()
+        if duration:
+            target = min(target, max(0.0, duration - 0.25))
+        target = max(0.0, target)
+        self.target_position = target
+        self.target_set_at = monotonic()
+        self.show_seek_osd(delta)
+        started = monotonic()
+        ok = self.pipeline.seek_simple(Gst.Format.TIME,
+                                       Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                                       int(target * Gst.SECOND))
+        log("seek %s %.1fs -> %s (%.1f ms, %s)" % (origin, delta, hms(target),
+                                                    (monotonic() - started) * 1000,
+                                                    "ok" if ok else "refused"))
+
+    def show_seek_osd(self, step=None):
+        """Draw the progress bar plus the signed step (or the pause state)."""
+        position = self.position()
+        duration = self.duration_s() or 0
+        fraction = (position / duration) if duration else 0.0
+        if self.paused:
+            label = "Pause"
+        else:
+            label = format_step(step) if step else ""
+        self.osd.show(label=label,
+                      fraction=fraction,
+                      right=("%s / %s" % (hms(position), hms(duration))) if duration else hms(position),
+                      duration=3600 if self.paused else 1.2,
+                      persistent=self.paused)
+
+    def software_volume(self, delta_percent):
+        """Arrow Up/Down: software gain of the player, not the sink volume.
+
+        Starts at SOFTWARE_GAIN_START (85 %) so both arrows have headroom."""
+        self.gain = max(0.0, min(SOFTWARE_GAIN_MAX, self.gain + delta_percent / 100.0))
+        self.volume_element.set_property("volume", self.gain)
+        percent = int(round(self.gain * 100))
+        log("software volume:", percent, "%")
+        self.osd.show(label="Volume (lecteur)", fraction=self.gain,
+                      right="%d %%" % percent)
+
+    def system_volume(self, delta_percent, mute=False):
+        """Multimedia keys: PipeWire sink volume, shared with the rest of the
+        desktop. wpctl expects "5%+" / "5%-": the sign follows the number."""
+        env = dict(CHILD_ENV)
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % UID)
+        command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                   "%d%%%s" % (abs(delta_percent), "+" if delta_percent >= 0 else "-")]
+        if mute:
+            command = ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]
+        result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=3)
+        state = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                               capture_output=True, text=True, env=env, timeout=3).stdout.strip()
+        match = re.search(r"([0-9.]+)", state)
+        fraction = float(match.group(1)) if match else 0.0
+        muted = "MUTED" in state
+        log("system volume:", state or "?", "| code", result.returncode)
+        if muted:
+            self.osd.show(label="Système", fraction=fraction, right="muet")
+        else:
+            self.osd.show(label="Système", fraction=fraction, right="%d %%" % round(fraction * 100))
+
+    # -- tracks ------------------------------------------------------------
+
+    def next_audio(self):
+        if not self.audio:
+            self.osd.show(label="Aucune piste audio", right="")
+            return
+        count = len(self.audio)
+        current = self.pipeline.get_property("current-audio")
+        following = (current + 1) % count
+        self.pipeline.set_property("current-audio", following)
+        name, title = language_name(self.audio[following].get("tags") or {})
+        label = track_label(name, title)
+        log("audio track ->", following, "/", count, label, "|", title)
+        self.osd.show(label="Audio : %s" % label, duration=1.5)
+
+    def next_subtitle(self):
+        """Cycle text tracks, then "off", then back to the first track."""
+        if not self.subs:
+            self.osd.show(label="Aucun sous-titre", right="", duration=1.5)
+            return
+        if not self.subtitles_enabled:
+            self.subtitles_enabled = True
+            self.sub_index = 0
+        else:
+            self.sub_index += 1
+            if self.sub_index >= len(self.subs):
+                self.subtitles_enabled = False
+        if not self.subtitles_enabled:
+            self.subtitles.cues = []
+            self.subtitles.current = None
+            self.subtitles._clear()
+            log("subtitles -> off")
+            self.osd.show(label="Sous-titres : Désactivé", right="", duration=1.5)
+            return
+        stream = self.subs[self.sub_index]
+        name, title = language_name(stream.get("tags") or {})
+        log("subtitles -> stream", stream["index"], name, "|", title)
+        self.osd.show(label="Sous-titres : %s" % name, duration=1.5)
+        # Extraction happens in a thread: the OSD must never wait for ffmpeg.
+        import threading
+        threading.Thread(target=self.load_subtitles, args=(stream,), daemon=True).start()
+
+    def load_subtitles(self, stream):
+        srt_path = extract_srt(self.media_path, stream["index"])
+        cues = parse_srt(srt_path) if srt_path else []
+        log("subtitles loaded:", srt_path, "|", len(cues), "cues")
+
+        # The worker thread must not touch the cairo/DRM state concurrently
+        # with the main loop, so the swap is posted to the GLib loop.
+        def apply():
+            self.subtitles.current = None
+            self.subtitles.cues = cues
+            if not cues:
+                self.subtitles._clear()
+            return False
+
+        GLib.idle_add(apply, priority=GLib.PRIORITY_DEFAULT)
+
+    # -- playback ----------------------------------------------------------
+
+    def toggle_pause(self):
+        if self.paused:
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self.paused = False
+            log("state: PLAYING")
+            self.osd.persistent = False
+            self.osd.show(label="Lecture",
+                          fraction=(self.position() / (self.duration_s() or 1)),
+                          right=hms(self.position()))
+        else:
+            # PAUSED keeps the last frame on screen: kmssink holds the plane.
+            self.pipeline.set_state(Gst.State.PAUSED)
+            self.paused = True
+            log("state: PAUSED")
+            position = self.position()
+            duration = self.duration_s() or 0
+            self.osd.show(label="Pause", fraction=(position / duration) if duration else 0.0,
+                          right=hms(position), duration=3600, persistent=True)
+
+    # -- keyboard ----------------------------------------------------------
+
+    def start_keyboard(self):
+        try:
+            self.keyboard = subprocess.Popen([KEYS_DAEMON], stdout=subprocess.PIPE,
+                                             bufsize=0, env=CHILD_ENV)
+        except Exception as exc:
+            die("kms-keys: %s" % exc)
+        self._keyboard_dead = False
+        import threading
+        threading.Thread(target=self._keyboard_loop, daemon=True).start()
+        GLib.timeout_add(200, self._tick_keyboard_alive)
+        log("kms-keys started, pid", self.keyboard.pid)
+
+    def _tick_keyboard_alive(self):
+        if self.finished:
+            return False
+        if self._keyboard_dead or self.keyboard.poll() is not None:
+            log("kms-keys exited, stopping")
+            self.stop()
+            return False
+        return True
+
+    def _keyboard_loop(self):
+        """Read kms-keys on a dedicated thread and push each line to GLib.
+
+        A raw os.read() loop is used instead of io_add_watch because the watch
+        proved fragile over long sessions (it stopped firing after hours)."""
+        fd = self.keyboard.stdout.fileno()
+        buffer = b""
+        try:
+            while True:
+                data = os.read(fd, 8192)
+                if not data:
+                    break
+                buffer += data
+                *lines, buffer = buffer.split(b"\n")
+                for raw in lines:
+                    fields = raw.decode("utf-8", "replace").split()
+                    if len(fields) == 3 and fields[0] == "key":
+                        try:
+                            value = int(fields[2])
+                        except ValueError:
+                            continue
+                        GLib.idle_add(self._dispatch_key, fields[1], value,
+                                      priority=GLib.PRIORITY_HIGH)
+        except Exception as exc:
+            log("keyboard: read error:", exc)
+        self._keyboard_dead = True
+
+    def _dispatch_key(self, name, value):
+        try:
+            self.on_key(name, value)
+        except Exception as exc:
+            import traceback
+            log("ERROR key %s: %s" % (name, exc))
+            traceback.print_exc(file=log_file)
+        return False
+
+    def on_key(self, name, value):
+        """Handle one keyboard event. value: 0 release, 1 press, 2 repeat."""
+        if self.finished:
+            return
+        log("key", name, value, "t=%.6f" % monotonic())
+        press = (value == 1)
+        if name in ("ESC", "Q"):
+            if press:
+                self.stop()
+            return
+        if name in ("LEFT", "RIGHT"):
+            # Both press and autorepeat advance the cumulative scale; the
+            # debounce inside seek_step() decides what is accepted.
+            if value != 0:
+                step = self.seek_step(-1 if name == "LEFT" else 1)
+                if step is not None:
+                    self.seek(step, "scale")
+            return
+        if name == "A" and press:
+            self.next_audio()
+        elif name == "S" and press:
+            self.next_subtitle()
+        elif name in ("SPACE", "PLAYPAUSE") and press:
+            self.toggle_pause()
+        elif name == "ENTER" and press:
+            log("osd toggled ->", self.osd.toggle())
+        elif name == "UP" and press:
+            self.software_volume(+5)
+        elif name == "DOWN" and press:
+            self.software_volume(-5)
+        elif name == "VOLUMEUP" and press:
+            self.system_volume(+5)
+        elif name == "VOLUMEDOWN" and press:
+            self.system_volume(-5)
+        elif name == "MUTE" and press:
+            self.system_volume(0, mute=True)
+        elif name == "NEXTSONG" and press:
+            self.seek(60, "next")
+        elif name == "PREVIOUSSONG" and press:
+            self.seek(-60, "previous")
+
+    def _tick_subtitles(self):
+        if self.finished:
+            return False
+        # After a seek the position is transient for a few hundred ms; showing
+        # cues during that window makes the subtitle plane flicker (each cue is
+        # a SetPlane on the DRM fd, which shares the master with the video).
+        if monotonic() - self.target_set_at < 0.5:
+            return True
+        if self.subtitles and self.subtitles.cues:
+            self.subtitles.update(self.position())
+        return True
+
+    def _tick_osd(self):
+        if self.finished:
+            return False
+        return self.osd.tick(monotonic())
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def on_message(self, bus, message):
+        message_type = message.type
+        if message_type == Gst.MessageType.EOS:
+            log("end of stream (EOS)")
+            self.stop()
+        elif message_type == Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            log("PIPELINE ERROR:", error.message, "|", debug)
+            self.stop()
+        elif message_type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
+            _old, new, _pending = message.parse_state_changed()
+            if new in (Gst.State.PLAYING, Gst.State.PAUSED):
+                log("pipeline state:", new.value_nick)
+
+    def stop(self):
+        """Tear everything down in an order that leaves the console usable."""
+        if self.finished:
+            return
+        self.finished = True
+        log("stop requested")
+        try:
+            if self.subtitles:
+                self.subtitles._clear()
+        except Exception:
+            pass
+        try:
+            self.pipeline.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+        self.main_loop.quit()
+
+    def run(self):
+        if not os.path.isfile(self.media_path):
+            die("file not found: %s" % self.media_path)
+
+        self.switch_vt()
+        self.start_subdaemon()
+        self.inhibit_session()
+        self.build_pipeline()
+        self.start_keyboard()
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_message)
+
+        # 12.5 Hz for subtitles is enough for human dialogue and cheap; 10 Hz
+        # for the OSD matches its rate limit.
+        GLib.timeout_add(80, self._tick_subtitles)
+        GLib.timeout_add(100, self._tick_osd)
+
+        signal.signal(signal.SIGTERM, lambda *a: self.stop())
+        signal.signal(signal.SIGINT, lambda *a: self.stop())
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.pipeline.get_state(2 * Gst.SECOND)
+
+        # First subtitle track, extracted in the background.
+        if self.subtitles_enabled and self.subs:
+            import threading
+            threading.Thread(target=self.load_subtitles,
+                             args=(self.subs[self.sub_index],), daemon=True).start()
+
+        self.main_loop.run()
+
+        # Shutdown sequence.
+        try:
+            self.keyboard.terminate()
+            self.keyboard.wait(timeout=1.5)
+        except Exception:
+            try:
+                self.keyboard.kill()
+                self.keyboard.wait(timeout=1.5)
+            except Exception:
+                pass
+        if self.subdaemon:
+            try:
+                self.subdaemon.stdin.write("quit\n")
+                self.subdaemon.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.subdaemon.wait(timeout=3)
+            except Exception:
+                self.subdaemon.kill()
+        self.release_inhibit()
+        if self.previous_vt:
+            subprocess.run(["sudo", "-n", "/usr/bin/chvt", self.previous_vt], check=False)
+        log("exit, VT", self.previous_vt)
+
+
+LOCK_HANDLE = [None]
+
+
+def single_instance_lock():
+    """Refuse to start twice: only one process can hold the DRM master, and a
+    second player would fight over the planes and the VT."""
+    import fcntl
+    handle = open("/tmp/kms-play-%d.lock" % UID, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("kms-play: a playback is already running", file=sys.stderr)
+        sys.exit(3)
+    LOCK_HANDLE[0] = handle
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: kms-play <file>", file=sys.stderr)
+        sys.exit(2)
+    single_instance_lock()
+    media_path = os.path.realpath(sys.argv[1])
+    player = Player(media_path)
+    player.run()
+
+
+if __name__ == "__main__":
+    main()

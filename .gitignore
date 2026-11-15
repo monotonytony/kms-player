@@ -1,16 +1,15 @@
-# Build artifacts
+# Compiled artifacts (build them with `make` in src/)
+src/kms-subd
+src/kms-keys
+src/kms-planes
+src/kms-inject
+src/kms-keywait
+src/drm-plane-formats
+src/libkmsshare.so
 *.o
-*.so
-/player-next/kms-subd
-/player-next/kms-keys
-/player-next/kms-planes
-/player-next/kms-inject
-!libkmsshare.so
-
-# Python
 __pycache__/
 *.pyc
 
-# Runtime / local
+# Runtime leftovers
 *.log
 *.srt

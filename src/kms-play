@@ -1,0 +1,20 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
+# KMS player launcher: NV15/NV12 video in zero copy, subtitles and OSD composited
+# by the VOP on two ARGB overlay planes.
+#
+# Two environment variables only matter to libkmsshare.so (LD_PRELOAD):
+#   LD_PRELOAD      makes the player's open("/dev/dri/card*") return kms-subd's
+#                   DRM fd instead of a fresh one, so there is a single master.
+#   KMS_SHARE_SOCK  the unix socket kms-subd listens on to hand that fd over.
+# It must be named exactly like the socket kms-play-py passes to kms-subd,
+# i.e. /tmp/kms-subd-<uid>.sock.
+#
+# System suspend/idle is already neutralised outside this project (masked
+# targets); kms-play-py additionally takes a GNOME session inhibit when a
+# session bus is available.
+exec env LD_PRELOAD=/usr/local/lib/libkmsshare.so \
+         KMS_SHARE_SOCK="/tmp/kms-subd-$(id -u).sock" \
+         /usr/local/bin/kms-play-py "$@"
