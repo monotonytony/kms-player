@@ -180,4 +180,8 @@ state and the pipeline position, not by looking at the screen.
 
 ## License
 
-Not decided yet.
+GNU General Public License v3.0 or later — see [LICENSE](LICENSE).
+
+In short: you may use, study, modify and redistribute this software, but if you
+distribute a modified version you must publish its source under the same license.
+Running a modified copy privately carries no obligation to publish.
