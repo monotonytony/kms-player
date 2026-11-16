@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KMS Player
+Comment=Lecteur KMS : NV15 direct sur le plan vidéo, sans conversion ni compositeur
+Exec=/usr/local/bin/kms-play %f
+Icon=video-x-generic
+Terminal=false
+MimeType=video/mp4;video/x-matroska;video/x-msvideo;video/webm;video/quicktime;video/mpeg;
+Categories=AudioVideo;Player;

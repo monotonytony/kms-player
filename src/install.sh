@@ -54,6 +54,12 @@ if ! grep -q '^[^#]*/usr/local/sbin/kms-vt' "$SUDOERS" 2>/dev/null; then
     visudo -c >/dev/null || { echo "sudoers is now invalid, fix $SUDOERS" >&2; exit 1; }
 fi
 
+# Desktop entry: this is the name and the icon offered in the file manager's
+# "Open With" menu and in the application list.
+install -d /usr/local/share/applications
+install -m 0644 "$HERE/kms-play.desktop" /usr/local/share/applications/kms-play.desktop
+update-desktop-database /usr/local/share/applications 2>/dev/null || true
+
 systemctl mask --quiet "getty@tty$PLAYER_VT.service" 2>/dev/null || true
 systemctl stop --quiet "getty@tty$PLAYER_VT.service" 2>/dev/null || true
 
