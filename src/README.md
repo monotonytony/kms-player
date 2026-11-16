@@ -84,6 +84,59 @@ wear) and `kms-subd` copies them row by row — the kernel pitch can be larger t
 bottom band is `screen × 76`, the startup panel is `880 × 202` and the on-demand
 panel with the file name is `880 × 242`.
 
+### Plane selection
+
+`plane-select.h` is the single source of truth. It is included by `kms-planes.c`
+and `kms-subd.c` (all functions `static`), so there is one implementation, not
+two that can drift:
+
+```
+kms-planes --select        # video 57 81 NV15 4 / sub 69 ... / osd 75 ...
+kms-subd --select          # same output, for a diff in the test suite
+```
+
+`kms-play-py` runs `kms-planes --select` once at startup and passes the ids to
+`kmssink` (`plane-id=`) and to `kms-subd` (positional arguments plus the CRTC).
+It no longer picks a plane itself, so the plane that is printed by hand is
+always the plane that is programmed.
+
+Selection, in order:
+
+1. Connector = `KMS_PLAY_CONNECTOR`, else the first `connected` connector with
+   a routed CRTC; otherwise `no connected display`.
+2. CRTC = the connector's routed CRTC. Only planes whose `possible_crtcs` mask
+   contains it are candidates (a multi-head board can no longer be given a
+   plane of the other screen).
+3. Video = `overlay` (or `primary` if no overlay exists) with NV15/NV12, lowest
+   zpos; NV15 preferred. `cursor` planes are never candidates.
+4. Sub/OSD = two distinct ARGB8888 overlays above the video plane; the two
+   highest zpos are kept (highest = OSD, second = subtitles).
+5. `zpos` is read, never forced. Immutable → the current value is the hardware
+   order; the player logs `zpos immutable, hw order` and checks the read-back.
+6. Degradation: one ARGB → video + OSD, subtitles disabled; none → video only;
+   no video plane → error naming what is missing.
+7. `KMS_PLAY_PLANES="video=…,sub=…,osd=…"` overrides roles (`none` disables).
+   Unknown ids, ids of another CRTC, wrong formats and cursor planes are hard
+   errors. `KMS_PLAY_PLANES_TOOL` is the binary path (a different variable, so
+   the override string cannot be mistaken for a path).
+8. After configuration the player reads `kms-planes --short`: `fb!=0` on the
+   video plane, else one retry with the next `--list-video` candidate, then a
+   clear log line (two attempts, no loop).
+
+`kms-planes --check` dumps the topology behind those rules: connectors
+(status, encoder, CRTC, mode, vrefresh), CRTCs (mode, active) and, per plane,
+the DRM type, the zpos range with its immutable flag, the formats and
+`possible_crtcs` decoded to CRTC ids. Measured on the BPI-M7: one CRTC (81),
+seven overlay planes, `zpos` mutable `0..7`, planes 39/45/51 ARGB-only below
+the video plane, 57 video (NV15), 69 sub, 75 osd; plane 63 is a third ARGB
+candidate that stays free.
+
+Limits worth knowing before trusting this on another board: the Rockchip driver
+does not expose `CRTC_W`/`CRTC_H` or the plane position (`pos` reads `+0+0`), so
+screen coverage is not readable and only `fb!=0` is verified; a driver without
+a usable `type` property is treated as `unknown`; and on a single-CRTC board the
+"plane of another CRTC" refusal cannot be exercised because every mask is `0x1`.
+
 ### Startup banner and information panel
 
 Once the decode tier and the video caps are known, `OnScreenDisplay` draws a

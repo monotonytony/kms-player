@@ -118,7 +118,9 @@ LOG_PATH = os.path.join(CACHE_DIR, "last.log")
 # can be tested without touching the installed copies (kms-play-next does it).
 SUBDAEMON = os.environ.get("KMS_PLAY_SUBD", "/usr/local/bin/kms-subd")
 KEYS_DAEMON = os.environ.get("KMS_PLAY_KEYS", "/usr/local/bin/kms-keys")
-PLANES_TOOL = os.environ.get("KMS_PLAY_PLANES", "/usr/local/bin/kms-planes")
+# Path to the diagnostic binary. KMS_PLAY_PLANES is NOT the path any more: it
+# is the plane override ("video=57,osd=75,sub=69", see kms-planes --select).
+PLANES_TOOL = os.environ.get("KMS_PLAY_PLANES_TOOL", "/usr/local/bin/kms-planes")
 
 # Console VT reserved for playback. getty is masked on it (see README), and
 # kms-vt clears it, because a text VT keeps the last thing written to it and a
@@ -2006,7 +2008,7 @@ def console_text(text, limit=120):
 
 
 def plane_state(plane_id):
-    """fmt/zpos/fb of one plane right now, from kms-planes --short.
+    """fmt/zpos/fb/geometry of one plane right now, from kms-planes --short.
 
     Called when the banner is about to be drawn, not at startup: before the
     first frame the plane has no framebuffer (fmt "-"). Once the decoder is
@@ -2019,10 +2021,19 @@ def plane_state(plane_id):
     except Exception:
         return {}
     for line in out.splitlines():
-        match = re.search(r"plane %d zpos=(\d+) fb=(\d+) fmt=(\S+)" % plane_id, line)
+        match = re.search(r"plane %d zpos=(\d+) fb=(\d+) fmt=(\S+)"
+                          r"(?:.* pos=\+(\d+)\+(\d+) frame=(\d+)x(\d+))?" % plane_id,
+                          line)
         if match:
-            return {"zpos": int(match.group(1)), "fb": int(match.group(2)),
-                    "fmt": match.group(3)}
+            state = {"zpos": int(match.group(1)), "fb": int(match.group(2)),
+                     "fmt": match.group(3)}
+            if match.group(4) is not None:
+                state.update({
+                    "x": int(match.group(4)), "y": int(match.group(5)),
+                    "frame_width": int(match.group(6)),
+                    "frame_height": int(match.group(7)),
+                })
+            return state
     return {}
 
 
@@ -2085,40 +2096,63 @@ def screen_size():
     return 1920, 1080
 
 
-def pick_video_plane():
-    """Return the DRM plane id able to scan NV15, lowest zpos first.
+def select_planes():
+    """Ask kms-planes --select for the three planes and their CRTC.
 
-    It must be the lowest plane: the ARGB overlays have to sit above it.
-    kms-planes --short reports nv15=1 for every plane that accepts 10-bit
-    video; among those we keep the one with the smallest zpos."""
+    This is the only place where planes are chosen. kms-planes owns the
+    algorithm (plane-select.h), so the video plane given to kmssink, the two
+    planes given to kms-subd and the ids printed by a manual `kms-planes
+    --select` are always the same answer. It also means a plan belonging to
+    another CRTC can never be programmed: only the planes of the CRTC routed
+    by the chosen connector are candidates.
+
+    Returns {"video": {...} or None, "sub": ..., "osd": ..., "crtc": int}.
+    The video entry is mandatory; sub/osd may be None when the board cannot
+    provide them (degraded operation, logged by kms-planes)."""
+    result = {"video": None, "sub": None, "osd": None, "crtc": 0}
     try:
-        out = subprocess.run([PLANES_TOOL, "--short"], capture_output=True, text=True,
-                             timeout=5, env=CHILD_ENV).stdout
-    except Exception:
-        out = ""
-    best, best_zpos = 0, None
-    for line in out.splitlines():
-        if "nv15=1" not in line:
+        proc = subprocess.run([PLANES_TOOL, "--select"], capture_output=True,
+                              text=True, timeout=5, env=CHILD_ENV)
+    except Exception as exc:
+        log("plane selection: cannot run kms-planes --select:", exc)
+        return result
+    detail = (proc.stderr or "").strip()
+    if detail:
+        log("plane selection:", detail.replace("\n", " | "))
+    if proc.returncode != 0:
+        return result
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if not fields:
             continue
-        match = re.search(r"plane (\d+) zpos=(\d+)", line)
-        if match:
-            plane_id, zpos = int(match.group(1)), int(match.group(2))
-            if best_zpos is None or zpos < best_zpos:
-                best, best_zpos = plane_id, zpos
-    if best:
-        return best
-    # Legacy fallback: an older helper that printed one line per plane.
+        role = fields[0]
+        if role not in ("video", "sub", "osd"):
+            continue
+        if len(fields) < 2:
+            continue
+        if fields[1] == "none":
+            result[role] = None
+            continue
+        if len(fields) < 5:
+            continue
+        result[role] = {"id": int(fields[1]), "crtc": int(fields[2]),
+                        "fourcc": fields[3], "zpos": int(fields[4])}
+        if role == "video":
+            result["crtc"] = int(fields[2])
+    return result
+
+
+def video_candidate_ids():
+    """Video plane candidates, best first, for the single retry.
+
+    Same selection code (`kms-planes --list-video`): overlay planes of the
+    routed CRTC that accept NV15/NV12, ordered exactly like --select."""
     try:
-        out = subprocess.run(["/usr/local/bin/drm-plane-formats"], capture_output=True,
+        out = subprocess.run([PLANES_TOOL, "--list-video"], capture_output=True,
                              text=True, timeout=5, env=CHILD_ENV).stdout
     except Exception:
-        return 0
-    for line in out.splitlines():
-        if "NV15" in line:
-            match = re.search(r"plan (\d+)", line)
-            if match:
-                return int(match.group(1))
-    return 0
+        return []
+    return [int(line) for line in out.splitlines() if line.strip().isdigit()]
 
 
 # ---------------------------------------------------------------------------
@@ -2739,10 +2773,29 @@ class Player:
                                    (s.get("tags") or {}).get("language", ""))
                                   for s in self.subs])
 
-        self.video_plane = pick_video_plane()
-        if not self.video_plane:
-            die("no NV15-capable DRM plane")
-        log("video plane:", self.video_plane)
+        # One selection for the whole player. kms-planes decides which plane
+        # of which CRTC is the video plane and which two overlays carry text;
+        # the same ids are handed to kmssink and to kms-subd below.
+        self.planes = select_planes()
+        if not self.planes["video"]:
+            die("no NV15/NV12 video plane on the connected display "
+                "(run kms-planes --check)")
+        self.video_plane = self.planes["video"]["id"]
+        self.video_crtc = self.planes["crtc"]
+        log("planes: video %d (%s zpos %d) | sub %s | osd %s | crtc %d"
+            % (self.video_plane, self.planes["video"]["fourcc"],
+               self.planes["video"]["zpos"],
+               self.planes["sub"]["id"] if self.planes["sub"] else "none",
+               self.planes["osd"]["id"] if self.planes["osd"] else "none",
+               self.video_crtc))
+        if not self.planes["sub"]:
+            log("planes: no subtitle plane available, subtitles disabled")
+        if not self.planes["osd"]:
+            log("planes: no OSD plane available, on-screen display disabled")
+        # Post-configuration verification state (see _verify_video_plane).
+        self.plane_attempts = 0
+        self.plane_verified = False
+        self.plane_check_scheduled = False
 
         # Default subtitle track: the first one whose title does not contain
         # "forced" (forced tracks only carry signs and foreign dialogue).
@@ -2752,7 +2805,7 @@ class Player:
             if "forced" not in title:
                 self.sub_index = index
                 break
-        self.subtitles_enabled = bool(self.subs)
+        self.subtitles_enabled = bool(self.subs) and self.planes["sub"] is not None
 
         self.subdaemon = None
         self.subtitles = None
@@ -2861,9 +2914,15 @@ class Player:
             os.unlink(SOCK_PATH)
         except OSError:
             pass
-        self.subdaemon = subprocess.Popen([SUBDAEMON, SOCK_PATH, str(self.video_plane)],
-                                          stdin=subprocess.PIPE, stderr=log_file, text=True,
-                                          env=CHILD_ENV, bufsize=1)
+        # The three ids and the CRTC come from the single selection above, so
+        # the daemon cannot pick a different (or another CRTC's) plane.
+        self.subdaemon = subprocess.Popen(
+            [SUBDAEMON, SOCK_PATH, str(self.video_plane),
+             str(self.planes["sub"]["id"]) if self.planes["sub"] else "none",
+             str(self.planes["osd"]["id"]) if self.planes["osd"] else "none",
+             str(self.video_crtc)],
+            stdin=subprocess.PIPE, stderr=log_file, text=True,
+            env=CHILD_ENV, bufsize=1)
         for _ in range(100):
             if os.path.exists(SOCK_PATH):
                 break
@@ -3036,10 +3095,93 @@ class Player:
                     # One startup panel per playback, drawn from the main
                     # loop: the probe runs on the streaming thread and the
                     # panel writes to the DRM plane through kms-subd's stdin.
+                    # The plane is verified shortly after the first frames:
+                    # fb!=0 and full-screen coverage are the only proof that
+                    # kmssink really took the plane we selected.
+                    if not self.plane_check_scheduled:
+                        self.plane_check_scheduled = True
+                        GLib.timeout_add(1500, self._verify_video_plane)
                     if not self.startup_panel_shown:
                         self.startup_panel_shown = True
                         GLib.idle_add(self._show_startup_panel)
         return Gst.PadProbeReturn.OK
+
+    def _kmssink(self):
+        """The kmssink element, wherever playbin put it."""
+        if not self.pipeline:
+            return None
+        iterator = self.pipeline.iterate()
+        while True:
+            result, elem = iterator.next()
+            if result == Gst.IteratorResult.DONE:
+                return None
+            if result != Gst.IteratorResult.OK:
+                continue
+            factory = elem.get_factory()
+            if factory and factory.get_name() == "kmssink":
+                return elem
+
+    def _verify_video_plane(self):
+        """Read back the video plane once the first frames are on screen.
+
+        fb!=0 and a size covering the screen are the proof that kmssink took
+        the plane this player selected. On failure the next kms-planes
+        --list-video candidate is tried exactly once (two attempts total), and
+        a second failure is logged instead of looping."""
+        if self.plane_verified:
+            return False
+        state = plane_state(self.video_plane)
+        fb = state.get("fb", 0)
+        fw = state.get("frame_width", 0)
+        fh = state.get("frame_height", 0)
+        # Coverage itself cannot be read back here: this Rockchip driver does
+        # not expose the atomic CRTC_W/CRTC_H plane properties, and the legacy
+        # GETPLANE ioctl carries no plane size. fb!=0 proves kmssink took the
+        # plane; kmssink programmes it over the whole CRTC by construction.
+        if fb and fw and fh:
+            self.plane_verified = True
+            log("plane verify: video %d fb=%d frame=%dx%d at +%d+%d, screen %dx%d"
+                % (self.video_plane, fb, fw, fh, state.get("x", 0),
+                   state.get("y", 0), self.width, self.height))
+            if state.get("zpos") != self.planes["video"]["zpos"]:
+                # zpos is read, never forced: an immutable property (or a
+                # driver reordering) shows up here as a different value.
+                log("plane verify: zpos read back %s, selected %s"
+                    % (state.get("zpos"), self.planes["video"]["zpos"]))
+            return False
+        self.plane_attempts += 1
+        log("plane verify: video %d NOT scanning out (fb=%d frame=%dx%d, "
+            "screen %dx%d)"
+            % (self.video_plane, fb, fw, fh, self.width, self.height))
+        if self.plane_attempts >= 2:
+            log("plane verify: giving up after 2 attempts, video may be black")
+            self.plane_verified = True
+            return False
+        if os.environ.get("KMS_PLAY_PLANES"):
+            log("plane verify: plane override in use, not retrying another plane")
+            self.plane_verified = True
+            return False
+        candidates = [pid for pid in video_candidate_ids()
+                      if pid != self.video_plane]
+        sink = self._kmssink()
+        if not candidates or not sink:
+            log("plane verify: no alternate video plane available")
+            self.plane_verified = True
+            return False
+        self.video_plane = candidates[0]
+        log("plane verify: retrying with video plane", self.video_plane)
+        try:
+            sink.set_property("plane-id", self.video_plane)
+            if self.subdaemon:
+                # kms-subd must release the new plane on exit, not the old one.
+                self.subdaemon.stdin.write("video %d\n" % self.video_plane)
+                self.subdaemon.stdin.flush()
+        except Exception as exc:
+            log("plane verify: retry failed:", exc)
+            self.plane_verified = True
+            return False
+        GLib.timeout_add(1500, self._verify_video_plane)
+        return False
 
     def _record_video_caps(self, structure, fmt, memory, caps_text=""):
         """Keep the negotiated description for the banner.
@@ -3531,6 +3673,9 @@ class Player:
 
     def next_subtitle(self):
         """Cycle text tracks, then "off", then back to the first track."""
+        if self.planes["sub"] is None:
+            self.osd.show(label=tr("osd.no_subtitles"), right="", duration=1.5)
+            return
         if not self.subs:
             self.osd.show(label=tr("osd.no_subtitles"), right="", duration=1.5)
             return

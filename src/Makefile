@@ -31,7 +31,8 @@ all: $(BINS) $(SHIM)
 	@$(PYTHON) -m py_compile kms-play-py && echo "kms-play-py: syntax OK"
 
 # DRM master owner: drives the subtitle and OSD planes.
-kms-subd: kms-subd.c
+# plane-select.h holds the shared selection algorithm included by both.
+kms-subd: kms-subd.c plane-select.h
 	$(CC) $(CFLAGS) -o $@ $< $(LIBDRM_CFLAGS) $(LIBDRM_LIBS)
 
 # Keyboard daemon: one poll() loop over every input device.
@@ -39,7 +40,7 @@ kms-keys: kms-keys.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # Diagnostic: dump plane capabilities and current formats.
-kms-planes: kms-planes.c
+kms-planes: kms-planes.c plane-select.h
 	$(CC) $(CFLAGS) -o $@ $< $(LIBDRM_CFLAGS) $(LIBDRM_LIBS)
 
 # Diagnostic: synthetic uinput keyboard used to measure input latency.
@@ -60,7 +61,7 @@ $(SHIM): kmsshare.c
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl
 
 check:
-	@for f in kms-subd.c kms-keys.c kms-planes.c kms-inject.c kmsshare.c; do \
+	@for f in kms-subd.c kms-keys.c kms-planes.c kms-inject.c kmsshare.c plane-select.h; do \
 		grep -q "SPDX-License-Identifier" $$f || { echo "missing SPDX header: $$f"; exit 1; }; \
 	done
 	@echo "license headers: OK"

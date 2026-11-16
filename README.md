@@ -79,6 +79,88 @@ Result: one master, three writers, no tearing, no extra copies.
 | `kms-planes` | C | Diagnostic: lists every plane (formats, zpos, alpha, attached framebuffer) and every connector with its live mode and refresh rate. |
 | `kms-inject` | C (`uinput`) | Diagnostic: injects synthetic key events, used to measure input latency. |
 
+## Plane selection
+
+The three planes are chosen by **one** algorithm, in `src/plane-select.h`, which is
+compiled into both `kms-planes` and `kms-subd` (a header, so there is only one
+implementation in the tree). `kms-play-py` never selects a plane itself: it runs
+
+```
+$ kms-planes --select
+video 57 81 NV15 4
+sub   69 81 ARGB8888 6
+osd   75 81 ARGB8888 7
+```
+
+and hands those ids to `kmssink` (`plane-id=57`) and to `kms-subd`
+(`kms-subd <sock> 57 69 75 81`). `sub none` / `osd none` mean the board cannot
+provide that layer; playback continues, degraded, and the log says why. Nothing
+but those three lines is written to stdout; diagnostics go to stderr.
+
+Rules (single screen: the goal is to never programme another CRTC's plane):
+
+1. **Connector**: `KMS_PLAY_CONNECTOR` if set, otherwise the first connected
+   connector with a routed CRTC. None found → explicit `no connected display`.
+2. **CRTC**: the one the connector is routed to. Only planes whose
+   `possible_crtcs` mask contains that CRTC are candidates.
+3. **Video**: an `overlay` plane (`primary` only if no overlay exists) that
+   accepts NV15 or NV12, lowest zpos. The chosen fourcc (NV15 preferred) is
+   logged.
+4. **Sub / OSD**: two distinct `ARGB8888` overlay planes of the same CRTC, with
+   a zpos above the video plane. The two highest-zpos candidates are used:
+   highest = OSD, second = subtitles (this leaves lower overlays free and keeps
+   the long-tested 69/75 pair on the BPI-M7).
+5. **zpos is read, never forced.** If the property is immutable the current
+   value is the hardware order; the player logs `zpos immutable, hw order` and
+   verifies the plane by reading it back after configuration.
+6. **Degradation**: one ARGB overlay → video + OSD, subtitles disabled;
+   none → video only; no video plane → a clear error naming what is missing.
+7. **Overrides**: `KMS_PLAY_PLANES="video=57,osd=75,sub=69"` short-circuits the
+   selection (`none` disables a text plane). An id that does not exist, does not
+   belong to the CRTC, is a cursor plane, or has the wrong format is a hard
+   error.
+8. **Read-back**: 1.5 s after the first frames, the player reads
+   `kms-planes --short`; the video plane must have `fb!=0`. If not, it logs the
+   failure and tries the next `kms-planes --list-video` candidate once (two
+   attempts total, never a loop), after which it gives up with a log line.
+
+`KMS_PLAY_PLANES_TOOL` overrides the path to the binary (used by
+`kms-play-next`). `KMS_PLAY_PLANES` is the override string above, not a path.
+
+`kms-planes --check` dumps the whole topology this algorithm works on: per
+connector (status, encoder, routed CRTC, mode, vrefresh), per CRTC (id, mode,
+active) and per plane (DRM type, zpos range and immutability, formats,
+`possible_crtcs` decoded to CRTC ids).
+
+### Measured on the BPI-M7 (RK3588, kernel 6.18.44)
+
+HDMI-A-1, 2560x1440 @ 75 Hz, encoder 82, **one** CRTC (81, mask `0x1`), seven
+planes, all reported `type=overlay` with a mutable `zpos` range `0..7`:
+
+| plane | zpos | NV15/NV12 | ARGB8888 | selection |
+|---|---|---|---|---|
+| 39 | 1 | no | yes | — (below the video plane) |
+| 45 | 2 | no | yes | — |
+| 51 | 3 | no | yes | — |
+| 57 | 4 | yes | yes | **video**, NV15 |
+| 63 | 5 | yes | yes | — (third ARGB candidate) |
+| 69 | 6 | yes | yes | **sub** |
+| 75 | 7 | yes | yes | **osd** |
+
+What is *still* not portable, even with this work:
+
+- this Rockchip driver exposes neither `CRTC_W`/`CRTC_H` nor the plane position
+  through the legacy `GETPLANE` ioctl (`pos` reads back as `+0+0`), so "covers
+  the screen" cannot be proven by reading the kernel; the read-back proves
+  `fb!=0`, and full-screen coverage relies on `kmssink` programming the plane
+  that way;
+- a driver that hides the plane `type` property, or reports a wrong one, is
+  treated as `unknown` and falls through to the format/zpos rules;
+- a board with no free overlay at all (all planes in use by fbcon) can only run
+  the video plane, and the subtitles/OSD are lost — the log says so;
+- the wrong-CRTC refusal is implemented but cannot be exercised on a
+  single-CRTC board like this one: every plane's `possible_crtcs` is `0x1`.
+
 ---
 
 ## Keyboard

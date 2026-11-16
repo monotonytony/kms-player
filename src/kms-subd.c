@@ -37,6 +37,9 @@
  *   osd cue <x> <y> <w> <h> <path>   show a raw BGRA, pre-multiplied buffer
  *   osd clear                        hide the OSD plane
  *   cue ... / clear                  shortcut for "sub ..." (compatibility)
+ *   video <id|none>                  update the video plane id the exit path
+ *                                    must release (used when the player
+ *                                    retries with another candidate)
  *   off                              disable the video, subtitle and OSD
  *                                    planes (exit path: no frame is left
  *                                    scanning out over the console)
@@ -49,12 +52,15 @@
  * ============================================================================
  * USAGE
  * ============================================================================
- *   kms-subd <socket-path> <video-plane-id> [sub-plane-id] [osd-plane-id]
+ *   kms-subd <socket-path> <video-plane-id> [sub-plane-id|none]
+ *            [osd-plane-id|none] [crtc-id]
+ *   kms-subd --select        print the shared selection, exactly like
+ *                            kms-planes --select (used to prove they agree)
  *
- * Without explicit plane ids the two highest-zpos ARGB planes are chosen:
- * highest = OSD, second highest = subtitles. The video plane id is needed
- * only to find the CRTC (via drmModeGetPlane) and to exclude it from the
- * candidates.
+ * The player always passes the three plane ids and the CRTC it got from
+ * `kms-planes --select`; this daemon only runs the selector itself when it is
+ * started by hand. "none" disables a text plane explicitly (degraded mode).
+ * The algorithm is plane-select.h - the same header kms-planes includes.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,6 +107,7 @@ struct dumbuf {
 struct plane {
     const char *name;    /* "sub" / "osd", used in logs and in the protocol */
     int id;              /* DRM plane id, 0 = not configured */
+    int none;            /* explicitly disabled ("none" on the command line) */
     unsigned zpos;       /* stacking order, higher is on top */
     uint32_t crtc;       /* CRTC the plane is (or will be) attached to */
     struct dumbuf buf[MAXBUF];
@@ -110,6 +117,7 @@ struct plane {
 
 static int g_fd = -1;          /* the one and only DRM fd; also shared with the player */
 static int g_vplane;           /* video plane id, used to locate the CRTC */
+static uint32_t g_crtc;        /* CRTC chosen by kms-planes --select, 0 = resolve it */
 static struct plane g_pl[NPLANS];
 static char *g_stage;          /* scratch buffer used to read the raw frame file */
 
@@ -127,12 +135,23 @@ static double mono(void)
  * all so that it can never be confused with the protocol. */
 #define TLOG(...) do { fprintf(stderr, "[%.6f] ", mono()); fprintf(stderr, __VA_ARGS__); } while (0)
 
+/* The selection algorithm is shared verbatim with kms-planes --select: the
+ * same header, the same rules, one implementation. Its diagnostics use this
+ * daemon's timestamped log. */
+#define PS_LOG(...) TLOG(__VA_ARGS__)
+#define PS_NO_LIST_VIDEO
+#include "plane-select.h"
+
 /* Find the CRTC the video plane is attached to.
  * Preferred source: the plane's own crtc_id, which is already set once the
  * pipeline is running. Fallback: the first CRTC with a valid mode, used when
  * the player starts before the video plane has been configured. */
 static uint32_t find_crtc(void)
 {
+    /* The player passes the CRTC resolved by kms-planes --select. Trusting it
+     * avoids the fallback below picking another display's CRTC before the
+     * video plane has been configured. */
+    if (g_crtc) return g_crtc;
     drmModePlane *p = drmModeGetPlane(g_fd, g_vplane);
     if (p) {
         uint32_t c = p->crtc_id;
@@ -334,6 +353,7 @@ static void configure_plane(struct plane *pl)
     drmModeObjectProperties *op = NULL;
     drmModePropertyPtr pp;
 
+    if (!pl->id) return;
     pp = prop_find(pl->id, "alpha", &v, &op);
     if (pp) {
         drmModeObjectSetProperty(g_fd, pl->id, DRM_MODE_OBJECT_PLANE, pp->prop_id, 65535);
@@ -389,60 +409,79 @@ static int serve_fd(int listen_fd)
  * by zpos, then take the top one for the OSD and the next one for subtitles. */
 static int auto_select_planes(void)
 {
-    drmModePlaneRes *pr = drmModeGetPlaneResources(g_fd);
-    if (!pr) { perror("planes"); return -1; }
-    unsigned cand[64], cz[64];
-    int n = 0;
-    for (unsigned i = 0; i < pr->count_planes && n < 64; i++) {
-        unsigned id = pr->planes[i];
-        if ((int)id == g_vplane) continue;
-        drmModePlane *pl = drmModeGetPlane(g_fd, id);
-        if (!pl) continue;
-        int has_argb = 0;
-        for (unsigned k = 0; k < pl->count_formats; k++)
-            if (pl->formats[k] == DRM_FORMAT_ARGB8888) { has_argb = 1; break; }
-        drmModeFreePlane(pl);
-        if (!has_argb) continue;
-        unsigned z = prop_zpos(id);
-        /* insertion sort, ascending zpos; candidate lists are tiny */
-        int j = n++;
-        while (j > 0 && cz[j - 1] > z) { cz[j] = cz[j - 1]; cand[j] = cand[j - 1]; j--; }
-        cz[j] = z;
-        cand[j] = id;
-    }
-    drmModeFreePlaneResources(pr);
-    if (n < 2) {
-        fprintf(stderr, "kms-subd: fewer than two ARGB planes available (%d)\n", n);
+    /* Same algorithm as kms-planes --select (plane-select.h): connector ->
+     * CRTC -> overlay planes that belong to it, ARGB above the video plane.
+     * This path only runs when the daemon is started by hand without plane
+     * ids; the player always passes the ids it got from kms-planes. */
+    struct ps_sel sel;
+    if (ps_select(g_fd, getenv("KMS_PLAY_CONNECTOR"), &sel, 1) < 0) {
+        TLOG("kms-subd: plane selection failed\n");
         return -1;
     }
-    if (!g_pl[P_OSD].id) { g_pl[P_OSD].id = (int)cand[n - 1]; g_pl[P_OSD].zpos = cz[n - 1]; }
-    if (!g_pl[P_SUB].id) { g_pl[P_SUB].id = (int)cand[n - 2]; g_pl[P_SUB].zpos = cz[n - 2]; }
+    g_crtc = sel.crtc;
+    if (!g_pl[P_OSD].id && !g_pl[P_OSD].none && sel.osd) {
+        g_pl[P_OSD].id = (int)sel.osd;
+        g_pl[P_OSD].zpos = sel.osd_zpos;
+    }
+    if (!g_pl[P_SUB].id && !g_pl[P_SUB].none && sel.sub) {
+        g_pl[P_SUB].id = (int)sel.sub;
+        g_pl[P_SUB].zpos = sel.sub_zpos;
+    }
+    if (!g_pl[P_SUB].id)
+        TLOG("kms-subd: no subtitle plane (degraded: subtitles disabled)\n");
+    if (!g_pl[P_OSD].id)
+        TLOG("kms-subd: no OSD plane (degraded: OSD disabled)\n");
     return 0;
 }
 
 int main(int argc, char **argv)
 {
+    /* `kms-subd --select` prints the shared selection, so a test can diff it
+     * against `kms-planes --select` and prove the two agree. */
+    if (argc > 1 && !strcmp(argv[1], "--select")) {
+        int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+        if (fd < 0) { perror("/dev/dri/card0"); return 1; }
+        struct ps_sel sel;
+        int rc = ps_select(fd, getenv("KMS_PLAY_CONNECTOR"), &sel, 1);
+        if (rc == 0) ps_print_selection(&sel);
+        close(fd);
+        return rc < 0 ? 1 : 0;
+    }
     if (argc < 3) {
-        fprintf(stderr, "usage: kms-subd <socket> <video-plane> [sub-plane] [osd-plane]\n");
+        fprintf(stderr, "usage: kms-subd <socket> <video-plane> [sub-plane|none]"
+                        " [osd-plane|none] [crtc]\n"
+                        "       kms-subd --select\n");
         return 2;
     }
     const char *sockpath = argv[1];
     g_vplane = atoi(argv[2]);
     g_pl[P_SUB].name = "sub";
     g_pl[P_OSD].name = "osd";
-    g_pl[P_SUB].id = argc > 3 ? atoi(argv[3]) : 0;
-    g_pl[P_OSD].id = argc > 4 ? atoi(argv[4]) : 0;
+    /* "none" disables the plane explicitly; an absent argument means "pick
+     * it with the shared selector". */
+    if (argc > 3) {
+        if (!strcmp(argv[3], "none")) g_pl[P_SUB].none = 1;
+        else g_pl[P_SUB].id = atoi(argv[3]);
+    }
+    if (argc > 4) {
+        if (!strcmp(argv[4], "none")) g_pl[P_OSD].none = 1;
+        else g_pl[P_OSD].id = atoi(argv[4]);
+    }
+    if (argc > 5) g_crtc = (uint32_t)strtoul(argv[5], NULL, 10);
     /* cur starts at -1 conceptually: the first cue targets buffer 0. Because
      * struct plane is static, cur is 0 and (0+1)%2 = 1, which is harmless. */
 
     g_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     if (g_fd < 0) { perror("/dev/dri/card0"); return 1; }
 
-    if (!g_pl[P_SUB].id || !g_pl[P_OSD].id) {
+    if ((!g_pl[P_SUB].id && !g_pl[P_SUB].none) ||
+        (!g_pl[P_OSD].id && !g_pl[P_OSD].none)) {
         if (auto_select_planes() < 0) return 1;
     }
-    if (!g_pl[P_SUB].zpos) g_pl[P_SUB].zpos = prop_zpos((uint32_t)g_pl[P_SUB].id);
-    if (!g_pl[P_OSD].zpos) g_pl[P_OSD].zpos = prop_zpos((uint32_t)g_pl[P_OSD].id);
+    if (g_pl[P_SUB].id && !g_pl[P_SUB].zpos)
+        g_pl[P_SUB].zpos = prop_zpos((uint32_t)g_pl[P_SUB].id);
+    if (g_pl[P_OSD].id && !g_pl[P_OSD].zpos)
+        g_pl[P_OSD].zpos = prop_zpos((uint32_t)g_pl[P_OSD].id);
 
     configure_plane(&g_pl[P_SUB]);
     configure_plane(&g_pl[P_OSD]);
@@ -500,6 +539,11 @@ int main(int argc, char **argv)
 
         if (strncmp(line, "quit", 4) == 0) { done = 1; break; }
         if (strcmp(line, "off") == 0) { disable_all_planes(); continue; }
+        if (strncmp(line, "video ", 6) == 0) {
+            g_vplane = atoi(line + 6);   /* "none" -> 0: nothing to release */
+            TLOG("kms-subd: video plane is now %d\n", g_vplane);
+            continue;
+        }
 
         struct plane *pl = NULL;
         const char *cmd = line;

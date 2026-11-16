@@ -8,5 +8,5 @@
 D=/usr/local/src/player-next
 exec env LD_PRELOAD=/usr/local/lib/libkmsshare.so \
          KMS_SHARE_SOCK="/tmp/kms-subd-$(id -u).sock" \
-         KMS_PLAY_SUBD=$D/kms-subd KMS_PLAY_KEYS=$D/kms-keys KMS_PLAY_PLANES=$D/kms-planes \
+         KMS_PLAY_SUBD=$D/kms-subd KMS_PLAY_KEYS=$D/kms-keys KMS_PLAY_PLANES_TOOL=$D/kms-planes \
          /usr/bin/python3 $D/kms-play-py "$@"
