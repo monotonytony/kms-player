@@ -17,6 +17,13 @@
  *   - the framebuffer currently attached (id, fourcc, DRM modifier) and the
  *     position it is placed at.
  *
+ * It also prints, per connected connector, the DRM connector name (HDMI-A-1,
+ * DP-1 ...), the mode actually scanned out on its CRTC and the vertical
+ * refresh rate taken from drmModeModeInfo.vrefresh. The player needs those
+ * three values for its startup banner, and they cannot be guessed: the sysfs
+ * "modes" file only lists supported modes, never which one is live, and the
+ * refresh rate is not derivable from the resolution.
+ *
  * A plane with fb=0 is switched off. A plane with fmt=AR24 and a non-zero
  * position is currently compositing text over the video.
  *
@@ -26,6 +33,9 @@
  *   kms-planes            human readable, one block per plane + CRTC modes
  *   kms-planes --short    one machine-parsable line per plane; this is the
  *                         form kms-play-py parses to pick the NV15 video plane
+ *
+ * Both forms end with the same connector and CRTC lines, so a single call is
+ * enough to learn both the plane layout and the active display mode.
  *
  * Reading these properties does not require DRM master, so this tool can run
  * alongside the player without disturbing it.
@@ -43,6 +53,46 @@
 /* Convert a DRM fourcc integer into its 4-character code (e.g. 0x34325241 ->
  * "AR24"). Non printable bytes become '.', which is what makes unknown
  * formats readable instead of dumping control characters. */
+/* DRM connector type -> the name used by sysfs and by every log on this
+ * project (HDMI-A, DP, eDP ...). Only the types this board can expose have a
+ * meaningful entry; anything else prints CONNECTOR-<n> rather than lying. */
+static const char *connector_type_name(uint32_t type)
+{
+    switch (type) {
+    case DRM_MODE_CONNECTOR_Unknown:    return "Unknown";
+    case DRM_MODE_CONNECTOR_VGA:        return "VGA";
+    case DRM_MODE_CONNECTOR_DVII:       return "DVI-I";
+    case DRM_MODE_CONNECTOR_DVID:       return "DVI-D";
+    case DRM_MODE_CONNECTOR_DVIA:       return "DVI-A";
+    case DRM_MODE_CONNECTOR_Composite:  return "Composite";
+    case DRM_MODE_CONNECTOR_SVIDEO:     return "SVIDEO";
+    case DRM_MODE_CONNECTOR_LVDS:       return "LVDS";
+    case DRM_MODE_CONNECTOR_Component:  return "Component";
+    case DRM_MODE_CONNECTOR_9PinDIN:    return "DIN";
+    case DRM_MODE_CONNECTOR_DisplayPort: return "DP";
+    case DRM_MODE_CONNECTOR_HDMIA:      return "HDMI-A";
+    case DRM_MODE_CONNECTOR_HDMIB:      return "HDMI-B";
+    case DRM_MODE_CONNECTOR_TV:         return "TV";
+    case DRM_MODE_CONNECTOR_eDP:        return "eDP";
+    case DRM_MODE_CONNECTOR_VIRTUAL:    return "Virtual";
+    case DRM_MODE_CONNECTOR_DSI:        return "DSI";
+    default:                            return "Connector";
+    }
+}
+
+/* CRTC the connector is currently routed to, or 0.
+ * encoder_id != 0 means "something is attached", but the CRTC is what decides
+ * which mode is actually live (and whether anything is scanned out at all). */
+static uint32_t connector_crtc(int fd, drmModeConnector *conn)
+{
+    if (!conn->encoder_id) return 0;
+    drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoder_id);
+    if (!enc) return 0;
+    uint32_t crtc = enc->crtc_id;
+    drmModeFreeEncoder(enc);
+    return crtc;
+}
+
 static void fourcc(unsigned int f, char *out)
 {
     out[0] = f & 0xff;
@@ -146,16 +196,53 @@ int main(int argc, char **argv)
         drmModeFreePlane(p);
     }
 
-    /* CRTC modes are printed in long mode only: they show the actual scanout
-     * resolution, which the player also derives from the connector's preferred
-     * mode. */
+    /* Connectors: name, routing and the live mode with its refresh rate.
+     * The active mode comes from the CRTC, not from the connector's preferred
+     * list, because a monitor can run a mode that is not its first entry.
+     * When no CRTC is routed yet (before the first modeset) the preferred mode
+     * is printed and flagged "preferred": it is the best available guess and
+     * it is reported as such instead of being presented as live. */
     if (res) {
+        for (int i = 0; i < res->count_connectors; i++) {
+            drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
+            if (!c) continue;
+            char name[64];
+            snprintf(name, sizeof name, "%s-%u", connector_type_name(c->connector_type),
+                     c->connector_type_id);
+            if (c->connection != DRM_MODE_CONNECTED) {
+                printf("connector %s disconnected\n", name);
+            } else {
+                uint32_t crtc_id = connector_crtc(fd, c);
+                drmModeModeInfo mode;
+                int have = 0;
+                if (crtc_id) {
+                    drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
+                    if (crtc) {
+                        if (crtc->mode_valid) { mode = crtc->mode; have = 1; }
+                        drmModeFreeCrtc(crtc);
+                    }
+                }
+                if (have) {
+                    printf("connector %s connected crtc=%u mode=%ux%u vrefresh=%u\n",
+                           name, crtc_id, mode.hdisplay, mode.vdisplay, mode.vrefresh);
+                } else if (c->count_modes) {
+                    mode = c->modes[0];
+                    printf("connector %s connected crtc=%u mode=%ux%u vrefresh=%u preferred\n",
+                           name, crtc_id, mode.hdisplay, mode.vdisplay, mode.vrefresh);
+                } else {
+                    printf("connector %s connected crtc=%u mode=- vrefresh=0\n",
+                           name, crtc_id);
+                }
+            }
+            drmModeFreeConnector(c);
+        }
         for (int i = 0; i < res->count_crtcs; i++) {
             drmModeCrtc *c = drmModeGetCrtc(fd, res->crtcs[i]);
             if (!c) continue;
-            printf("crtc %u: mode=%s %ux%u active=%d\n", c->crtc_id,
+            printf("crtc %u: mode=%s %ux%u vrefresh=%u active=%d\n", c->crtc_id,
                    c->mode_valid ? c->mode.name : "-",
-                   c->mode.hdisplay, c->mode.vdisplay, c->mode_valid);
+                   c->mode.hdisplay, c->mode.vdisplay, c->mode.vrefresh,
+                   c->mode_valid);
             drmModeFreeCrtc(c);
         }
         drmModeFreeResources(res);
