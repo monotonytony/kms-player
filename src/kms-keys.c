@@ -14,7 +14,13 @@
  * device with a single poll() loop and funnels the events into ONE line
  * oriented stream on stdout:
  *
- *     key <NAME> <1|0|2>      1 = press, 0 = release, 2 = autorepeat
+ *     key <NAME> <1|0|2> <code>   1 = press, 0 = release, 2 = autorepeat
+ *
+ * <NAME> is the KEY_* token, i.e. a PHYSICAL POSITION: KEY_A is the second key
+ * of the home row whatever the language. On an AZERTY keyboard the key labelled
+ * A is at the US Q position and reports KEY_Q. <code> is the raw evdev code so
+ * the player can translate it through the XKB layout (see keylayout in
+ * kms-play-py) instead of guessing from the US name.
  *
  * The parent (kms-play-py) reads that stream on a background thread and
  * dispatches each line into the GLib main loop. kms-keys knows nothing about
@@ -201,9 +207,9 @@ static int g_ndev = 0;
 
 /* Print one event line and flush. A write failure means the parent is gone:
  * exit quietly rather than spin. */
-static int emit(const char *name, int value)
+static int emit(const char *name, int value, unsigned code)
 {
-    if (printf("key %s %d\n", name, value) < 0) return -1;
+    if (printf("key %s %d %u\n", name, value, code) < 0) return -1;
     fflush(stdout);
     return 0;
 }
@@ -216,7 +222,7 @@ static void close_device(struct dev *d)
 {
     if (d->fd >= 0) {
         for (int i = 0; KEYS[i].name; i++)
-            if (d->held & (1u << i)) emit(KEYS[i].name, 0);
+            if (d->held & (1u << i)) emit(KEYS[i].name, 0, KEYS[i].code);
         close(d->fd);
     }
     d->fd = -1;
@@ -281,7 +287,7 @@ static void run_repeats(void)
         for (int k = 0; KEYS[k].name; k++) {
             if (!(d->held & (1u << k)) || d->next[k] == 0.0) continue;
             if (t < d->next[k]) continue;
-            if (emit(KEYS[k].name, 2) < 0) return;
+            if (emit(KEYS[k].name, 2, KEYS[k].code) < 0) return;
             d->next[k] += REPEAT_INTERVAL_MS / 1000.0;
             if (d->next[k] < t) d->next[k] = t + REPEAT_INTERVAL_MS / 1000.0;
         }
@@ -331,7 +337,7 @@ static int drain_device(struct dev *d)
                 d->held &= ~(1u << k);
                 d->next[k] = 0.0;
             }
-            if (emit(name, ev.value) < 0) return 1;
+            if (emit(name, ev.value, ev.code) < 0) return 1;
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;

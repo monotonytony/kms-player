@@ -99,6 +99,14 @@ The OSD is deliberately sober: a thin bar at the bottom of the screen, small lab
 white on translucent black. It never covers the picture and fades out by itself after
 about 1.2 s. It is not animated continuously — it is only redrawn when something changes.
 
+**Letters follow the keyboard layout, not the US position.** The kernel reports key
+*positions*: on an AZERTY keyboard the key labelled `A` sits where a US keyboard has
+`Q` and reports `KEY_Q`. The player therefore compiles the XKB layout declared in
+`/etc/default/keyboard` (`XKBLAYOUT`, via `libxkbcommon`) and translates each keycode,
+so `A`, `S` and `Q` mean the letters actually printed on the keycaps. `ESC`, the arrows,
+space and the media keys are position-independent and are never translated. Override
+with `KMS_PLAY_KEYMAP=us|fr|…` if the declared layout is wrong.
+
 ---
 
 ## Output formats

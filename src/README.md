@@ -291,3 +291,31 @@ It pretends the switch failed as soon as it succeeded; the log must show
 
 The previous run's log is kept as `last.log.prev` (rotated at startup): a crash
 or a failed switch leaves no other trace.
+
+## Keyboard layout
+
+evdev gives **positions**, not characters: `KEY_A` is the second key of the home row
+whatever the language (`KEY_*` codes follow the US physical layout). On an AZERTY
+keyboard the key labelled `A` is at the US `Q` position and reports `KEY_Q`; reading the
+US name literally made `A` do nothing and `Q` quit the film.
+
+`kms-keys` therefore prints the raw evdev code as a fourth field:
+
+```
+key <NAME> <1|0|2> <code>
+```
+
+and `kms-play-py` translates it through the XKB layout declared in
+`/etc/default/keyboard` (`XKBLAYOUT`), using `libxkbcommon` through `ctypes` — no extra
+package, since any Wayland system already ships that library:
+
+* the layout is resolved once at startup: `KMS_PLAY_KEYMAP`, then `XKBLAYOUT`, then
+  `localectl status`, then `us`;
+* only single-letter tokens are translated (`A`, `S`, `Q`); arrows, space, `ENTER`,
+  media keys and `ESC` are position-independent;
+* if the keymap cannot be compiled, the raw US name is used and the reason is logged —
+  a broken layout must not make the player unusable.
+
+Check it without a screen: `/usr/local/bin/kms-keys` prints the stream, and
+`kms-inject A` (which emits evdev code 30, the US `A` position) must appear as `key Q`
+under an AZERTY layout.

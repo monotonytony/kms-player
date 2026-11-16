@@ -189,6 +189,112 @@ def die(message, code=1):
     sys.exit(code)
 
 
+# ---------------------------------------------------------------------------
+# Keyboard layout
+# ---------------------------------------------------------------------------
+def configured_layout():
+    """XKB layout to use, in order of authority.
+
+    The kernel reports key POSITIONS, not characters: KEY_A is the second key of
+    the home row whatever language is configured. On an AZERTY keyboard the key
+    labelled A sits at the US Q position and therefore reports KEY_Q — reading
+    the US name would make A switch nothing and Q quit the film."""
+    candidates = []
+    override = os.environ.get("KMS_PLAY_KEYMAP")
+    if override:
+        candidates.append(override.split(",")[0])
+    try:
+        with open("/etc/default/keyboard") as handle:
+            for line in handle:
+                if line.strip().startswith("XKBLAYOUT="):
+                    value = line.split("=", 1)[1].strip().strip("\"'")
+                    candidates.append(value.split(",")[0])
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["localectl", "status"], capture_output=True,
+                             text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if "X11 Layout" in line:
+                candidates.append(line.split(":", 1)[1].strip().split(",")[0])
+    except Exception:
+        pass
+    return next((c for c in candidates if c), "us")
+
+
+class KeyLayout:
+    """Translate an evdev keycode into the character printed on the keycap.
+
+    libxkbcommon is already installed on any system with a Wayland session, so
+    this costs no dependency; when it is missing or the keymap cannot be
+    compiled, the raw US name is kept (and logged) rather than failing."""
+
+    XKB_KEY_UP, XKB_KEY_DOWN = 0, 1
+
+    def __init__(self, layout=None):
+        self.layout = layout or configured_layout()
+        self.state = None
+        self.lib = None
+        try:
+            import ctypes
+
+            class RuleNames(ctypes.Structure):
+                _fields_ = [("rules", ctypes.c_char_p), ("model", ctypes.c_char_p),
+                            ("layout", ctypes.c_char_p), ("variant", ctypes.c_char_p),
+                            ("options", ctypes.c_char_p)]
+
+            lib = ctypes.CDLL("libxkbcommon.so.0")
+            lib.xkb_context_new.restype = ctypes.c_void_p
+            lib.xkb_context_new.argtypes = [ctypes.c_int]
+            lib.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+            lib.xkb_keymap_new_from_names.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(RuleNames), ctypes.c_int]
+            lib.xkb_state_new.restype = ctypes.c_void_p
+            lib.xkb_state_new.argtypes = [ctypes.c_void_p]
+            lib.xkb_state_update_key.restype = ctypes.c_int
+            lib.xkb_state_update_key.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                ctypes.c_int]
+            lib.xkb_state_key_get_one_sym.restype = ctypes.c_uint32
+            lib.xkb_state_key_get_one_sym.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
+            context = lib.xkb_context_new(0)
+            names = RuleNames(None, None, self.layout.encode(), None, None)
+            keymap = lib.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+            if not keymap:
+                raise RuntimeError("keymap '%s' not found" % self.layout)
+            self.state = lib.xkb_state_new(keymap)
+            if not self.state:
+                raise RuntimeError("cannot allocate xkb state")
+            self.lib = lib
+            log("keyboard layout:", self.layout)
+        except Exception as exc:
+            log("keyboard layout unavailable (%s), key positions are used as-is" % exc)
+            self.state = None
+            self.lib = None
+
+    def token(self, code, name, value):
+        """US name -> name for the configured layout, for letter keys only.
+
+        Arrows, space, media keys and ESC are position-independent and are left
+        untouched."""
+        if self.state is None or self.lib is None or not code:
+            return name
+        if len(name) != 1 or not name.isalpha():
+            return name
+        keycode = code + 8            # evdev code + 8 = XKB keycode
+        direction = self.XKB_KEY_DOWN if value != 0 else self.XKB_KEY_UP
+        try:
+            self.lib.xkb_state_update_key(self.state, keycode, direction)
+            sym = self.lib.xkb_state_key_get_one_sym(self.state, keycode)
+        except Exception:
+            return name
+        if 0x41 <= sym <= 0x5A:
+            return chr(sym)
+        if 0x61 <= sym <= 0x7A:
+            return chr(sym - 32)
+        return name
+
+
 # Displayed on screen, therefore intentionally French: these are user-facing
 # labels, the only place where French is allowed in this project.
 LANGUAGE_NAMES = {
@@ -669,6 +775,7 @@ class Player:
         self.audio_switch_at = 0.0
         self.audio_previous = None
         self.audio_recoveries = 0
+        self.keylayout = KeyLayout()
         self.keyboard = None
 
     # -- infrastructure ----------------------------------------------------
@@ -1132,15 +1239,22 @@ class Player:
                 *lines, buffer = buffer.split(b"\n")
                 for raw in lines:
                     fields = raw.decode("utf-8", "replace").split()
-                    if len(fields) == 3 and fields[0] == "key":
+                    if len(fields) >= 3 and fields[0] == "key":
                         try:
                             value = int(fields[2])
                         except ValueError:
                             continue
+                        code = 0
+                        if len(fields) >= 4:
+                            try:
+                                code = int(fields[3])
+                            except ValueError:
+                                code = 0
+                        name = self.keylayout.token(code, fields[1], value)
                         # Stamp at read time: the main loop may already be
                         # busy with a seek, and the ladder must follow the
                         # viewer's cadence, not our latency.
-                        GLib.idle_add(self._dispatch_key, fields[1], value,
+                        GLib.idle_add(self._dispatch_key, name, value,
                                       monotonic(), priority=GLib.PRIORITY_HIGH)
         except Exception as exc:
             log("keyboard: read error:", exc)
