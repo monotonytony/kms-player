@@ -55,7 +55,7 @@ the original VT on exit.
 | `kms-play-py` | The player: probes the container, picks the video plane, starts the helpers, builds the GStreamer pipeline, renders subtitles and OSD with Pango/Cairo, handles the keyboard. |
 | `kms-subd.c` | Long-lived daemon holding the DRM master. Drives the two ARGB planes; protocol on stdin (`sub cue …`, `osd cue …`, `sub clear`, `osd clear`, `quit`). |
 | `kms-keys.c` | Reads every `/dev/input/event*` with one `poll()` loop and prints `key <NAME> <1\|0\|2>` lines on stdout. **Owns autorepeat**: it drops kernel `value=2` events and synthesises its own (300 ms delay, 60 ms interval), so the behaviour does not depend on the keyboard's `EV_REP` capability or on the desktop's repeat settings. |
-| `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position). `--short` is machine-parsable and is what the player uses to find the NV15 plane. This is the only way to prove "the OSD is visible" without a screen. |
+| `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position) and every connector's DRM name with the mode and vertical refresh actually scanned out on its CRTC. `--short` is machine-parsable and is what the player uses to find the NV15 plane and to report the plane format in the banner. This is the only way to prove "the OSD is visible" without a screen. |
 | `kms-inject.c` | uinput virtual keyboard for tests. Emits one key press with a monotonic timestamp so latency can be measured. |
 | `measure-latency.py` | Measures keyboard → visible-effect latency by watching the OSD plane in `/sys/kernel/debug/dri/0/state`. |
 | `measure-cpu.py` | CPU usage of the player process tree over N seconds. |
@@ -78,7 +78,50 @@ never modified.
 
 Cairo surfaces are written to `/dev/shm/kms-{sub,osd}-<uid>.raw` (tmpfs, no eMMC
 wear) and `kms-subd` copies them row by row — the kernel pitch can be larger than
-`width * 4`.
+`width * 4`. A `WxH` string is written next to each raw file
+(`/dev/shm/kms-{sub,osd}-<uid>.geom`) because the OSD surface changes size: the
+bottom band is `screen × 76`, the startup banner is `880 × 200`.
+
+### Startup banner
+
+Once the decode tier and the video caps are known, `OnScreenDisplay` draws a
+four-line banner in the top left corner (`880x200+40+40` on a 2560x1440 screen)
+and shows it for 8 s, then fades it over 0.8 s (12 renders at 67 ms) and clears
+the plane:
+
+```
+MATÉRIEL · zéro copie          <- tier: MATÉRIEL·zero copy / LOGICIEL·CPU fallback
+H.265 · Main 10 · 3840x1600 · 23.976 i/s   <- codec+profile, size+rate
+Plan 57 · NV15 · DMABuf · zpos 4           <- plane id, fourcc, memory, zpos
+HDMI-A-1 · 2560x1440 @ 75 Hz               <- connector, live mode, vrefresh
+```
+
+Sources, all read at the moment the banner is drawn:
+
+* codec and profile: the compressed caps on the decoder's sink pad, found by a
+  single walk of the pipeline tree (`video/x-h265, profile=main-10` becomes
+  `H.265 Main 10`); ffprobe's stream metadata is the fallback when the decoder
+  cannot be located;
+* width, height, frame rate: the raw caps that reached the video sink;
+* plane format and zpos: `kms-planes --short` for the video plane — the DRM
+  fourcc (`NV15`) and the kernel's zpos, not our own bookkeeping. When the caps
+  format differs from what the plane scans out (software tier: `I420` through
+  videoconvert becomes `NV12`), both are shown: `NV12 (négocié I420)`;
+* connector, mode, refresh: `kms-planes`, one call at startup. The sysfs `modes`
+  file lists supported modes, not the live one, and has no refresh rate, so the
+  connector's routed CRTC and `drmModeModeInfo.vrefresh` are used. If no mode is
+  routed yet, the preferred mode is printed and flagged `preferred`.
+
+The banner and the bottom band share the OSD plane: the board exposes only two
+ARGB planes in total, and the subtitles keep theirs. They cannot be shown at the
+same time — a band render supersedes a visible banner, and any key event calls
+`cancel_banner()` before the key is interpreted, which clears the plane and
+leaves the band free for the action (seek, pause, volume...).
+
+The fade is the only animation in the player: `_start_fade()` schedules a
+self-removing 67 ms timeout, and after the last render the plane is cleared and
+the OSD buffer is blanked, so `kms-shot` reports 0 non-transparent pixels rather
+than a stale image. Idle playback runs no timer for the OSD.
 
 ---
 
@@ -278,7 +321,10 @@ visual claim can be checked from an SSH session.
 
    The video plane must show `nv15=1` (or `nv12=1`) with a `fb=` and a DMABuf
    modifier; the OSD plane must show `fmt=AR24` with a non-zero `fb` only while
-   the OSD is displayed.
+   the OSD is displayed. The same output ends with one `connector` line per
+   connector (`connector HDMI-A-1 connected crtc=81 mode=2560x1440 vrefresh=75`)
+   and one `crtc` line per CRTC: that is where the banner's screen line comes
+   from, and it is also the fastest way to confirm the mode the VOP is driving.
 3. **Zero copy proof**: grep the log for `video caps:` — it must say
    `memory=DMABuf`. `memory=system` means a conversion was inserted, which is a
    failure (the plane accepts NV15 and NV12 natively).
@@ -300,6 +346,12 @@ visual claim can be checked from an SSH session.
    difference between consecutive target positions.
 6. **CPU**: `python3 measure-cpu.py 30` while a 4K file plays. Must stay under one
    core.
+7. **Startup banner**: wait for `/dev/shm/kms-osd-<uid>.geom` to read `880x200`
+   (the banner is up), then `kms-shot osd /tmp/banner.png`. It must be `880x200`
+   with a non-zero pixel count and four text lines. Ten seconds later the geom is
+   back to `Wx76` and `kms-shot osd` prints `0 non-transparent pixels`. Pressing a
+   key while the banner is up must log `banner: cancelled (key …)` and show the
+   bottom band instead.
 
 ## Hardware and software prerequisites
 
@@ -440,17 +492,21 @@ under an AZERTY layout.
 
 Nobody in this pipeline sits in front of the screen, but the overlays do not need an
 eye: the player renders them itself into a cairo ARGB surface and writes that surface
-to `/dev/shm/kms-osd-<uid>.raw` (band 2560x76) and `/dev/shm/kms-sub-<uid>.raw`
-(band 2560x220) before handing the file name to `kms-subd`.
+to `/dev/shm/kms-osd-<uid>.raw` (bottom band 2560x76, or startup banner 880x200) and
+`/dev/shm/kms-sub-<uid>.raw` (band 2560x220) before handing the file name to
+`kms-subd`. The matching `.geom` file holds `WxH`, which is how `kms-shot` knows
+which rectangle a dump contains.
 
 ```sh
-kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label
+kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label, startup banner
 kms-shot sub /tmp/sub.png      # current subtitle cue
+kms-shot osd /tmp/x.png --size 880x200   # manual override if the geom file is gone
 ```
 
-It prints `WxH, N non-transparent pixels`; `N = 0` means the overlay was not showing,
-not that the render is broken. To inspect glyph quality, crop to the non-transparent
-bounding box and scale up — a 3x crop shows the anti-aliased outline clearly.
+It prints `WxH, N non-transparent pixels, size from geom|--size|inferred`; `N = 0`
+means the overlay was not showing, not that the render is broken. To inspect glyph
+quality, crop to the non-transparent bounding box and scale up — a 3x crop shows the
+anti-aliased outline clearly.
 
 The **video plane is out of reach**: its framebuffer is an `NV15` DMABUF allocated by
 the VPU, and the kernel does not expose it for reading. Picture quality stays a human

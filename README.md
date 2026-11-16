@@ -76,7 +76,7 @@ Result: one master, three writers, no tearing, no extra copies.
 | `libkmsshare.so` | C (`LD_PRELOAD`) | Shares the DRM fd with `kmssink` so it can scan out without being master. |
 | `kms-keys` | C | Reads every `/dev/input/event*` with `poll()`, prints one line per key event. |
 | `kms-vt` | shell | Prepares the console VT: switch, clear, hide cursor; restores it on exit. The only command the player runs through sudo. |
-| `kms-planes` | C | Diagnostic: lists every plane, its formats, zpos and alpha capabilities. |
+| `kms-planes` | C | Diagnostic: lists every plane (formats, zpos, alpha, attached framebuffer) and every connector with its live mode and refresh rate. |
 | `kms-inject` | C (`uinput`) | Diagnostic: injects synthetic key events, used to measure input latency. |
 
 ---
@@ -153,6 +153,38 @@ negotiate its DMABuf caps with `kmssink` (`DMABuf caps negotiated without the ma
 support of VideoMeta`), and forcing system memory is not supported by that decoder. The
 software tier is the answer; details and the failed workarounds are in
 [`src/README.md`](src/README.md#decode-tiers).
+
+## Startup banner
+
+When playback is confirmed — the decode tier is decided and the video caps are
+negotiated — the OSD plane shows a four-line banner in the top left corner, in
+French, for 8 seconds, then fades out over 0.8 s and disappears:
+
+```
+MATÉRIEL · zéro copie
+H.265 · Main 10 · 3840x1600 · 23.976 i/s
+Plan 57 · NV15 · DMABuf · zpos 4
+HDMI-A-1 · 2560x1440 @ 75 Hz
+```
+
+| Line | Values come from |
+|---|---|
+| decode tier | the caps probe that decided the tier (`DMABuf` = hardware) |
+| codec, profile | the decoder's input caps (`video/x-h265, profile=main-10`) |
+| resolution, frame rate | the raw caps that reached the sink |
+| plane, format, memory, zpos | `kms-planes --short`, i.e. the kernel's live plane state |
+| connector, mode, refresh | `kms-planes`, from the CRTC's live `drmModeModeInfo` |
+
+In the software tier the first line says « LOGICIEL · repli CPU », and the plane line
+also shows the negotiated format when it differs from what the plane scans out, e.g.
+`Plan 57 · NV12 (négocié I420) · system · zpos 4`. Any key press cancels the banner
+immediately and gives the plane back to the usual bottom band; nothing fades and no
+timer is left running. The fade is the only animation in the player: 12 bounded
+renders, then the plane is cleared and the buffer blanked.
+
+The banner and the bottom band are two different rectangles on the same OSD plane
+(there are only two ARGB planes in total), so the player writes the surface geometry
+next to the buffer (`/dev/shm/kms-osd-<uid>.geom`, `WxH`) for `kms-shot`.
 
 ---
 
@@ -261,14 +293,18 @@ bands as plain cairo ARGB buffers in `/dev/shm` before handing them to `kms-subd
 `kms-shot` reads them back as a PNG:
 
 ```sh
-kms-shot osd /tmp/osd.png     # progress bar, volume, track label
+kms-shot osd /tmp/osd.png     # progress bar, volume, track label, or the startup banner
 kms-shot sub /tmp/sub.png     # the current subtitle cue
+kms-shot osd /tmp/osd.png --size 880x200   # override the recorded geometry
 ```
 
-It prints the number of non-transparent pixels, which distinguishes "drawn" from
-"not showing at the time of the dump". That is how the subtitle rendering was checked
-rather than guessed: white bold glyphs with a black outline, laid out at the real
-position of the pipeline.
+It prints the surface size (and where that size came from), plus the number of
+non-transparent pixels, which distinguishes "drawn" from "not showing at the time of
+the dump". That is how the subtitle rendering was checked rather than guessed: white
+bold glyphs with a black outline, laid out at the real position of the pipeline. The
+OSD is no longer always the same band (the startup banner is a 880x200 rectangle in
+the top left corner), so the player writes `WxH` to `/dev/shm/kms-osd-<uid>.geom`
+alongside the buffer and `kms-shot` reads it back; `--size` is the manual override.
 
 **What still needs a human**: the picture itself. The video plane scans out an `NV15`
 buffer allocated by the VPU as a DMABUF, which is not readable from user space —

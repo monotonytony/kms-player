@@ -46,6 +46,18 @@ to rank NONE and "videoconvert ! kmssink", then seeks back to the position
 reached. One attempt: a second failure stops with a clear message.
 
 ============================================================================
+STARTUP BANNER
+============================================================================
+Once the decode tier and the video caps are known, the OSD plane shows a
+four-line banner in the top left corner: decode tier, codec/profile/resolution/
+frame rate, video plane format and memory, and the active connector and mode.
+It stays for 8 s, then fades out over 0.8 s (12 renders: the only animation in
+the player) and the plane is cleared. Any key cancels it immediately and frees
+the plane for the usual bottom band. Both surfaces are written to
+/dev/shm/kms-osd-<uid>.raw together with a .geom file holding "WxH", because
+kms-shot cannot otherwise tell which geometry a dump contains.
+
+============================================================================
 KEYBOARD MODEL
 ============================================================================
 kms-keys emits a press (1), a release (0) and, while a key is held, repeats
@@ -100,6 +112,11 @@ VT_HELPER = os.environ.get("KMS_PLAY_VT_HELPER", "/usr/local/sbin/kms-vt")
 SOCK_PATH = "/tmp/kms-subd-%d.sock" % UID
 RAW_SUB = "/dev/shm/kms-sub-%d.raw" % UID      # tmpfs: no eMMC wear, no disk I/O
 RAW_OSD = "/dev/shm/kms-osd-%d.raw" % UID
+# Geometry of each overlay surface, rewritten with every dump. The OSD is no
+# longer always the same band (see STARTUP BANNER), so kms-shot cannot infer
+# its size from the file length and needs this file.
+RAW_SUB_GEOM = "/dev/shm/kms-sub-%d.geom" % UID
+RAW_OSD_GEOM = "/dev/shm/kms-osd-%d.geom" % UID
 
 # Children must NOT inherit LD_PRELOAD/KMS_SHARE_SOCK: libkmsshare would make
 # them try to steal the master fd, and kms-subd is the legitimate owner.
@@ -125,6 +142,24 @@ SEEK_DEBOUNCE = 0.120
 
 # Idle time after which the scale restarts at 1 s.
 SEEK_RESET_AFTER = 1.0
+
+# ---------------------------------------------------------------------------
+# Startup banner
+# ---------------------------------------------------------------------------
+# Shown in the top left corner once playback is confirmed (decode tier and
+# caps known): eight seconds of presence, then a single 0.8 s fade. The fade
+# is the only animation in the player: 12 renders at 67 ms, then it removes
+# itself. A key press cancels the banner instead of fading it.
+BANNER_SECONDS = 8.0
+BANNER_FADE = 0.8
+BANNER_FADE_STEP_MS = 67
+BANNER_WIDTH = 880
+BANNER_HEIGHT = 200
+BANNER_X = 40
+BANNER_Y = 40
+BANNER_MARGIN = 22
+BANNER_TOP = 18
+BANNER_LINE_HEIGHT = 40
 
 # An audio track change makes playbin rebuild its audio branch (decoder, resample,
 # sink). On this board that reconfiguration can report ERROR, or even EOS, from
@@ -413,23 +448,134 @@ def probe_media(path):
 
     Only text codecs are kept: image-based subtitles (PGS/DVD) cannot be
     rendered by Pango and would need a bitmap path we do not implement.
-    Returns (audio_streams, subtitle_streams), each a list of dicts."""
+    Returns (audio_streams, subtitle_streams, video_stream), the last one being
+    the first video stream (or {}) used as a fallback by the startup banner
+    when the negotiated caps do not carry every field."""
     proc = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                           "stream=index,codec_type,codec_name:stream_tags=language,title",
+                           "stream=index,codec_type,codec_name,profile,width,height,"
+                           "r_frame_rate:stream_tags=language,title",
                            "-of", "json", path], capture_output=True, text=True)
     try:
         streams = json.loads(proc.stdout or "{}").get("streams", [])
     except Exception as exc:
         log("ffprobe output unreadable:", exc)
-        return [], []
-    audio, subs = [], []
+        return [], [], {}
+    audio, subs, video = [], [], {}
     for stream in streams:
         if stream.get("codec_type") == "audio":
             audio.append(stream)
         elif stream.get("codec_type") == "subtitle" and stream.get("codec_name") in (
                 "subrip", "ass", "ssa", "mov_text", "webvtt"):
             subs.append(stream)
-    return audio, subs
+        elif stream.get("codec_type") == "video" and not video:
+            video = stream
+    return audio, subs, video
+
+
+def write_surface(raw_path, geom_path, surface, width, height):
+    """Write an overlay buffer and its geometry side by side.
+
+    The raw file holds the pixels, the geom file says how wide and high they
+    are: the OSD surface changes shape between the bottom band and the startup
+    banner, and kms-shot reads the buffer back without any other context. The
+    geometry is replaced atomically (tmp + rename) so a capture running at the
+    same time never sees half a size."""
+    with open(raw_path, "wb") as handle:
+        handle.write(bytes(surface.get_data()))
+    tmp = geom_path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write("%dx%d\n" % (width, height))
+    os.replace(tmp, geom_path)
+
+
+def display_info():
+    """Connector name, active mode and refresh rate, from kms-planes.
+
+    Read once at startup. /sys/class/drm/*/modes only lists the modes a
+    connector accepts, never which one is being scanned out, and says nothing
+    about the vertical refresh: only the kernel's CRTC state knows both, which
+    is what kms-planes prints. A connector whose CRTC is not routed yet shows
+    its preferred mode, flagged as such, instead of pretending it is live."""
+    info = {"name": None, "width": 0, "height": 0, "vrefresh": 0}
+    try:
+        out = subprocess.run([PLANES_TOOL], capture_output=True, text=True,
+                             timeout=5, env=CHILD_ENV).stdout
+    except Exception as exc:
+        log("display info: kms-planes failed:", exc)
+        return info
+    for line in out.splitlines():
+        match = re.match(r"connector (\S+) connected crtc=\d+ mode=(\d+)x(\d+) "
+                         r"vrefresh=(\d+)", line)
+        if not match:
+            continue
+        candidate = {"name": match.group(1), "width": int(match.group(2)),
+                     "height": int(match.group(3)), "vrefresh": int(match.group(4))}
+        if "preferred" not in line:
+            return candidate           # live CRTC mode: authoritative
+        if info["name"] is None:
+            info = candidate           # keep as a fallback, keep looking
+    return info
+
+
+def plane_state(plane_id):
+    """fmt/zpos/fb of one plane right now, from kms-planes --short.
+
+    Called when the banner is about to be drawn, not at startup: before the
+    first frame the plane has no framebuffer (fmt "-"). Once the decoder is
+    feeding it, fmt is the DRM fourcc of the buffer actually scanned out, and
+    that is the value the banner must show (NV15 for 10-bit HEVC, even though
+    the GStreamer caps call it DMA_DRM or P010_10LE)."""
+    try:
+        out = subprocess.run([PLANES_TOOL, "--short"], capture_output=True, text=True,
+                             timeout=5, env=CHILD_ENV).stdout
+    except Exception:
+        return {}
+    for line in out.splitlines():
+        match = re.search(r"plane %d zpos=(\d+) fb=(\d+) fmt=(\S+)" % plane_id, line)
+        if match:
+            return {"zpos": int(match.group(1)), "fb": int(match.group(2)),
+                    "fmt": match.group(3)}
+    return {}
+
+
+CODEC_LABELS = {
+    "video/x-h265": "H.265", "video/x-h264": "H.264", "video/x-vp8": "VP8",
+    "video/x-vp9": "VP9", "video/x-av1": "AV1", "video/x-mpeg2": "MPEG-2",
+    "video/x-mpeg4": "MPEG-4", "video/x-theora": "Theora",
+    "hevc": "H.265", "h264": "H.264", "vp8": "VP8", "vp9": "VP9",
+    "av1": "AV1", "mpeg2video": "MPEG-2", "mpeg4": "MPEG-4",
+}
+
+
+def codec_label(name):
+    """Turn a caps structure name or an ffprobe codec_name into H.265 etc."""
+    if not name:
+        return ""
+    return CODEC_LABELS.get(name, name.replace("video/x-", ""))
+
+
+def profile_label(profile):
+    """'main-10' -> 'Main 10', 'high' -> 'High'."""
+    if not profile:
+        return ""
+    return " ".join(part.capitalize() for part in re.split(r"[-_ ]+", profile) if part)
+
+
+def framerate_label(text):
+    """'24000/1001' -> '23.976 i/s', '25/1' -> '25 i/s'."""
+    try:
+        if "/" in str(text):
+            num, den = str(text).split("/")[:2]
+            rate = float(num) / float(den)
+        else:
+            rate = float(text)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return ""
+    if rate <= 0:
+        return ""
+    if abs(rate - round(rate)) < 0.01:
+        return "%d i/s" % round(rate)
+    return "%.3f i/s" % rate
 
 
 def screen_size():
@@ -604,8 +750,7 @@ class Subtitles:
         PangoCairo.show_layout(ctx, self.layout)
 
         self.surface.flush()
-        with open(RAW_SUB, "wb") as handle:
-            handle.write(bytes(self.surface.get_data()))
+        write_surface(RAW_SUB, RAW_SUB_GEOM, self.surface, self.width, self.band_height)
         self.subdaemon.stdin.write("sub cue %d %d %d %d %s\n"
                                    % (0, self.y, self.width, self.band_height, RAW_SUB))
         self.subdaemon.stdin.flush()
@@ -647,18 +792,29 @@ class Subtitles:
 class OnScreenDisplay:
     """Discrete on-screen display on its own ARGB plane.
 
-    A single thin band at the bottom of the screen (default 76 px) containing:
-      - an optional progress bar (seek position, or volume level),
-      - a left label, e.g. "+10 s", "Pause", "Sous-titres : Français",
-      - an optional right label, e.g. "12:34 / 48:45".
+    Two geometries share the plane:
 
-    It is refreshed at most 10 times per second (see show()): a faster rate
-    would burn CPU on cairo and SetPlane for no visible benefit.
+      - the bottom band (default 76 px), with an optional progress bar (seek
+        position or volume level), a left label ("+10 s", "Pause",
+        "Sous-titres : Français") and an optional right label ("12:34 / 48:45");
+      - the startup banner, a BANNER_WIDTH x BANNER_HEIGHT rectangle in the top
+        left corner, four lines of text, shown once for BANNER_SECONDS then
+        faded out over BANNER_FADE.
+
+The plane is the OSD plane either way: the board has only two ARGB planes in
+total (subtitles + OSD), so the banner reuses the OSD one with its own
+rectangle. The two can never be visible at once: drawing the band supersedes a
+visible banner, and any key cancels the banner before the key is handled.
+
+Refresh is event driven. The band is rate limited to 10 Hz (see show()); the
+banner fade is the single bounded exception: 12 renders at 67 ms, then it
+removes its own timer and clears the plane.
     """
 
     def __init__(self, subdaemon, width, screen_height, band_height=None):
         self.subdaemon = subdaemon
         self.width = width
+        self.screen_height = screen_height
         self.band_height = band_height or int(os.environ.get("KMS_OSD_HEIGHT", "76"))
         self.y = screen_height - self.band_height
         self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width, self.band_height)
@@ -674,9 +830,46 @@ class OnScreenDisplay:
         self.pending = False
         self.enabled = True         # toggled by ENTER
 
+        # Banner state. banner_visible covers both the 8 s plateau and the
+        # fade; banner_fading tells the two apart. The surface is allocated on
+        # first use: the banner never shows in a run where decode fails.
+        self.banner_visible = False
+        self.banner_fading = False
+        self.banner_hide_at = 0.0
+        self.banner_lines = []
+        self.banner_surface = None
+        self.banner_ctx = None
+        self.banner_layout = None
+        self.fade_started = 0.0
+        self.fade_source = 0        # GLib timeout id while fading
+
+    # -- buffer plumbing ---------------------------------------------------
+
+    def _blank_band_file(self):
+        """Overwrite the OSD buffer with a fully transparent band surface.
+
+        kms-subd detaches the plane on clear, but the raw file stays on disk:
+        without this, kms-shot would keep reading the last drawn content and
+        report "overlay visible" long after it disappeared. The band geometry
+        is used because that is what the next render will use."""
+        ctx = self.ctx
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        self.surface.flush()
+        write_surface(RAW_OSD, RAW_OSD_GEOM, self.surface, self.width, self.band_height)
+
+    # -- bottom band -------------------------------------------------------
+
     def _render(self):
-        """Draw the current state and push it to the plane. Returns draw ms."""
+        """Draw the band and push it to the plane. Returns draw ms."""
         started = monotonic()
+        if self.banner_visible:
+            # A band render always wins: its rectangle replaces the banner on
+            # the same plane, so the banner state must not survive and later
+            # clear the plane under the band.
+            log("banner: superseded by osd")
+            self._reset_banner()
         ctx = self.ctx
         width, height = self.width, self.band_height
         state = self.state
@@ -712,8 +905,7 @@ class OnScreenDisplay:
             PangoCairo.show_layout(ctx, self.layout)
 
         self.surface.flush()
-        with open(RAW_OSD, "wb") as handle:
-            handle.write(bytes(self.surface.get_data()))
+        write_surface(RAW_OSD, RAW_OSD_GEOM, self.surface, self.width, self.band_height)
         self.subdaemon.stdin.write("osd cue %d %d %d %d %s\n"
                                    % (0, self.y, self.width, self.band_height, RAW_OSD))
         self.subdaemon.stdin.flush()
@@ -738,9 +930,121 @@ class OnScreenDisplay:
         elapsed_ms = self._render()
         log("osd:", label or "-", right, "| render %.1f ms" % elapsed_ms)
 
+    # -- startup banner ----------------------------------------------------
+
+    def show_banner(self, lines, duration=None):
+        """Display the information banner in the top left corner.
+
+        `lines` is at most four strings, already formatted by the player. The
+        banner replaces whatever the band was showing (same plane), stays for
+        `duration` seconds (8 by default) and is then faded by tick()."""
+        if not self.enabled:
+            return
+        duration = BANNER_SECONDS if duration is None else duration
+        lines = [line for line in lines if line][:4]
+        if not lines:
+            return
+        self._reset_banner()
+        self.banner_lines = lines
+        self.banner_visible = True
+        self.banner_hide_at = monotonic() + duration
+        # The band is gone even if it was visible a moment ago: its rectangle
+        # has been replaced by the banner's.
+        self.visible = False
+        self.pending = False
+        elapsed_ms = self._render_banner(1.0)
+        log("banner: shown for %.1f s |" % duration, " | ".join(lines),
+            "| render %.1f ms" % elapsed_ms)
+
+    def _render_banner(self, alpha):
+        """Draw the banner at the given opacity and push it to the plane."""
+        started = monotonic()
+        if self.banner_surface is None:
+            self.banner_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                                     BANNER_WIDTH, BANNER_HEIGHT)
+            self.banner_ctx = cairo.Context(self.banner_surface)
+            self.banner_layout = PangoCairo.create_layout(self.banner_ctx)
+            self.banner_layout.set_width((BANNER_WIDTH - 2 * BANNER_MARGIN) * Pango.SCALE)
+            self.banner_layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            self.banner_layout.set_alignment(Pango.Alignment.LEFT)
+        ctx = self.banner_ctx
+        # Translucent black box: readable over any picture, and the video is
+        # still visible behind it (the VOP blends the plane).
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0.72 * alpha)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        for index, line in enumerate(self.banner_lines):
+            # First line is the decode tier: bold, it is the headline.
+            desc = Pango.FontDescription("Sans Bold 16" if index == 0 else "Sans 15")
+            self.banner_layout.set_font_description(desc)
+            self.banner_layout.set_text(line, -1)
+            ctx.set_source_rgba(1, 1, 1, alpha)
+            ctx.move_to(BANNER_MARGIN, BANNER_TOP + index * BANNER_LINE_HEIGHT)
+            PangoCairo.show_layout(ctx, self.banner_layout)
+        self.banner_surface.flush()
+        write_surface(RAW_OSD, RAW_OSD_GEOM, self.banner_surface, BANNER_WIDTH, BANNER_HEIGHT)
+        self.subdaemon.stdin.write("osd cue %d %d %d %d %s\n"
+                                   % (BANNER_X, BANNER_Y, BANNER_WIDTH, BANNER_HEIGHT,
+                                      RAW_OSD))
+        self.subdaemon.stdin.flush()
+        self.last_render = monotonic()
+        return (self.last_render - started) * 1000
+
+    def _reset_banner(self):
+        """Forget the banner and cancel its fade timer, without touching the
+        plane: callers either redraw the plane immediately or clear it."""
+        self.banner_visible = False
+        self.banner_fading = False
+        self.banner_lines = []
+        if self.fade_source:
+            GLib.source_remove(self.fade_source)
+            self.fade_source = 0
+
+    def cancel_banner(self, reason="key"):
+        """Drop the banner at once, fade included, and free the plane.
+
+        Called for every key event: while the banner is up the plane belongs
+        to it, and a viewer pressing a key is asking for the usual controls.
+        Returns True when something was actually cancelled."""
+        if not self.banner_visible:
+            return False
+        self._reset_banner()
+        self._blank_band_file()
+        self.subdaemon.stdin.write("osd clear\n")
+        self.subdaemon.stdin.flush()
+        log("banner: cancelled (%s)" % reason)
+        return True
+
+    def _start_fade(self):
+        """Begin the one-off fade: 12 renders over BANNER_FADE."""
+        self.banner_fading = True
+        self.fade_started = monotonic()
+        log("banner: fade")
+        # The only animation in the player, and a self-removing one: no timer
+        # survives the fade, so idle playback stays event driven.
+        self.fade_source = GLib.timeout_add(BANNER_FADE_STEP_MS, self._fade_step)
+
+    def _fade_step(self):
+        if not self.banner_visible or not self.banner_fading:
+            self.fade_source = 0
+            return False
+        alpha = 1.0 - (monotonic() - self.fade_started) / BANNER_FADE
+        if alpha <= 0:
+            self.fade_source = 0
+            self._reset_banner()
+            self._blank_band_file()
+            self.subdaemon.stdin.write("osd clear\n")
+            self.subdaemon.stdin.flush()
+            log("banner: hidden")
+            return False
+        self._render_banner(alpha)
+        return True
+
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
+            self.cancel_banner("osd disabled")
             self.hide()
         return self.enabled
 
@@ -750,12 +1054,15 @@ class OnScreenDisplay:
             return
         self.visible = False
         self.state = {}
+        self._blank_band_file()
         self.subdaemon.stdin.write("osd clear\n")
         self.subdaemon.stdin.flush()
         log("osd: hidden")
 
     def tick(self, now):
         """Housekeeping called at 10 Hz from the GLib loop."""
+        if self.banner_visible and not self.banner_fading and now >= self.banner_hide_at:
+            self._start_fade()
         if self.pending:
             self.pending = False
             if self.state and (self.persistent or now < self.hide_at):
@@ -775,7 +1082,14 @@ class Player:
         self.width, self.height = screen_size()
         log("screen:", self.width, "x", self.height)
 
-        self.audio, self.subs = probe_media(media_path)
+        # Connector name, live mode and refresh rate, read once: the banner
+        # must report what the VOP scans out, not what the file claims.
+        self.display = display_info()
+        log("display:", self.display.get("name"),
+            "%dx%d" % (self.display.get("width") or 0, self.display.get("height") or 0),
+            "vrefresh=%s" % self.display.get("vrefresh"))
+
+        self.audio, self.subs, self.probe_video = probe_media(media_path)
         log("audio streams:", [(s["index"], language_name(s.get("tags") or {})[0])
                                for s in self.audio])
         log("subtitle streams:", [(s["index"], (s.get("tags") or {}).get("title", ""),
@@ -809,6 +1123,18 @@ class Player:
         self.tier_logged = False
         self.video_caps_seen = False
         self.play_requested_at = 0.0
+        # Negotiated video description, filled by _on_video_caps and used by
+        # the startup banner. Width/height/framerate come from the raw caps;
+        # codec and profile from the decoder's input caps.
+        self.video_format = ""
+        self.video_drm_format = ""
+        self.video_memory = ""
+        self.video_width = 0
+        self.video_height = 0
+        self.video_framerate = ""
+        self.codec_name = ""
+        self.codec_profile = ""
+        self.banner_shown = False
         self.main_loop = GLib.MainLoop()
         self.finished = False
         self.inhibit_cookie = None
@@ -1014,12 +1340,16 @@ class Player:
             if caps and caps.get_size():
                 structure = caps.get_structure(0)
                 fmt = structure.get_value("format") if structure.has_field("format") else "?"
-                memory = "DMABuf" if "memory:DMABuf" in caps.to_string() else "system"
+                caps_text = caps.to_string()
+                memory = "DMABuf" if "memory:DMABuf" in caps_text else "system"
+                self._record_video_caps(structure, str(fmt), memory, caps_text)
                 if getattr(self, "_last_video_caps", None) != (fmt, memory):
                     self._last_video_caps = (fmt, memory)
                     self.video_caps_seen = True
                     log("video caps:", structure.get_name(), "format=" + str(fmt),
-                        "memory=" + memory)
+                        "memory=" + memory,
+                        "size=%sx%s" % (self.video_width, self.video_height),
+                        "fps=" + (self.video_framerate or "?"))
                     if not self.tier_logged:
                         self.tier_logged = True
                         if self.tier == 1 and memory == "DMABuf":
@@ -1034,7 +1364,92 @@ class Player:
                         else:
                             log("decode tier: software (confirmed, %s in system memory)"
                                 % str(fmt))
+                    # One banner per playback, drawn from the main loop: the
+                    # probe runs on the streaming thread and the banner writes
+                    # to the DRM plane through kms-subd's stdin.
+                    if not self.banner_shown:
+                        self.banner_shown = True
+                        GLib.idle_add(self._show_startup_banner)
         return Gst.PadProbeReturn.OK
+
+    def _record_video_caps(self, structure, fmt, memory, caps_text=""):
+        """Keep the negotiated description for the banner.
+
+        Width, height and framerate are taken from the raw caps (the ones that
+        reached the sink), which is exactly what the VOP will scan out. The
+        codec and its profile are not in those caps (they describe raw video),
+        so they are read from the decoder's input caps and falling back to what
+        ffprobe said about the file if the decoder cannot be located."""
+        self.video_format = fmt
+        self.video_memory = memory
+        for attr, field in (("video_width", "width"), ("video_height", "height")):
+            if structure.has_field(field):
+                try:
+                    setattr(self, attr, int(structure.get_value(field)))
+                except (TypeError, ValueError):
+                    pass
+        # GstFraction has no pygobject conversion, so get_value("framerate")
+        # raises TypeError. The caps string always carries it as a fraction.
+        match = re.search(r"framerate=\(fraction\)\s*(\d+/\d+)", caps_text)
+        if match:
+            self.video_framerate = match.group(1)
+        # 10-bit video is negotiated as DMA_DRM, but the caps also carry the
+        # concrete fourcc the VOP will read (NV15). Handy when kms-planes
+        # cannot be read at that instant.
+        match = re.search(r"drm-format=\(string\)(\S+?)[,\s]", caps_text)
+        if match:
+            self.video_drm_format = match.group(1)
+        if not self.codec_name:
+            name, profile = self._negotiated_codec()
+            if name:
+                self.codec_name, self.codec_profile = name, profile
+                log("codec: %s profile=%s (decoder input caps)"
+                    % (name, profile or "?"))
+            else:
+                probe = self.probe_video or {}
+                self.codec_name = probe.get("codec_name") or ""
+                self.codec_profile = probe.get("profile") or ""
+                log("codec: %s profile=%s (ffprobe fallback)"
+                    % (self.codec_name or "?", self.codec_profile or "?"))
+
+    def _negotiated_codec(self):
+        """Codec and profile from the decoder's sink caps, or ("", "").
+
+        The caps at the video sink are raw video: they cannot name H.265 or its
+        profile. The compressed caps live on the parser/decoder sink pads, so
+        the pipeline tree is scanned once for an element whose sink caps are
+        video/x-<codec> but not raw. The decoder is preferred implicitly by
+        being listed before its parser; a structure carrying `profile` wins
+        because that is the value the banner shows."""
+        codec, profile = "", ""
+        try:
+            iterator = self.pipeline.iterate_recurse()
+        except Exception:
+            return codec, profile
+        while True:
+            try:
+                result, element = iterator.next()
+            except Exception:
+                break
+            if result != Gst.IteratorResult.OK:
+                break
+            if not isinstance(element, Gst.Element):
+                continue
+            sink = element.get_static_pad("sink")
+            if sink is None:
+                continue
+            caps = sink.get_current_caps()
+            if caps is None or not caps.get_size():
+                continue
+            structure = caps.get_structure(0)
+            name = structure.get_name()
+            if not name.startswith("video/x-") or name.startswith("video/x-raw"):
+                continue
+            if not codec:
+                codec = name
+            if structure.has_field("profile"):
+                return name, str(structure.get_value("profile"))
+        return codec, profile
 
     def _on_audio_caps(self, pad, info):
         event = info.get_event()
@@ -1046,6 +1461,66 @@ class Player:
                     "rate=" + str(structure.get_value("rate")
                                   if structure.has_field("rate") else "?"))
         return Gst.PadProbeReturn.OK
+
+    # -- startup banner ----------------------------------------------------
+
+    def _banner_lines(self):
+        """The four banner lines, in French, from the values just negotiated.
+
+        Every value has a single source, so the banner can be trusted as a
+        report and not as a guess:
+          line 1  decode tier     -> the tier the caps probe confirmed;
+          line 2  codec/profile   -> decoder input caps, size/rate -> raw caps;
+          line 3  plane fmt/zpos  -> kms-planes, i.e. the kernel's plane state;
+          line 4  screen          -> kms-planes connector + live CRTC mode.
+        Missing fields are omitted rather than printed as "None"."""
+        if self.tier == 1 and self.video_memory == "DMABuf":
+            tier = "MATÉRIEL · zéro copie"
+        else:
+            tier = "LOGICIEL · repli CPU"
+
+        probe = self.probe_video or {}
+        codec = codec_label(self.codec_name or probe.get("codec_name"))
+        profile = profile_label(self.codec_profile or probe.get("profile"))
+        width = self.video_width or probe.get("width") or 0
+        height = self.video_height or probe.get("height") or 0
+        definition = "%dx%d" % (width, height) if width and height else ""
+        rate = framerate_label(self.video_framerate or probe.get("r_frame_rate"))
+        codec_line = " · ".join(part for part in (codec, profile, definition, rate) if part)
+
+        state = plane_state(self.video_plane)
+        plane_fmt = state.get("fmt") if state else None
+        if not plane_fmt or plane_fmt == "-":
+            # No framebuffer yet (or unreadable): the caps' drm-format is the
+            # concrete fourcc negotiated with the decoder, so it is used next.
+            plane_fmt = self.video_drm_format or self.video_format or "?"
+        pline = "Plan %s · %s" % (self.video_plane, plane_fmt)
+        # The plane scans out what kmssink accepted; the decoder output can be
+        # a different fourcc (I420 through videoconvert becomes NV12). Show
+        # both when they differ, and skip the DMA_DRM pseudo-format: it is
+        # only the caps-level name for "a DRM buffer", not a layout.
+        caps_fmt = self.video_format or ""
+        if (caps_fmt and caps_fmt != plane_fmt and caps_fmt not in ("DMA_DRM", "?")):
+            pline += " (négocié %s)" % caps_fmt
+        pline += " · %s" % ("DMABuf" if self.video_memory == "DMABuf" else "system")
+        if state and "zpos" in state:
+            pline += " · zpos %d" % state["zpos"]
+
+        screen_width = self.display.get("width") or self.width
+        screen_height = self.display.get("height") or self.height
+        sline = "%s · %dx%d" % (self.display.get("name") or "écran",
+                                 screen_width, screen_height)
+        if self.display.get("vrefresh"):
+            sline += " @ %d Hz" % self.display["vrefresh"]
+
+        return [tier, codec_line, pline, sline]
+
+    def _show_startup_banner(self):
+        """idle_add target: draw the banner once the main loop is free."""
+        if self.finished or self.osd is None:
+            return False
+        self.osd.show_banner(self._banner_lines())
+        return False
 
     # -- decode tier fallback ---------------------------------------------
 
@@ -1072,6 +1547,12 @@ class Player:
             return
         self.fallback_done = True
         self.tier = 2
+        # The banner describes the tier that is negotiating caps. After a
+        # fallback it would announce the wrong one, so it is dropped and drawn
+        # again from the new caps (the software tier is worth reporting).
+        if self.osd is not None:
+            self.osd.cancel_banner("decode tier change")
+        self.banner_shown = False
         position = 0.0
         try:
             position = max(0.0, self.position())
@@ -1500,6 +1981,10 @@ class Player:
         if self.finished:
             return
         log("key", name, value, "t=%.6f" % monotonic())
+        # Any key takes the plane back from the banner, before the key is
+        # interpreted: the pressed key may need the bottom band right away.
+        if self.osd is not None:
+            self.osd.cancel_banner("key %s" % name)
         press = (value == 1)
         if name in ("ESC", "Q"):
             if press:
@@ -1591,6 +2076,12 @@ class Player:
             return
         self.finished = True
         log("stop requested")
+        try:
+            if self.osd is not None:
+                self.osd.cancel_banner("stop")
+                self.osd.hide()
+        except Exception:
+            pass
         try:
             if self.subtitles:
                 self.subtitles._clear()

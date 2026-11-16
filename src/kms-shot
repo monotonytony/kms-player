@@ -16,35 +16,97 @@ allocated by the VPU (NV15 DMABUF) and is not readable from user space. Picture
 quality (banding, HDR, motion) still needs a human eye; the overlays do not.
 
 Usage:
-    kms-shot osd [out.png]     # progress bar / volume / track labels
-    kms-shot sub [out.png]     # current subtitle cue
+    kms-shot osd [out.png] [--size WxH]   # progress bar, volume, startup banner
+    kms-shot sub [out.png] [--size WxH]   # current subtitle cue
+
+The player writes the surface geometry next to the raw buffer
+(/dev/shm/kms-osd-<uid>.geom, /dev/shm/kms-sub-<uid>.geom) because the OSD is
+no longer always the same band: the startup banner is a 880x200 rectangle in
+the top left corner, then the plane goes back to the bottom band. The geom
+file is the only way to know which of the two a given dump contains; --size
+is the manual override for dumps taken by an older player or copied elsewhere.
+Without either, the old heuristic (width = bytes / (4 * band height)) still
+applies, which is correct for the fixed subtitle band.
 
 Defaults: ~/kms-osd.png and ~/kms-sub.png. Exit status 1 when the buffer is
 missing (no film playing) or empty (all transparent).
 """
 
 import os
+import re
 import sys
 
 import cairo
 
 RAW_OSD = "/dev/shm/kms-osd-%d.raw" % os.getuid()
 RAW_SUB = "/dev/shm/kms-sub-%d.raw" % os.getuid()
+GEOM_OSD = "/dev/shm/kms-osd-%d.geom" % os.getuid()
+GEOM_SUB = "/dev/shm/kms-sub-%d.geom" % os.getuid()
 
-# Geometry the player uses for its two bands. Kept in sync with
+# Geometry the player uses when nothing better is known. Kept in sync with
 # OnScreenDisplay / Subtitles in kms-play-py; a mismatch shows up immediately
-# as a skewed image, so it is checked against the file size below.
-BANDS = {"osd": (RAW_OSD, 76), "sub": (RAW_SUB, 220)}
+# as a skewed image, which is why the geom file takes precedence.
+BANDS = {"osd": (RAW_OSD, GEOM_OSD, 76), "sub": (RAW_SUB, GEOM_SUB, 220)}
+
+SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
+
+
+def read_geom(path):
+    """Read a 'WxH' file written by the player. Returns (w, h) or None."""
+    try:
+        with open(path, "r") as handle:
+            match = SIZE_RE.match(handle.read().strip())
+    except OSError:
+        return None
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def parse_size(text):
+    match = SIZE_RE.match(text or "")
+    if not match:
+        raise ValueError("--size expects WxH, got %r" % text)
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise ValueError("--size expects positive dimensions, got %r" % text)
+    return width, height
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in BANDS:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print("usage: kms-shot osd|sub [out.png]", file=sys.stderr)
+        print("usage: kms-shot osd|sub [out.png] [--size WxH]", file=sys.stderr)
         return 2
     which = argv[1]
-    path, height = BANDS[which]
-    out = argv[2] if len(argv) > 2 else os.path.expanduser("~/kms-%s.png" % which)
+    path, geom_path, band_height = BANDS[which]
+
+    # Positional argument is the output file; --size may come before or after.
+    out = os.path.expanduser("~/kms-%s.png" % which)
+    forced = None
+    rest = argv[2:]
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        if arg == "--size":
+            if index + 1 >= len(rest):
+                print("--size needs a WxH value", file=sys.stderr)
+                return 2
+            try:
+                forced = parse_size(rest[index + 1])
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            index += 2
+            continue
+        if arg.startswith("--size="):
+            try:
+                forced = parse_size(arg.split("=", 1)[1])
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            index += 1
+            continue
+        out = os.path.expanduser(arg)
+        index += 1
 
     try:
         data = open(path, "rb").read()
@@ -52,11 +114,33 @@ def main(argv):
         print("cannot read %s: %s (is a film playing?)" % (path, exc), file=sys.stderr)
         return 1
 
-    width = len(data) // (4 * height)
+    known = read_geom(geom_path)
+    if forced is not None:
+        width, height = forced
+        source = "--size"
+    elif known is not None:
+        width, height = known
+        source = "geom"
+    else:
+        width, height = 0, band_height
+        source = "inferred"
+
+    if width <= 0:
+        width = len(data) // (4 * height)
     if width <= 0:
         print("%s is too short to hold a %d-row surface" % (path, height), file=sys.stderr)
         return 1
-    if len(data) % (4 * height):
+    if len(data) < width * height * 4:
+        print("%s is %d bytes, needs %d for %dx%d"
+              % (path, len(data), width * height * 4, width, height), file=sys.stderr)
+        return 1
+    if len(data) != width * height * 4 and source != "inferred":
+        # The player always writes exactly W*H*4 bytes, so any other length
+        # means the geometry does not describe this dump (stale geom file or a
+        # wrong --size). The image would still be written, skewed; say so.
+        print("warning: %s is %d bytes, %dx%d needs %d - wrong size?"
+              % (path, len(data), width, height, width * height * 4), file=sys.stderr)
+    if len(data) % (4 * height) and source == "inferred":
         print("warning: %s is %d bytes, not a multiple of %d"
               % (path, len(data), 4 * height), file=sys.stderr)
 
@@ -67,9 +151,9 @@ def main(argv):
 
     # Reported so the caller can tell "drawn" from "empty": a fully transparent
     # band means the overlay was not showing at the time of the dump.
-    opaque = sum(1 for i in range(3, len(data), 4) if data[i])
-    print("%s -> %s (%dx%d, %d non-transparent pixels)"
-          % (path, out, width, height, opaque))
+    opaque = sum(1 for i in range(3, width * height * 4, 4) if data[i])
+    print("%s -> %s (%dx%d, %d non-transparent pixels, size from %s)"
+          % (path, out, width, height, opaque, source))
     return 0 if opaque else 1
 
 
