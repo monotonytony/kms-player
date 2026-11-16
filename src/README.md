@@ -319,3 +319,23 @@ package, since any Wayland system already ships that library:
 Check it without a screen: `/usr/local/bin/kms-keys` prints the stream, and
 `kms-inject A` (which emits evdev code 30, the US `A` position) must appear as `key Q`
 under an AZERTY layout.
+
+## Looking at the overlays: `kms-shot`
+
+Nobody in this pipeline sits in front of the screen, but the overlays do not need an
+eye: the player renders them itself into a cairo ARGB surface and writes that surface
+to `/dev/shm/kms-osd-<uid>.raw` (band 2560x76) and `/dev/shm/kms-sub-<uid>.raw`
+(band 2560x220) before handing the file name to `kms-subd`.
+
+```sh
+kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label
+kms-shot sub /tmp/sub.png      # current subtitle cue
+```
+
+It prints `WxH, N non-transparent pixels`; `N = 0` means the overlay was not showing,
+not that the render is broken. To inspect glyph quality, crop to the non-transparent
+bounding box and scale up — a 3x crop shows the anti-aliased outline clearly.
+
+The **video plane is out of reach**: its framebuffer is an `NV15` DMABUF allocated by
+the VPU, and the kernel does not expose it for reading. Picture quality stays a human
+question.

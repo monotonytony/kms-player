@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
+"""kms-shot - turn one of the player's overlay buffers into a PNG.
+
+The OSD and the subtitles are composited by the player itself into an ARGB
+buffer that it writes to /dev/shm and hands to kms-subd. Those files are plain
+cairo ARGB32 surfaces, so they can be read back and written as a PNG: it is the
+only way to look at what the overlays actually contain without a camera in
+front of the screen, and it is what makes "the OSD looks right" a checkable
+statement instead of an impression.
+
+The decoded video plane cannot be captured this way: its framebuffer is
+allocated by the VPU (NV15 DMABUF) and is not readable from user space. Picture
+quality (banding, HDR, motion) still needs a human eye; the overlays do not.
+
+Usage:
+    kms-shot osd [out.png]     # progress bar / volume / track labels
+    kms-shot sub [out.png]     # current subtitle cue
+
+Defaults: ~/kms-osd.png and ~/kms-sub.png. Exit status 1 when the buffer is
+missing (no film playing) or empty (all transparent).
+"""
+
+import os
+import sys
+
+import cairo
+
+RAW_OSD = "/dev/shm/kms-osd-%d.raw" % os.getuid()
+RAW_SUB = "/dev/shm/kms-sub-%d.raw" % os.getuid()
+
+# Geometry the player uses for its two bands. Kept in sync with
+# OnScreenDisplay / Subtitles in kms-play-py; a mismatch shows up immediately
+# as a skewed image, so it is checked against the file size below.
+BANDS = {"osd": (RAW_OSD, 76), "sub": (RAW_SUB, 220)}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in BANDS:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: kms-shot osd|sub [out.png]", file=sys.stderr)
+        return 2
+    which = argv[1]
+    path, height = BANDS[which]
+    out = argv[2] if len(argv) > 2 else os.path.expanduser("~/kms-%s.png" % which)
+
+    try:
+        data = open(path, "rb").read()
+    except OSError as exc:
+        print("cannot read %s: %s (is a film playing?)" % (path, exc), file=sys.stderr)
+        return 1
+
+    width = len(data) // (4 * height)
+    if width <= 0:
+        print("%s is too short to hold a %d-row surface" % (path, height), file=sys.stderr)
+        return 1
+    if len(data) % (4 * height):
+        print("warning: %s is %d bytes, not a multiple of %d"
+              % (path, len(data), 4 * height), file=sys.stderr)
+
+    surface = cairo.ImageSurface.create_for_data(
+        bytearray(data[:width * height * 4]), cairo.FORMAT_ARGB32, width, height,
+        cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_ARGB32, width))
+    surface.write_to_png(out)
+
+    # Reported so the caller can tell "drawn" from "empty": a fully transparent
+    # band means the overlay was not showing at the time of the dump.
+    opaque = sum(1 for i in range(3, len(data), 4) if data[i])
+    print("%s -> %s (%dx%d, %d non-transparent pixels)"
+          % (path, out, width, height, opaque))
+    return 0 if opaque else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

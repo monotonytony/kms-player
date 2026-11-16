@@ -219,8 +219,23 @@ The cumulative seek scale is checked by `src/test-seek-scale.py`, which injects 
 uinput key presses and asserts the progression 1 / 10 / 30 / 60 / 120 / 240 s,
 the reset after one second of inactivity and the reset on a direction change.
 
-**Not verified by a machine**: how the OSD and the subtitles actually look. Nobody in
-this pipeline sees the screen; that judgement belongs to a human sitting in front of it.
+**Overlays are verifiable without a screen.** The player writes the OSD and the subtitle
+bands as plain cairo ARGB buffers in `/dev/shm` before handing them to `kms-subd`, so
+`kms-shot` reads them back as a PNG:
+
+```sh
+kms-shot osd /tmp/osd.png     # progress bar, volume, track label
+kms-shot sub /tmp/sub.png     # the current subtitle cue
+```
+
+It prints the number of non-transparent pixels, which distinguishes "drawn" from
+"not showing at the time of the dump". That is how the subtitle rendering was checked
+rather than guessed: white bold glyphs with a black outline, laid out at the real
+position of the pipeline.
+
+**What still needs a human**: the picture itself. The video plane scans out an `NV15`
+buffer allocated by the VPU as a DMABUF, which is not readable from user space —
+banding, HDR tone mapping, motion and colour have to be judged by eye.
 
 Detailed component documentation, build instructions and pitfalls live in
 [`src/README.md`](src/README.md).

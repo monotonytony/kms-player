@@ -15,7 +15,7 @@ DEST=/usr/local/bin
 STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP=/root/gst-hevc-patch-$STAMP
 
-FILES="kms-subd kms-keys kms-planes kms-inject kms-play-py kms-play kms-play-next"
+FILES="kms-subd kms-keys kms-planes kms-inject kms-play-py kms-play kms-play-next kms-shot"
 PLAYER_VT=${KMS_PLAY_VT:-4}
 
 mkdir -p "$BACKUP"
