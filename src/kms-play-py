@@ -78,6 +78,12 @@ SUBDAEMON = os.environ.get("KMS_PLAY_SUBD", "/usr/local/bin/kms-subd")
 KEYS_DAEMON = os.environ.get("KMS_PLAY_KEYS", "/usr/local/bin/kms-keys")
 PLANES_TOOL = os.environ.get("KMS_PLAY_PLANES", "/usr/local/bin/kms-planes")
 
+# Console VT reserved for playback. getty is masked on it (see README), and
+# kms-vt clears it, because a text VT keeps the last thing written to it and a
+# login prompt sitting in the letterbox next to the picture is unacceptable.
+PLAYER_VT = os.environ.get("KMS_PLAY_VT", "4")
+VT_HELPER = os.environ.get("KMS_PLAY_VT_HELPER", "/usr/local/sbin/kms-vt")
+
 SOCK_PATH = "/tmp/kms-subd-%d.sock" % UID
 RAW_SUB = "/dev/shm/kms-sub-%d.raw" % UID      # tmpfs: no eMMC wear, no disk I/O
 RAW_OSD = "/dev/shm/kms-osd-%d.raw" % UID
@@ -138,10 +144,27 @@ def log(*args):
 ORIGINAL_VT = [None]
 
 
+def vt_command(action, vt):
+    """Run kms-vt through the single NOPASSWD rule of /etc/sudoers.d/kms-play.
+
+    Non-interactive only: if sudo would need a password we give up silently
+    rather than hang on a prompt nobody can see."""
+    return subprocess.run(["sudo", "-n", VT_HELPER, action, str(vt)],
+                          capture_output=True, text=True, check=False)
+
+
+def restore_vt(vt):
+    """Leave the console usable: show the cursor again, then switch back."""
+    if not vt:
+        return
+    vt_command("show", PLAYER_VT)
+    vt_command("switch", vt)
+
+
 def die(message, code=1):
     log("ERROR:", message)
     if ORIGINAL_VT[0]:
-        subprocess.run(["sudo", "-n", "/usr/bin/chvt", ORIGINAL_VT[0]], check=False)
+        restore_vt(ORIGINAL_VT[0])
     sys.exit(code)
 
 
@@ -625,23 +648,31 @@ class Player:
     # -- infrastructure ----------------------------------------------------
 
     def switch_vt(self):
-        """Move to a free VT before anyone calls drmSetMaster.
+        """Move to the player's VT, cleared, before anyone calls drmSetMaster.
 
         The VT that owns the console holds the DRM master; without switching
         away, drmSetMaster returns EACCES. The previous VT is remembered so it
-        can be restored on exit. sudo is restricted to /usr/bin/chvt by
-        /etc/sudoers.d/kms-play - nothing else is allowed there."""
+        can be restored on exit.
+
+        The target is always PLAYER_VT, never a VT that carries a getty: a
+        login prompt left behind by systemd-logind is drawn on the console
+        framebuffer, and the video plane only covers the picture. In the
+        letterbox it showed up above and below the film. kms-vt (the only
+        sudo command allowed here, see /etc/sudoers.d/kms-play) switches,
+        clears the screen and hides the cursor in one call."""
         active = subprocess.run(["cat", "/sys/class/tty/tty0/active"],
                                 capture_output=True, text=True).stdout.strip()
-        self.previous_vt = active.replace("tty", "") or "2"
+        self.previous_vt = active.replace("tty", "") or "1"
         ORIGINAL_VT[0] = self.previous_vt
-        target = "4" if self.previous_vt == "3" else "3"
-        subprocess.run(["sudo", "-n", "/usr/bin/chvt", target], check=False)
+        result = vt_command("prepare", PLAYER_VT)
+        if result.returncode != 0:
+            log("kms-vt prepare failed:", (result.stderr or "").strip(),
+                "- is the sudoers rule installed?")
         for _ in range(25):
-            if open("/sys/class/tty/tty0/active").read().strip() == "tty" + target:
+            if open("/sys/class/tty/tty0/active").read().strip() == "tty" + PLAYER_VT:
                 break
             time.sleep(0.2)
-        time.sleep(0.5)
+        time.sleep(0.3)
         log("active VT:", open("/sys/class/tty/tty0/active").read().strip())
 
     def start_subdaemon(self):
@@ -1168,7 +1199,12 @@ class Player:
                 self.subdaemon.kill()
         self.release_inhibit()
         if self.previous_vt:
-            subprocess.run(["sudo", "-n", "/usr/bin/chvt", self.previous_vt], check=False)
+            # Never come back to the player's VT: it has no getty, so the user
+            # would land on a blank screen with no way to log in.
+            back = self.previous_vt
+            if back == PLAYER_VT:
+                back = "1"
+            restore_vt(back)
         log("exit, VT", self.previous_vt)
 
 

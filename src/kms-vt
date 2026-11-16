@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+#
+# kms-vt - put the console into the state the player needs, and restore it.
+#
+# kms-play switches to a text VT before it takes the DRM master. That VT must
+# look like a black screen: no login prompt, no boot log, no cursor. Writing to
+# /dev/ttyN and driving the console VT_ACTIVATE ioctl both need root, so this
+# script is the only thing the player is allowed to run through the NOPASSWD
+# rule in /etc/sudoers.d/kms-play.
+#
+#   prepare VT   switch to VT, clear it, hide the cursor
+#   show VT      clear VT and show the cursor again (exit path)
+#   switch VT    switch to VT, leave its contents alone
+#
+# Clearing matters because a VT keeps whatever was last written to it: the
+# console that was active before the film still holds its text, and the VT the
+# player picks may have shown a getty banner earlier.
+set -eu
+
+action=${1:-}
+vt=${2:-}
+
+case "$action" in
+    prepare|show|switch) ;;
+    *)
+        echo "usage: kms-vt prepare|show|switch VT" >&2
+        exit 2
+        ;;
+esac
+
+case "$vt" in
+    ''|*[!0-9]*)
+        echo "kms-vt: VT must be a number, got '$vt'" >&2
+        exit 2
+        ;;
+esac
+
+[ -c "/dev/tty$vt" ] || { echo "kms-vt: /dev/tty$vt is not a VT" >&2; exit 1; }
+
+switch_to() {
+    # chvt reads the console fd from stdin; when the player is started from a
+    # non-interactive context (ssh, cron, systemd) stdin is not a console and
+    # chvt fails silently. /dev/tty0 is the console whatever the caller is.
+    /usr/bin/chvt "$1" < /dev/tty0
+}
+
+case "$action" in
+    prepare)
+        switch_to "$vt"
+        printf '\033[2J\033[H\033[?25l' > "/dev/tty$vt"
+        ;;
+    show)
+        printf '\033[2J\033[H\033[?25h' > "/dev/tty$vt"
+        ;;
+    switch)
+        switch_to "$vt"
+        ;;
+esac

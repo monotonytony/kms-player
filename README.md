@@ -75,6 +75,7 @@ Result: one master, three writers, no tearing, no extra copies.
 | `kms-subd` | C (libdrm) | Holds the DRM master, owns the subtitle and OSD planes, composites ARGB buffers on command. |
 | `libkmsshare.so` | C (`LD_PRELOAD`) | Shares the DRM fd with `kmssink` so it can scan out without being master. |
 | `kms-keys` | C | Reads every `/dev/input/event*` with `poll()`, prints one line per key event. |
+| `kms-vt` | shell | Prepares the console VT: switch, clear, hide cursor; restores it on exit. The only command the player runs through sudo. |
 | `kms-planes` | C | Diagnostic: lists every plane, its formats, zpos and alpha capabilities. |
 | `kms-inject` | C (`uinput`) | Diagnostic: injects synthetic key events, used to measure input latency. |
 
@@ -121,7 +122,10 @@ conversion — exactly the cost this project exists to avoid.
 * Python 3 with `python3-gi`, `gir1.2-gst-1.0`, Pango, PangoCairo, Cairo
 * `libdrm` development headers to build the C helpers
 * Permission to use `/dev/dri/card0` and `/dev/input/event*` as a normal user
-* `chvt` allowed through sudo (the player switches VT before taking the DRM master)
+* `kms-vt` allowed through a `NOPASSWD` sudo rule (`/etc/sudoers.d/kms-play`) — the
+  player switches VT before taking the DRM master, and only root may write to a tty
+* `getty` masked on the player's VT (`systemctl mask getty@ttyN autovt@ttyN`) —
+  `install.sh` does it for the VT it installs
 
 ## Build
 
@@ -135,6 +139,10 @@ sudo make install
 ```sh
 kms-play /path/to/movie.mkv
 ```
+
+Playback happens on **VT4**: the console is switched there, cleared and the cursor hidden,
+so the picture sits on plain black. `ESC`/`Q` gives the console back and returns to the VT
+you came from (never to VT4, which has no getty — you would land on a blank screen).
 
 Logs go to `~/.cache/kms-play/last.log` and record every decision the player makes:
 which planes were selected, which subtitle track was used, every seek, every track change.
@@ -166,6 +174,18 @@ These cost real debugging time; do not rediscover them.
   text subtitle tracks (`subrip`, `ass`, `ssa`, `mov_text`, `webvtt`); PGS tracks are skipped.
 * **A suspended board freezes the display pipeline** (1 fps, Cloudflare loops, etc.).
   Sleep must be disabled at the systemd, logind and gsettings levels.
+* **The login prompt shows up in the letterbox.** The video plane does not fill the
+  screen when the film's aspect ratio differs from the mode's: on 2560x1440 a 2.39:1
+  film scans out at `crtc-pos=2560x1066+0+187`, so 187 px of the console stay visible
+  above and below the picture. Two things keep that area black:
+  * masking **both** `getty@ttyN` **and** `autovt@ttyN`. Masking `getty@ttyN` alone is
+    not enough: systemd-logind starts `autovt@ttyN` directly on every VT switch, and
+    that instance is not covered by the alias mask;
+  * clearing the VT itself (`kms-vt prepare`). A text VT keeps whatever was last
+    written to it, so a VT that once showed a banner still displays it — hiding the
+    cursor and clearing is what makes it actually black. Verify without a screen:
+    `/dev/vcsaN` is the VT's character map, it must contain no character other than
+    space while a film plays.
 * **`Restart=always` is not enough** for the chromium/CDP side of this machine — see the
   watchdog in the parent project.
 

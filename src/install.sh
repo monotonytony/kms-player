@@ -16,6 +16,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP=/root/gst-hevc-patch-$STAMP
 
 FILES="kms-subd kms-keys kms-planes kms-inject kms-play-py kms-play kms-play-next"
+PLAYER_VT=${KMS_PLAY_VT:-4}
 
 mkdir -p "$BACKUP"
 for f in $FILES; do
@@ -31,5 +32,31 @@ for f in $FILES; do
     install -m 0755 "$HERE/$f" "$DEST/$f"
 done
 
-echo "installed: $FILES"
+# The console VT the player switches to must look like a black screen. Two
+# things make that true, both idempotent:
+#   1. kms-vt, the only sudo command the player may run: it switches VT,
+#      clears the screen and hides the cursor.
+#   2. getty masked on that VT. systemd-logind spawns autovt@ttyN on every VT
+#      switch, which prints the login banner exactly where the film's
+#      letterbox is. Masking the instance covers autovt@ttyN too, since
+#      autovt@.service is an alias of getty@.service.
+if [ -e "$HERE/kms-vt" ]; then
+    install -m 0755 "$HERE/kms-vt" /usr/local/sbin/kms-vt
+else
+    echo "missing $HERE/kms-vt" >&2
+    exit 1
+fi
+
+SUDOERS=/etc/sudoers.d/kms-play
+if ! grep -q '^[^#]*/usr/local/sbin/kms-vt' "$SUDOERS" 2>/dev/null; then
+    echo "armbian ALL=(root) NOPASSWD: /usr/local/sbin/kms-vt" >> "$SUDOERS"
+    chmod 0440 "$SUDOERS"
+    visudo -c >/dev/null || { echo "sudoers is now invalid, fix $SUDOERS" >&2; exit 1; }
+fi
+
+systemctl mask --quiet "getty@tty$PLAYER_VT.service" 2>/dev/null || true
+systemctl stop --quiet "getty@tty$PLAYER_VT.service" 2>/dev/null || true
+
+echo "installed: $FILES kms-vt"
+echo "console: VT$PLAYER_VT is dedicated to playback, getty masked on it"
 echo "test with: kms-play-next /path/to/movie.mkv   then   kms-play /path/to/movie.mkv"
