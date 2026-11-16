@@ -144,22 +144,34 @@ SEEK_DEBOUNCE = 0.120
 SEEK_RESET_AFTER = 1.0
 
 # ---------------------------------------------------------------------------
-# Startup banner
+# Information panel
 # ---------------------------------------------------------------------------
-# Shown in the top left corner once playback is confirmed (decode tier and
-# caps known): eight seconds of presence, then a single 0.8 s fade. The fade
-# is the only animation in the player: 12 renders at 67 ms, then it removes
-# itself. A key press cancels the banner instead of fading it.
-BANNER_SECONDS = 8.0
-BANNER_FADE = 0.8
-BANNER_FADE_STEP_MS = 67
-BANNER_WIDTH = 880
-BANNER_HEIGHT = 200
-BANNER_X = 40
-BANNER_Y = 40
-BANNER_MARGIN = 22
-BANNER_TOP = 18
-BANNER_LINE_HEIGHT = 40
+# One panel, two triggers: shown once when playback is confirmed (decode tier
+# and caps known), and on demand with the I key. Eight seconds of presence,
+# then a single 0.8 s fade. The fade is the only animation in the player: 12
+# renders at 67 ms, then it removes itself. A key press cancels the startup
+# panel instead of fading it; the on-demand panel is hidden by a second I and
+# keeps the bottom band suppressed while it is up, so the viewer can seek and
+# keep reading.
+PANEL_SECONDS = 8.0
+PANEL_FADE = 0.8
+PANEL_FADE_STEP_MS = 67
+PANEL_WIDTH = 880
+PANEL_X = 40
+PANEL_Y = 40
+PANEL_MARGIN = 22
+PANEL_TOP = 18
+PANEL_LINE_HEIGHT = 40
+PANEL_BOTTOM = 24
+PANEL_MAX_LINES = 5
+
+
+def panel_height(line_count):
+    """Height of the panel box for a given number of text lines.
+
+    The startup panel has four lines, the on-demand one adds the file name;
+    the box follows so neither has a stray black band under the text."""
+    return PANEL_TOP + line_count * PANEL_LINE_HEIGHT + PANEL_BOTTOM
 
 # An audio track change makes playbin rebuild its audio branch (decoder, resample,
 # sink). On this board that reconfiguration can report ERROR, or even EOS, from
@@ -797,17 +809,20 @@ class OnScreenDisplay:
       - the bottom band (default 76 px), with an optional progress bar (seek
         position or volume level), a left label ("+10 s", "Pause",
         "Sous-titres : Français") and an optional right label ("12:34 / 48:45");
-      - the startup banner, a BANNER_WIDTH x BANNER_HEIGHT rectangle in the top
-        left corner, four lines of text, shown once for BANNER_SECONDS then
-        faded out over BANNER_FADE.
+      - the information panel, a PANEL_WIDTH rectangle in the top left corner
+        with four lines (decode tier, codec, plane, screen) or five when the
+        file name is added. It is shown once for PANEL_SECONDS after playback
+        is confirmed, and on demand with the I key.
 
 The plane is the OSD plane either way: the board has only two ARGB planes in
-total (subtitles + OSD), so the banner reuses the OSD one with its own
-rectangle. The two can never be visible at once: drawing the band supersedes a
-visible banner, and any key cancels the banner before the key is handled.
+total (subtitles + OSD), so the panel reuses the OSD one with its own
+rectangle. The two can never be visible at once, and the rules differ by
+trigger: the startup panel is superseded by a band render and cancelled by
+any key; the on-demand panel (kind "manual") is hidden only by a second I,
+and the bottom band is suppressed while it is up so seeking does not wipe it.
 
 Refresh is event driven. The band is rate limited to 10 Hz (see show()); the
-banner fade is the single bounded exception: 12 renders at 67 ms, then it
+panel fade is the single bounded exception: 12 renders at 67 ms, then it
 removes its own timer and clears the plane.
     """
 
@@ -830,16 +845,18 @@ removes its own timer and clears the plane.
         self.pending = False
         self.enabled = True         # toggled by ENTER
 
-        # Banner state. banner_visible covers both the 8 s plateau and the
-        # fade; banner_fading tells the two apart. The surface is allocated on
-        # first use: the banner never shows in a run where decode fails.
-        self.banner_visible = False
-        self.banner_fading = False
-        self.banner_hide_at = 0.0
-        self.banner_lines = []
-        self.banner_surface = None
-        self.banner_ctx = None
-        self.banner_layout = None
+        # Information-panel state. panel_visible covers both the plateau and
+        # the fade; panel_kind says which trigger owns the plane ("startup"
+        # or "manual"). The surface is allocated on first use: the panel never
+        # shows in a run where decode fails.
+        self.panel_visible = False
+        self.panel_fading = False
+        self.panel_kind = None
+        self.panel_hide_at = 0.0
+        self.panel_lines = []
+        self.panel_surface = None
+        self.panel_ctx = None
+        self.panel_layout = None
         self.fade_started = 0.0
         self.fade_source = 0        # GLib timeout id while fading
 
@@ -859,17 +876,31 @@ removes its own timer and clears the plane.
         self.surface.flush()
         write_surface(RAW_OSD, RAW_OSD_GEOM, self.surface, self.width, self.band_height)
 
+    def _panel_blocks_band(self):
+        """True while the on-demand panel must keep the bottom band away.
+
+        The startup panel is transient and informational; the viewer can wait
+        or press a key. The on-demand panel is read deliberately, possibly
+        while seeking, so the band would destroy it: it stays until I or the
+        timer ends it."""
+        return self.panel_visible and self.panel_kind == "manual"
+
     # -- bottom band -------------------------------------------------------
 
     def _render(self):
         """Draw the band and push it to the plane. Returns draw ms."""
         started = monotonic()
-        if self.banner_visible:
-            # A band render always wins: its rectangle replaces the banner on
-            # the same plane, so the banner state must not survive and later
-            # clear the plane under the band.
-            log("banner: superseded by osd")
-            self._reset_banner()
+        if self.panel_visible:
+            if self._panel_blocks_band():
+                # show() never gets here in that state; this is a safety net
+                # for a render queued before the panel appeared.
+                log("osd: suppressed, info panel visible")
+                return 0.0
+            # A band render always wins over the startup panel: its rectangle
+            # replaces the panel's on the same plane, so the panel state must
+            # not survive and later clear the plane under the band.
+            log("panel: superseded by osd")
+            self._reset_panel()
         ctx = self.ctx
         width, height = self.width, self.band_height
         state = self.state
@@ -921,6 +952,11 @@ removes its own timer and clears the plane.
         This keeps fast key bursts from flooding the DRM plane."""
         if not self.enabled:
             return
+        if self._panel_blocks_band():
+            # The panel is being read on purpose; a seek or a volume change
+            # must not replace it. The action itself still happens.
+            log("osd: suppressed while the info panel is up:", label or "-")
+            return
         self.state = {"label": label, "fraction": fraction, "right": right}
         self.persistent = persistent
         self.hide_at = monotonic() + duration
@@ -930,121 +966,185 @@ removes its own timer and clears the plane.
         elapsed_ms = self._render()
         log("osd:", label or "-", right, "| render %.1f ms" % elapsed_ms)
 
-    # -- startup banner ----------------------------------------------------
+    # -- information panel -------------------------------------------------
 
-    def show_banner(self, lines, duration=None):
-        """Display the information banner in the top left corner.
+    def show_panel(self, lines, kind="startup", duration=None):
+        """Display the information panel in the top left corner.
 
-        `lines` is at most four strings, already formatted by the player. The
-        banner replaces whatever the band was showing (same plane), stays for
-        `duration` seconds (8 by default) and is then faded by tick()."""
+        One renderer, two triggers. `kind="startup"` is the automatic banner:
+        four lines, cancelled by the first key or superseded by a band render.
+        `kind="manual"` is the on-demand panel (key I): the same lines plus
+        the file name, hidden only by a second I or by its timer, while the
+        bottom band stays away under it.
+
+        `lines` are already formatted by the player; at most PANEL_MAX_LINES
+        are drawn and the box height follows their count."""
         if not self.enabled:
             return
-        duration = BANNER_SECONDS if duration is None else duration
-        lines = [line for line in lines if line][:4]
+        duration = PANEL_SECONDS if duration is None else duration
+        lines = [line for line in lines if line][:PANEL_MAX_LINES]
         if not lines:
             return
-        self._reset_banner()
-        self.banner_lines = lines
-        self.banner_visible = True
-        self.banner_hide_at = monotonic() + duration
+        self._reset_panel()
+        self.panel_lines = lines
+        self.panel_kind = kind
+        self.panel_visible = True
+        self.panel_hide_at = monotonic() + duration
         # The band is gone even if it was visible a moment ago: its rectangle
-        # has been replaced by the banner's.
+        # has been replaced by the panel's.
         self.visible = False
         self.pending = False
-        elapsed_ms = self._render_banner(1.0)
-        log("banner: shown for %.1f s |" % duration, " | ".join(lines),
-            "| render %.1f ms" % elapsed_ms)
+        elapsed_ms = self._render_panel(1.0)
+        log("panel: shown (%s) for %.1f s |" % (kind, duration),
+            " | ".join(lines), "| render %.1f ms" % elapsed_ms)
 
-    def _render_banner(self, alpha):
-        """Draw the banner at the given opacity and push it to the plane."""
+    def _fit_middle(self, text, max_width):
+        """Shorten a line in the middle until it fits, keeping the extension.
+
+        Filenames are the reason this exists: the end of the name carries the
+        release tag and the extension, which is what the viewer recognises, so
+        the middle is what gets dropped. Measurement is done with the real
+        Pango layout, so the result fits whatever font ends up being used.
+
+        The layout is measured unwrapped (width -1): with the drawing width
+        set, Pango would report the wrapped block width instead of the natural
+        line width, every long name would look like it fits and would silently
+        wrap onto a second line outside the box."""
+        layout = self.panel_layout
+        layout.set_width(-1)
+        try:
+            layout.set_text(text, -1)
+            if layout.get_pixel_extents()[1].width <= max_width:
+                return text
+            # Cut at a dot rather than at a fixed offset: the tail then holds
+            # whole tokens plus the extension ("x265-TAC.mkv"), which is the
+            # part a viewer recognises, instead of a stray digit.
+            extension = os.path.splitext(text)[1]
+            kept = []
+            for part in reversed(text.split(".")):
+                length = sum(len(p) for p in kept) + len(part) + len(kept)
+                if kept and length > 13:
+                    break
+                kept.insert(0, part)
+            tail = ".".join(kept)
+            head = text[:len(text) - len(tail)].rstrip(".")
+            while True:
+                candidate = (head + "…" + tail) if head else ("…" + tail)
+                layout.set_text(candidate, -1)
+                if layout.get_pixel_extents()[1].width <= max_width:
+                    if not self.panel_fading:
+                        # Logged once, on the opaque render: the fade redraws
+                        # the same line eleven more times and would add noise.
+                        log("panel: shortened:", text, "->", candidate)
+                    return candidate
+                if len(head) > 1:
+                    head = head[:-1]
+                elif len(tail) > len(extension) + 1:
+                    tail = tail[1:]
+                else:
+                    return candidate
+        finally:
+            layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
+
+    def _render_panel(self, alpha):
+        """Draw the panel at the given opacity and push it to the plane."""
         started = monotonic()
-        if self.banner_surface is None:
-            self.banner_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
-                                                     BANNER_WIDTH, BANNER_HEIGHT)
-            self.banner_ctx = cairo.Context(self.banner_surface)
-            self.banner_layout = PangoCairo.create_layout(self.banner_ctx)
-            self.banner_layout.set_width((BANNER_WIDTH - 2 * BANNER_MARGIN) * Pango.SCALE)
-            self.banner_layout.set_wrap(Pango.WrapMode.WORD_CHAR)
-            self.banner_layout.set_alignment(Pango.Alignment.LEFT)
-        ctx = self.banner_ctx
+        height = panel_height(max(1, len(self.panel_lines)))
+        if self.panel_surface is None or self.panel_surface.get_height() != height:
+            self.panel_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                                    PANEL_WIDTH, height)
+            self.panel_ctx = cairo.Context(self.panel_surface)
+            self.panel_layout = PangoCairo.create_layout(self.panel_ctx)
+            self.panel_layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
+            self.panel_layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            self.panel_layout.set_alignment(Pango.Alignment.LEFT)
+        ctx = self.panel_ctx
         # Translucent black box: readable over any picture, and the video is
         # still visible behind it (the VOP blends the plane).
         ctx.set_operator(cairo.OPERATOR_SOURCE)
         ctx.set_source_rgba(0, 0, 0, 0.72 * alpha)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
-        for index, line in enumerate(self.banner_lines):
+        for index, line in enumerate(self.panel_lines):
             # First line is the decode tier: bold, it is the headline.
             desc = Pango.FontDescription("Sans Bold 16" if index == 0 else "Sans 15")
-            self.banner_layout.set_font_description(desc)
-            self.banner_layout.set_text(line, -1)
+            self.panel_layout.set_font_description(desc)
+            text = self._fit_middle(line, PANEL_WIDTH - 2 * PANEL_MARGIN)
+            self.panel_layout.set_text(text, -1)
             ctx.set_source_rgba(1, 1, 1, alpha)
-            ctx.move_to(BANNER_MARGIN, BANNER_TOP + index * BANNER_LINE_HEIGHT)
-            PangoCairo.show_layout(ctx, self.banner_layout)
-        self.banner_surface.flush()
-        write_surface(RAW_OSD, RAW_OSD_GEOM, self.banner_surface, BANNER_WIDTH, BANNER_HEIGHT)
+            ctx.move_to(PANEL_MARGIN, PANEL_TOP + index * PANEL_LINE_HEIGHT)
+            PangoCairo.show_layout(ctx, self.panel_layout)
+        self.panel_surface.flush()
+        write_surface(RAW_OSD, RAW_OSD_GEOM, self.panel_surface, PANEL_WIDTH, height)
         self.subdaemon.stdin.write("osd cue %d %d %d %d %s\n"
-                                   % (BANNER_X, BANNER_Y, BANNER_WIDTH, BANNER_HEIGHT,
-                                      RAW_OSD))
+                                   % (PANEL_X, PANEL_Y, PANEL_WIDTH, height, RAW_OSD))
         self.subdaemon.stdin.flush()
         self.last_render = monotonic()
         return (self.last_render - started) * 1000
 
-    def _reset_banner(self):
-        """Forget the banner and cancel its fade timer, without touching the
+    def _reset_panel(self):
+        """Forget the panel and cancel its fade timer, without touching the
         plane: callers either redraw the plane immediately or clear it."""
-        self.banner_visible = False
-        self.banner_fading = False
-        self.banner_lines = []
+        self.panel_visible = False
+        self.panel_fading = False
+        self.panel_kind = None
+        self.panel_lines = []
         if self.fade_source:
             GLib.source_remove(self.fade_source)
             self.fade_source = 0
 
-    def cancel_banner(self, reason="key"):
-        """Drop the banner at once, fade included, and free the plane.
-
-        Called for every key event: while the banner is up the plane belongs
-        to it, and a viewer pressing a key is asking for the usual controls.
-        Returns True when something was actually cancelled."""
-        if not self.banner_visible:
-            return False
-        self._reset_banner()
+    def _clear_panel(self, reason):
+        """Detach the panel from the plane and blank the captured buffer."""
+        kind = self.panel_kind
+        self._reset_panel()
         self._blank_band_file()
         self.subdaemon.stdin.write("osd clear\n")
         self.subdaemon.stdin.flush()
-        log("banner: cancelled (%s)" % reason)
+        log("panel: hidden (%s, %s)" % (kind, reason))
+
+    def cancel_panel(self, reason="key", kind=None):
+        """Drop the panel at once, fade included, and free the plane.
+
+        `kind` restricts which trigger may be cancelled this way: the startup
+        panel is dropped by the first key, the on-demand panel only by its own
+        key, so a seek does not erase what the viewer is reading.
+        Returns True when something was actually cancelled."""
+        if not self.panel_visible:
+            return False
+        if kind is not None and self.panel_kind != kind:
+            return False
+        self._clear_panel(reason)
         return True
 
+    def hide_panel(self, reason="key I"):
+        """Hide the panel whatever its trigger: the I key toggles it off."""
+        return self.cancel_panel(reason)
+
     def _start_fade(self):
-        """Begin the one-off fade: 12 renders over BANNER_FADE."""
-        self.banner_fading = True
+        """Begin the one-off fade: 12 renders over PANEL_FADE."""
+        self.panel_fading = True
         self.fade_started = monotonic()
-        log("banner: fade")
+        log("panel: fade (%s)" % self.panel_kind)
         # The only animation in the player, and a self-removing one: no timer
         # survives the fade, so idle playback stays event driven.
-        self.fade_source = GLib.timeout_add(BANNER_FADE_STEP_MS, self._fade_step)
+        self.fade_source = GLib.timeout_add(PANEL_FADE_STEP_MS, self._fade_step)
 
     def _fade_step(self):
-        if not self.banner_visible or not self.banner_fading:
+        if not self.panel_visible or not self.panel_fading:
             self.fade_source = 0
             return False
-        alpha = 1.0 - (monotonic() - self.fade_started) / BANNER_FADE
+        alpha = 1.0 - (monotonic() - self.fade_started) / PANEL_FADE
         if alpha <= 0:
             self.fade_source = 0
-            self._reset_banner()
-            self._blank_band_file()
-            self.subdaemon.stdin.write("osd clear\n")
-            self.subdaemon.stdin.flush()
-            log("banner: hidden")
+            self._clear_panel("timer")
             return False
-        self._render_banner(alpha)
+        self._render_panel(alpha)
         return True
 
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
-            self.cancel_banner("osd disabled")
+            self.cancel_panel("osd disabled")
             self.hide()
         return self.enabled
 
@@ -1061,11 +1161,12 @@ removes its own timer and clears the plane.
 
     def tick(self, now):
         """Housekeeping called at 10 Hz from the GLib loop."""
-        if self.banner_visible and not self.banner_fading and now >= self.banner_hide_at:
+        if self.panel_visible and not self.panel_fading and now >= self.panel_hide_at:
             self._start_fade()
         if self.pending:
             self.pending = False
-            if self.state and (self.persistent or now < self.hide_at):
+            if (self.state and not self._panel_blocks_band()
+                    and (self.persistent or now < self.hide_at)):
                 self._render()
         if self.visible and not self.persistent and now >= self.hide_at:
             self.hide()
@@ -1134,7 +1235,7 @@ class Player:
         self.video_framerate = ""
         self.codec_name = ""
         self.codec_profile = ""
-        self.banner_shown = False
+        self.startup_panel_shown = False
         self.main_loop = GLib.MainLoop()
         self.finished = False
         self.inhibit_cookie = None
@@ -1364,12 +1465,12 @@ class Player:
                         else:
                             log("decode tier: software (confirmed, %s in system memory)"
                                 % str(fmt))
-                    # One banner per playback, drawn from the main loop: the
-                    # probe runs on the streaming thread and the banner writes
-                    # to the DRM plane through kms-subd's stdin.
-                    if not self.banner_shown:
-                        self.banner_shown = True
-                        GLib.idle_add(self._show_startup_banner)
+                    # One startup panel per playback, drawn from the main
+                    # loop: the probe runs on the streaming thread and the
+                    # panel writes to the DRM plane through kms-subd's stdin.
+                    if not self.startup_panel_shown:
+                        self.startup_panel_shown = True
+                        GLib.idle_add(self._show_startup_panel)
         return Gst.PadProbeReturn.OK
 
     def _record_video_caps(self, structure, fmt, memory, caps_text=""):
@@ -1462,9 +1563,9 @@ class Player:
                                   if structure.has_field("rate") else "?"))
         return Gst.PadProbeReturn.OK
 
-    # -- startup banner ----------------------------------------------------
+    # -- information panel -------------------------------------------------
 
-    def _banner_lines(self):
+    def _panel_base_lines(self):
         """The four banner lines, in French, from the values just negotiated.
 
         Every value has a single source, so the banner can be trusted as a
@@ -1515,12 +1616,30 @@ class Player:
 
         return [tier, codec_line, pline, sline]
 
-    def _show_startup_banner(self):
-        """idle_add target: draw the banner once the main loop is free."""
+    def _panel_lines(self):
+        """The startup lines plus the file being played, for the I key.
+
+        Base name only: the directory adds nothing and can be very long. The
+        renderer shortens the name in the middle if it does not fit, keeping
+        the extension and the release tag at the end."""
+        return self._panel_base_lines() + [os.path.basename(self.media_path)]
+
+    def _show_startup_panel(self):
+        """idle_add target: draw the startup panel once the main loop is free."""
         if self.finished or self.osd is None:
             return False
-        self.osd.show_banner(self._banner_lines())
+        self.osd.show_panel(self._panel_base_lines(), kind="startup")
         return False
+
+    def toggle_info_panel(self):
+        """Key I: show the panel with the file name, or hide it if it is up.
+
+        Only I closes it: the panel is meant to be read while seeking, so the
+        other keys leave it alone (and the bottom band stays suppressed)."""
+        if self.osd.panel_visible and self.osd.panel_kind == "manual":
+            self.osd.hide_panel("key I")
+            return
+        self.osd.show_panel(self._panel_lines(), kind="manual")
 
     # -- decode tier fallback ---------------------------------------------
 
@@ -1547,12 +1666,12 @@ class Player:
             return
         self.fallback_done = True
         self.tier = 2
-        # The banner describes the tier that is negotiating caps. After a
+        # The panel describes the tier that is negotiating caps. After a
         # fallback it would announce the wrong one, so it is dropped and drawn
         # again from the new caps (the software tier is worth reporting).
         if self.osd is not None:
-            self.osd.cancel_banner("decode tier change")
-        self.banner_shown = False
+            self.osd.cancel_panel("decode tier change")
+        self.startup_panel_shown = False
         position = 0.0
         try:
             position = max(0.0, self.position())
@@ -1981,11 +2100,17 @@ class Player:
         if self.finished:
             return
         log("key", name, value, "t=%.6f" % monotonic())
-        # Any key takes the plane back from the banner, before the key is
-        # interpreted: the pressed key may need the bottom band right away.
+        # The startup panel belongs to the first moments of playback: any key
+        # takes the plane back from it, before the key is interpreted, since
+        # the pressed key may need the bottom band right away. The on-demand
+        # panel (I) is deliberately not cancelled here: it is read while
+        # seeking, so only I closes it.
         if self.osd is not None:
-            self.osd.cancel_banner("key %s" % name)
+            self.osd.cancel_panel("key %s" % name, kind="startup")
         press = (value == 1)
+        if name == "I" and press:
+            self.toggle_info_panel()
+            return
         if name in ("ESC", "Q"):
             if press:
                 self.stop()
@@ -2078,7 +2203,7 @@ class Player:
         log("stop requested")
         try:
             if self.osd is not None:
-                self.osd.cancel_banner("stop")
+                self.osd.cancel_panel("stop")
                 self.osd.hide()
         except Exception:
             pass

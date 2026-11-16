@@ -54,7 +54,7 @@ the original VT on exit.
 |---|---|
 | `kms-play-py` | The player: probes the container, picks the video plane, starts the helpers, builds the GStreamer pipeline, renders subtitles and OSD with Pango/Cairo, handles the keyboard. |
 | `kms-subd.c` | Long-lived daemon holding the DRM master. Drives the two ARGB planes; protocol on stdin (`sub cue …`, `osd cue …`, `sub clear`, `osd clear`, `quit`). |
-| `kms-keys.c` | Reads every `/dev/input/event*` with one `poll()` loop and prints `key <NAME> <1\|0\|2>` lines on stdout. **Owns autorepeat**: it drops kernel `value=2` events and synthesises its own (300 ms delay, 60 ms interval), so the behaviour does not depend on the keyboard's `EV_REP` capability or on the desktop's repeat settings. |
+| `kms-keys.c` | Reads every `/dev/input/event*` with one `poll()` loop and prints `key <NAME> <1\|0\|2>` lines on stdout (the table includes `I` for the information panel). **Owns autorepeat**: it drops kernel `value=2` events and synthesises its own (300 ms delay, 60 ms interval), so the behaviour does not depend on the keyboard's `EV_REP` capability or on the desktop's repeat settings. |
 | `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position) and every connector's DRM name with the mode and vertical refresh actually scanned out on its CRTC. `--short` is machine-parsable and is what the player uses to find the NV15 plane and to report the plane format in the banner. This is the only way to prove "the OSD is visible" without a screen. |
 | `kms-inject.c` | uinput virtual keyboard for tests. Emits one key press with a monotonic timestamp so latency can be measured. |
 | `measure-latency.py` | Measures keyboard → visible-effect latency by watching the OSD plane in `/sys/kernel/debug/dri/0/state`. |
@@ -80,12 +80,13 @@ Cairo surfaces are written to `/dev/shm/kms-{sub,osd}-<uid>.raw` (tmpfs, no eMMC
 wear) and `kms-subd` copies them row by row — the kernel pitch can be larger than
 `width * 4`. A `WxH` string is written next to each raw file
 (`/dev/shm/kms-{sub,osd}-<uid>.geom`) because the OSD surface changes size: the
-bottom band is `screen × 76`, the startup banner is `880 × 200`.
+bottom band is `screen × 76`, the startup panel is `880 × 202` and the on-demand
+panel with the file name is `880 × 242`.
 
-### Startup banner
+### Startup banner and information panel
 
 Once the decode tier and the video caps are known, `OnScreenDisplay` draws a
-four-line banner in the top left corner (`880x200+40+40` on a 2560x1440 screen)
+four-line panel in the top left corner (`880x202+40+40` on a 2560x1440 screen)
 and shows it for 8 s, then fades it over 0.8 s (12 renders at 67 ms) and clears
 the plane:
 
@@ -112,11 +113,28 @@ Sources, all read at the moment the banner is drawn:
   connector's routed CRTC and `drmModeModeInfo.vrefresh` are used. If no mode is
   routed yet, the preferred mode is printed and flagged `preferred`.
 
-The banner and the bottom band share the OSD plane: the board exposes only two
+The panel and the bottom band share the OSD plane: the board exposes only two
 ARGB planes in total, and the subtitles keep theirs. They cannot be shown at the
-same time — a band render supersedes a visible banner, and any key event calls
-`cancel_banner()` before the key is interpreted, which clears the plane and
-leaves the band free for the action (seek, pause, volume...).
+same time, and the rules differ by trigger:
+
+* `kind="startup"` (automatic): four lines, superseded by a band render and
+  cancelled by any key event — `on_key()` calls `cancel_panel(..., kind="startup")`
+  before interpreting the key, so a seek shows its band immediately;
+* `kind="manual"` (key `I`): the same four lines plus a fifth line with the base
+  name of the file. Only `I` closes it (toggle) or the 8 s timer fades it; while it
+  is up, `show()` suppresses the bottom band so seeking, pausing or switching tracks
+  does not erase what is being read. The action itself still happens.
+
+The file line is shortened in the middle by `_fit_middle()`, measured with the real
+Pango layout and unwrapped (with the drawing width set, Pango reports the wrapped
+block width and every long name would look like it fits). The cut is made at a dot,
+so the tail keeps whole release tokens and the extension
+(`Un.Titre.…x265-TEAM.mkv`); the full name is logged once as
+`panel: shortened: <full> -> <shown>`.
+
+The box height follows the line count (`PANEL_TOP + lines*40 + PANEL_BOTTOM`):
+202 px for the startup panel, 242 px with the file name, so neither has a stray
+black band under the text.
 
 The fade is the only animation in the player: `_start_fade()` schedules a
 self-removing 67 ms timeout, and after the last render the plane is cleared and
@@ -133,6 +151,7 @@ than a stale image. Idle playback runs no timer for the OSD.
 | `Space` / `PLAYPAUSE` | Play / pause (pause keeps the last frame) |
 | `A` | Next audio track (cyclic), OSD `Audio : Français — VFF` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`), OSD shows the language |
+| `I` | Information panel (four lines + file name); a second `I` hides it, other keys leave it up |
 | `←` / `→` | Cumulative seek, see below |
 | `↑` / `↓` | Software gain ±2 % (starts at 100 %, ceiling 100 %; `KMS_PLAY_VOLUME_STEP` overrides) |
 | `VOLUMEUP` / `VOLUMEDOWN` / `MUTE` | PipeWire sink volume (`wpctl`), OSD |
@@ -346,12 +365,14 @@ visual claim can be checked from an SSH session.
    difference between consecutive target positions.
 6. **CPU**: `python3 measure-cpu.py 30` while a 4K file plays. Must stay under one
    core.
-7. **Startup banner**: wait for `/dev/shm/kms-osd-<uid>.geom` to read `880x200`
-   (the banner is up), then `kms-shot osd /tmp/banner.png`. It must be `880x200`
-   with a non-zero pixel count and four text lines. Ten seconds later the geom is
-   back to `Wx76` and `kms-shot osd` prints `0 non-transparent pixels`. Pressing a
-   key while the banner is up must log `banner: cancelled (key …)` and show the
-   bottom band instead.
+7. **Startup banner and I panel**: wait for `/dev/shm/kms-osd-<uid>.geom` to read
+   `880x202` (the startup panel is up), then `kms-shot osd /tmp/banner.png`. It
+   must show four text lines. Ten seconds later the geom is back to `Wx76` and
+   `kms-shot osd` prints `0 non-transparent pixels`. Pressing a key while the
+   startup panel is up must log `panel: hidden (startup, key …)` and show the
+   bottom band instead. Pressing `I` must log `panel: shown (manual)` and produce
+   a `880x242` capture with a fifth line (the file name); a second `I` must give
+   `0 non-transparent pixels`, and arrows, `A`, `S`, `Q` must leave it up.
 
 ## Hardware and software prerequisites
 
@@ -492,15 +513,16 @@ under an AZERTY layout.
 
 Nobody in this pipeline sits in front of the screen, but the overlays do not need an
 eye: the player renders them itself into a cairo ARGB surface and writes that surface
-to `/dev/shm/kms-osd-<uid>.raw` (bottom band 2560x76, or startup banner 880x200) and
+to `/dev/shm/kms-osd-<uid>.raw` (bottom band 2560x76, or information panel 880x202 /
+880x242) and
 `/dev/shm/kms-sub-<uid>.raw` (band 2560x220) before handing the file name to
 `kms-subd`. The matching `.geom` file holds `WxH`, which is how `kms-shot` knows
 which rectangle a dump contains.
 
 ```sh
-kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label, startup banner
+kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label, info panel
 kms-shot sub /tmp/sub.png      # current subtitle cue
-kms-shot osd /tmp/x.png --size 880x200   # manual override if the geom file is gone
+kms-shot osd /tmp/x.png --size 880x242   # manual override if the geom file is gone
 ```
 
 It prints `WxH, N non-transparent pixels, size from geom|--size|inferred`; `N = 0`

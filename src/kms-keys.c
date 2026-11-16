@@ -121,6 +121,7 @@ static const struct key_name KEYS[] = {
     { KEY_Q,            "Q" },
     { KEY_A,            "A" },
     { KEY_S,            "S" },
+    { KEY_I,            "I" },
     { KEY_SPACE,        "SPACE" },
     { KEY_LEFT,         "LEFT" },
     { KEY_RIGHT,        "RIGHT" },

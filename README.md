@@ -90,6 +90,7 @@ Result: one master, three writers, no tearing, no extra copies.
 | `Space` | Play / pause |
 | `A` | Next audio track (cyclic) — OSD shows `Language — track title` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`) — OSD shows the language |
+| `I` | Information panel in the top left corner, with the file name; a second `I` hides it |
 | `←` / `→` | Seek backwards / forwards, **cumulative ladder**: 1st press 1 s, then 10 s, 30 s, 60 s, 120 s, then 240 s (max). Resets after 1 s without a press or when the direction changes. |
 | `↑` / `↓` | Software volume ±2 % (player gain, 0-100 %, starts at 100 %; `KMS_PLAY_VOLUME_STEP=1` for 1 %), with a discrete bar |
 | Media keys | System volume through PipeWire (`wpctl`), with the same bar |
@@ -154,7 +155,7 @@ support of VideoMeta`), and forcing system memory is not supported by that decod
 software tier is the answer; details and the failed workarounds are in
 [`src/README.md`](src/README.md#decode-tiers).
 
-## Startup banner
+## Startup banner and information panel
 
 When playback is confirmed — the decode tier is decided and the video caps are
 negotiated — the OSD plane shows a four-line banner in the top left corner, in
@@ -175,16 +176,25 @@ HDMI-A-1 · 2560x1440 @ 75 Hz
 | plane, format, memory, zpos | `kms-planes --short`, i.e. the kernel's live plane state |
 | connector, mode, refresh | `kms-planes`, from the CRTC's live `drmModeModeInfo` |
 
+Pressing **I** shows the same panel at any time, with a fifth line holding the file
+name (base name only). A long name is shortened in the middle, keeping the extension
+and the last release tokens: `Un.Titre.…x265-TEAM.mkv`. A second **I** hides the
+panel at once; otherwise it fades after the same 8 s. Other keys do **not** close
+it — seeking, pausing, changing tracks and reading it at the same time is the point
+— so the bottom band stays suppressed while the panel is up.
+
 In the software tier the first line says « LOGICIEL · repli CPU », and the plane line
 also shows the negotiated format when it differs from what the plane scans out, e.g.
-`Plan 57 · NV12 (négocié I420) · system · zpos 4`. Any key press cancels the banner
-immediately and gives the plane back to the usual bottom band; nothing fades and no
-timer is left running. The fade is the only animation in the player: 12 bounded
-renders, then the plane is cleared and the buffer blanked.
+`Plan 57 · NV12 (négocié I420) · system · zpos 4`. The startup panel is cancelled by
+the first key, before that key is interpreted, so the usual band appears immediately;
+the I panel ignores every key except I.
 
-The banner and the bottom band are two different rectangles on the same OSD plane
-(there are only two ARGB planes in total), so the player writes the surface geometry
-next to the buffer (`/dev/shm/kms-osd-<uid>.geom`, `WxH`) for `kms-shot`.
+The fade is the only animation in the player: 12 bounded renders, then the plane is
+cleared and the buffer blanked. The panel and the bottom band are two different
+rectangles on the same OSD plane (there are only two ARGB planes in total), so the
+player writes the surface geometry next to the buffer (`/dev/shm/kms-osd-<uid>.geom`,
+`WxH`) for `kms-shot`, and the box height follows the number of lines (202 px for the
+startup panel, 242 px with the file name).
 
 ---
 
@@ -293,16 +303,16 @@ bands as plain cairo ARGB buffers in `/dev/shm` before handing them to `kms-subd
 `kms-shot` reads them back as a PNG:
 
 ```sh
-kms-shot osd /tmp/osd.png     # progress bar, volume, track label, or the startup banner
+kms-shot osd /tmp/osd.png     # progress bar, volume, track label, or the info panel
 kms-shot sub /tmp/sub.png     # the current subtitle cue
-kms-shot osd /tmp/osd.png --size 880x200   # override the recorded geometry
+kms-shot osd /tmp/osd.png --size 880x242   # override the recorded geometry
 ```
 
 It prints the surface size (and where that size came from), plus the number of
 non-transparent pixels, which distinguishes "drawn" from "not showing at the time of
 the dump". That is how the subtitle rendering was checked rather than guessed: white
 bold glyphs with a black outline, laid out at the real position of the pipeline. The
-OSD is no longer always the same band (the startup banner is a 880x200 rectangle in
+OSD is no longer always the same band (the information panel is a 880-wide rectangle in
 the top left corner), so the player writes `WxH` to `/dev/shm/kms-osd-<uid>.geom`
 alongside the buffer and `kms-shot` reads it back; `--size` is the manual override.
 
