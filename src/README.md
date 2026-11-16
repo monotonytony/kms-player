@@ -265,3 +265,29 @@ Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>.
 
 The complete license text is in the `LICENSE` file of the repository. Every
 source file carries an SPDX header with the same information.
+
+## Audio switch resilience
+
+`current-audio` makes playbin rebuild the whole audio branch (decoder, resample,
+sink). On this board that reconfiguration can post **ERROR** or even **EOS** from
+the audio side while the video keeps running perfectly. Ending the film there is
+wrong, so `recover_audio_switch()` catches these messages when they arrive within
+`AUDIO_SWITCH_GRACE` (3 s) of a switch: it restores the previous track, re-anchors
+the pipeline with a seek, shows "Piste audio indisponible" and keeps playing. Two
+attempts maximum, then the message is treated normally.
+
+A file with a single audio track is never reconfigured at all — pressing `A` just
+recalls the label.
+
+Self-test of that path on real hardware:
+
+```sh
+KMS_PLAY_AUDIO_SELFTEST=1 kms-play film.mkv    # then press A
+```
+
+It pretends the switch failed as soon as it succeeded; the log must show
+`audio switch failed, restoring track N` and the video must keep advancing
+(`plane[57] fb=` changes).
+
+The previous run's log is kept as `last.log.prev` (rotated at startup): a crash
+or a failed switch leaves no other trace.

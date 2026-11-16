@@ -113,6 +113,17 @@ SEEK_DEBOUNCE = 0.120
 # Idle time after which the scale restarts at 1 s.
 SEEK_RESET_AFTER = 1.0
 
+# An audio track change makes playbin rebuild its audio branch (decoder, resample,
+# sink). On this board that reconfiguration can report ERROR, or even EOS, from
+# the rendering side. Such a message is not a reason to end the film: within
+# this window after a switch it is treated as a failed switch, the previous
+# track is restored and playback continues.
+AUDIO_SWITCH_GRACE = 3.0
+
+# Self-test hook: pretend a switch failed as soon as it succeeded, to exercise
+# recover_audio_switch() against the real pipeline. Never set in normal use.
+AUDIO_SWITCH_SELFTEST = os.environ.get("KMS_PLAY_AUDIO_SELFTEST") == "1"
+
 # ---------------------------------------------------------------------------
 # Software gain
 # ---------------------------------------------------------------------------
@@ -130,6 +141,13 @@ SOFTWARE_GAIN_STEP = max(1.0, min(25.0, float(os.environ.get("KMS_PLAY_VOLUME_ST
 
 # Truncate then reopen in append mode: kms-subd also writes to this descriptor
 # (stderr), and append avoids NUL holes if the file is truncated mid-flight.
+# The previous run is kept as last.log.prev: a crash or a failed track switch
+# leaves no other trace, and losing it cost a whole debugging session.
+try:
+    if os.path.getsize(LOG_PATH) > 0:
+        os.replace(LOG_PATH, LOG_PATH + ".prev")
+except OSError:
+    pass
 open(LOG_PATH, "w").close()
 log_file = open(LOG_PATH, "a", buffering=1)
 
@@ -646,6 +664,11 @@ class Player:
         self.seek_direction = 0
         self.seek_index = 0
         self.seek_last_at = 0.0
+
+        # Audio switch bookkeeping (see next_audio / recover_audio_switch).
+        self.audio_switch_at = 0.0
+        self.audio_previous = None
+        self.audio_recoveries = 0
         self.keyboard = None
 
     # -- infrastructure ----------------------------------------------------
@@ -930,13 +953,81 @@ class Player:
             self.osd.show(label="Aucune piste audio", right="")
             return
         count = len(self.audio)
-        current = self.pipeline.get_property("current-audio")
+        try:
+            current = self.pipeline.get_property("current-audio")
+        except Exception as exc:
+            log("cannot read current-audio:", exc)
+            current = 0
+        if not isinstance(current, int) or current < 0:
+            current = 0
         following = (current + 1) % count
-        self.pipeline.set_property("current-audio", following)
         name, title = language_name(self.audio[following].get("tags") or {})
         label = track_label(name, title)
+        if following == current:
+            # Single track: playbin would still rebuild its audio branch for a
+            # switch to itself, which is pure risk for no gain.
+            log("audio track: only one, no switch")
+            self.osd.show(label="Audio : %s" % label, duration=1.5)
+            return
+        if monotonic() - self.audio_switch_at > 5.0:
+            self.audio_recoveries = 0
+        self.audio_previous = current
+        self.audio_switch_at = monotonic()
+        try:
+            self.pipeline.set_property("current-audio", following)
+        except Exception as exc:
+            log("audio switch refused:", exc)
+            self.osd.show(label="Piste audio indisponible", duration=2.0)
+            self.audio_switch_at = 0.0
+            return
         log("audio track ->", following, "/", count, label, "|", title)
         self.osd.show(label="Audio : %s" % label, duration=1.5)
+        if AUDIO_SWITCH_SELFTEST:
+            log("self-test: pretending the switch failed")
+            self.recover_audio_switch()
+
+    def recover_audio_switch(self, eos=False):
+        """Turn a failed audio switch into a no-op instead of the end of the film.
+
+        playbin rebuilds decoder and sink when current-audio changes, and that
+        reconfiguration can post ERROR or EOS from the audio branch. Ending the
+        film there is wrong: the video side is fine. Put the previous track
+        back, re-anchor the pipeline and keep playing.
+
+        Returns True when the message was absorbed, False when it must still be
+        treated as a real error or a real end of stream."""
+        if not self.audio_switch_at:
+            return False
+        if monotonic() - self.audio_switch_at > AUDIO_SWITCH_GRACE:
+            return False
+        if eos:
+            # A genuine EOS arrives near the end of the film; anything earlier
+            # right after a switch is the reconfiguration talking.
+            position = self.position()
+            if self.duration and position < self.duration - 10:
+                log("spurious EOS during audio switch at %s, ignoring" % hms(position))
+            else:
+                return False
+        if self.audio_recoveries >= 2:
+            log("audio recovery already attempted twice, giving up")
+            return False
+        self.audio_recoveries += 1
+        previous = self.audio_previous
+        log("audio switch failed, restoring track", previous)
+        self.audio_switch_at = 0.0
+        if previous is None:
+            return False
+        try:
+            self.pipeline.set_property("current-audio", previous)
+            self.pipeline.seek_simple(Gst.Format.TIME,
+                                      Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                                      int(max(0.0, self.position()) * Gst.SECOND))
+        except Exception as exc:
+            log("audio restore failed:", exc)
+            return False
+        self.audio_switch_at = monotonic()
+        self.osd.show(label="Piste audio indisponible", duration=2.5)
+        return True
 
     def next_subtitle(self):
         """Cycle text tracks, then "off", then back to the first track."""
@@ -1127,11 +1218,15 @@ class Player:
     def on_message(self, bus, message):
         message_type = message.type
         if message_type == Gst.MessageType.EOS:
+            if self.recover_audio_switch(eos=True):
+                return
             log("end of stream (EOS)")
             self.stop()
         elif message_type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             log("PIPELINE ERROR:", error.message, "|", debug)
+            if self.recover_audio_switch():
+                return
             self.stop()
         elif message_type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
