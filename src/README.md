@@ -138,6 +138,34 @@ screen coverage is not readable and only `fb!=0` is verified; a driver without
 a usable `type` property is treated as `unknown`; and on a single-CRTC board the
 "plane of another CRTC" refusal cannot be exercised because every mask is `0x1`.
 
+### Display mode: `kms-subd` is the only caller of `drmModeSetCrtc`
+
+The VT switch lets fbdev emulation reprogram the CRTC (75 Hz on the desktop
+becomes 60 Hz on the player's VT) and `kmssink` never mode-sets, so any other
+rate has to be programmed by the process holding the DRM master: `kms-subd`.
+It serves `<sock>.ctl` next to the fd-passing socket, one request line and one
+reply line per connection (`current`, `rates`, `mode W H rate`,
+`mode remember W H rate`, `mode restore`, `vblank`). Selection is by resolution
+(the active one) then by closest rate within 1 Hz; the mode is programmed at
+`fb = cur->buffer_id`, then **read back** with `drmModeGetCrtc`, and a mismatch
+reverts to the previous mode before answering `err verify`. `rates` and every
+`err` list what the connector actually offers, so the player can explain a
+refusal instead of guessing.
+
+`kms-play-py` (`_setup_refresh`, `_apply_refresh`, `_restore_refresh`) applies
+the mode after `switch_vt()` and before `PLAYING`, chooses `k` in `2..6` such
+that `k x fps` is within 0.5 % of an available mode, and restores the previous
+mode before `exit_to_vt()`. `KMS_PLAY_REFRESH=auto|off|<Hz>` and
+`KMS_PLAY_STATS=1` are documented in the top-level README; no failure here can
+stop playback, the worst case is one log line and the mode already running.
+
+On this board the panel's 119.998/144.002 Hz EDID timings are dropped by the
+kernel (mode list capped around 340 MHz TMDS) and a direct `drmModeSetCrtc` with
+the EDID timing returns `EINVAL`, so the player keeps 60 Hz and says so. The
+path is tested with 75 Hz (a mode that exists): applied, verified by read-back,
+measured at 74.98-75.20 Hz from the vblank counter, restored to 59.968 Hz on
+exit.
+
 ### Startup banner and information panel
 
 Once the decode tier and the video caps are known, `OnScreenDisplay` draws a

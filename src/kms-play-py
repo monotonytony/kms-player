@@ -95,6 +95,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -133,6 +134,18 @@ RETURN_VT_SETTING = os.environ.get("KMS_PLAY_RETURN_VT", "").strip()
 ACTIVE_VT_PATH = "/sys/class/tty/tty0/active"
 
 SOCK_PATH = "/tmp/kms-subd-%d.sock" % UID
+# Control socket of the daemon: one request line, one reply line. It carries
+# the display-mode requests, which only the DRM master can satisfy.
+CTL_PATH = SOCK_PATH + ".ctl"
+# KMS_PLAY_REFRESH: "auto" (default) picks the rate that divides the source
+# cadence, "off" keeps whatever the kernel programmed, a number (Hz) asks for
+# that exact rate. Any failure falls back to the current mode silently.
+REFRESH_SETTING = os.environ.get("KMS_PLAY_REFRESH", "auto").strip().lower()
+# KMS_PLAY_STATS=1 logs one counter line per 5 s window: frames rendered,
+# frames late or duplicated, worst gap, and the refresh rate measured from the
+# CRTC's vblank counter. Off by default: it costs one pad probe.
+STATS_ENABLED = os.environ.get("KMS_PLAY_STATS", "").strip() == "1"
+STATS_WINDOW = 5.0
 RAW_SUB = "/dev/shm/kms-sub-%d.raw" % UID      # tmpfs: no eMMC wear, no disk I/O
 RAW_OSD = "/dev/shm/kms-osd-%d.raw" % UID
 # Geometry of each overlay surface, rewritten with every dump. The OSD is no
@@ -2034,6 +2047,120 @@ def planes_in_use():
     return busy
 
 
+def subd_ctl(request, timeout=4.0):
+    """One request line, one reply line, on the daemon's control socket.
+
+    Returns the reply ("ok ..." or "err ..."), or "" when the socket is
+    missing or silent. Every caller treats "" as "keep what you have": a
+    display-mode request is an optimisation, never a condition for playback,
+    so a dead socket must not raise on the GStreamer threads."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(CTL_PATH)
+            sock.sendall((request + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                data += chunk
+        return data.decode("utf-8", "replace").strip()
+    except OSError as exc:
+        log("refresh: control socket: %s" % exc)
+        return ""
+
+
+def parse_mode_reply(reply):
+    """'ok 2560x1440@119.998' -> (2560, 1440, 119.998); None otherwise."""
+    match = re.match(r"ok (\d+)x(\d+)@([\d.]+)$", reply or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), float(match.group(3))
+
+
+def current_mode():
+    """Mode the CRTC is really scanning out, read from the daemon."""
+    return parse_mode_reply(subd_ctl("current"))
+
+
+def available_rates():
+    """Refresh rates the connector offers at the active resolution."""
+    reply = subd_ctl("rates")
+    if not reply.startswith("ok"):
+        return []
+    rates = []
+    for part in reply[2:].split():
+        try:
+            rates.append(float(part))
+        except ValueError:
+            pass
+    return rates
+
+
+def source_rate(probe, caps_framerate=""):
+    """Frame rate of the source, as a float, or 0.0 when unknown.
+
+    The negotiated caps win (that is what the decoder really produces); the
+    container's r_frame_rate is the fallback for codecs whose caps carry
+    framerate=0/1 (some raw/MPEG-2 streams)."""
+    for text in (caps_framerate, (probe or {}).get("r_frame_rate"),
+                 (probe or {}).get("avg_frame_rate")):
+        try:
+            if text and "/" in str(text):
+                num, den = str(text).split("/")[:2]
+                rate = float(num) / float(den)
+            elif text:
+                rate = float(text)
+            else:
+                continue
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if 1.0 < rate < 1000.0:
+            return rate
+    return 0.0
+
+
+def choose_refresh(fps, setting=REFRESH_SETTING):
+    """Pick an available mode rate for this source cadence.
+
+    A display refreshes whole frames, so a source at 23.976 fps looks smooth
+    only when the refresh is an integer multiple of it: 5 x 23.976 = 119.88,
+    within 0.1 % of the panel's 119.998 Hz mode, so every frame is shown for
+    the same number of refreshes. At 60 Hz the same film gets 2 refreshes,
+    then 3, then 2 (60 / 23.976 = 2.5), which is the judder.
+
+    Returns (rate, k, error_percent) with k the multiplier (None when the user
+    asked for an exact rate), or None when nothing fits within 0.5 %: the
+    caller then keeps the current mode and says so in one log line."""
+    rates = available_rates()
+    if not rates:
+        return None
+    if setting != "auto":
+        try:
+            want = float(setting)
+        except ValueError:
+            log("refresh: KMS_PLAY_REFRESH=%r is not auto/off/Hz, using auto"
+                % setting)
+        else:
+            best = min(rates, key=lambda r: abs(r - want))
+            if abs(best - want) <= 1.0:
+                return best, None, 100.0 * abs(best - want) / best
+            return None
+    if fps <= 0:
+        return None
+    best = None
+    for k in range(2, 7):
+        target = fps * k
+        rate = min(rates, key=lambda r: abs(r - target))
+        error = abs(rate - target) / rate * 100.0
+        if best is None or error < best[2]:
+            best = (rate, k, error)
+    if best is None or best[2] >= 0.5:
+        return None
+    return best
+
+
 def console_text(text, limit=120):
     """Flatten a string for the VT: no control characters, no newlines.
 
@@ -2897,6 +3024,16 @@ class Player:
             "%dx%d" % (self.display.get("width") or 0, self.display.get("height") or 0),
             "vrefresh=%s" % self.display.get("vrefresh"))
 
+        # Display mode actually applied for this playback, and the mode the
+        # screen had before (for the exit path). Filled by _setup_refresh.
+        self.refresh_applied = None
+        self.refresh_original = None
+        self.refresh_pending = False
+        # Pacing counters, only allocated when KMS_PLAY_STATS=1 (see
+        # _on_stats_buffer).
+        self.stats = None
+        self.stats_total = None
+
         self.audio, self.subs, self.probe_video = probe_media(media_path)
         log("audio streams:", [(s["index"], language_name(s.get("tags") or {})[0])
                                for s in self.audio])
@@ -3066,6 +3203,114 @@ class Player:
         self.subtitles = Subtitles(self.subdaemon, self.width, self.height)
         self.osd = OnScreenDisplay(self.subdaemon, self.width, self.height)
 
+    # -- display mode ------------------------------------------------------
+
+    def _refresh_label(self):
+        """Rate printed on the panel: the mode actually applied.
+
+        kms-planes reports the CRTC's vrefresh, and a DRM mode carries it as
+        an integer (120 for the 119.998 Hz timing), so the panel shows that
+        integer: it is the mode's identity, and the viewer reads the television
+        line, not a timing analysis. The exact rate stays in the log."""
+        if self.refresh_applied:
+            return int(round(self.refresh_applied[2]))
+        return self.display.get("vrefresh")
+
+    def _setup_refresh(self):
+        """Ask the daemon to put the screen at a rate that fits the source.
+
+        Order matters and is enforced here rather than in build_pipeline:
+        this runs after switch_vt() (which lets fbcon reprogram the CRTC to
+        60 Hz) and after start_subdaemon() (which takes the DRM master), but
+        before the pipeline goes to PLAYING. kmssink never mode-sets, so the
+        CRTC keeps whatever is programmed here while the video plane scans
+        out on top of it.
+
+        Every failure is a log line, never an exception: playback continues at
+        the mode the kernel chose."""
+        if REFRESH_SETTING == "off":
+            log("refresh: disabled (KMS_PLAY_REFRESH=off), keeping the current mode")
+            return
+        current = current_mode()
+        if current:
+            self.refresh_original = current
+            self.display["vrefresh"] = self._refresh_label_from(current[2])
+            log("refresh: current mode %dx%d@%.3f" % current)
+        fps = source_rate(self.probe_video, self.video_framerate)
+        if fps <= 0:
+            # The caps are the second chance: _on_video_caps calls back into
+            # _apply_refresh() once the decoder has negotiated a framerate.
+            self.refresh_pending = True
+            log("refresh: source rate unknown yet, waiting for the caps")
+            return
+        self._apply_refresh(fps)
+
+    @staticmethod
+    def _refresh_label_from(rate):
+        """Panel-friendly form of a rate: 75 -> 75, 119.998 -> 120."""
+        return int(round(rate))
+
+    def _apply_refresh(self, fps):
+        """Choose, remember and apply the mode. Called once per playback."""
+        self.refresh_pending = False
+        choice = choose_refresh(fps, REFRESH_SETTING)
+        if choice is None:
+            log("refresh: no available mode fits %.3f fps"
+                " (available: %s), keeping the current mode"
+                % (fps, " ".join("%.3f" % r for r in available_rates()) or "none"))
+            return
+        rate, k, error = choice
+        if self.refresh_original is None:
+            self.refresh_original = current_mode()
+        original = self.refresh_original
+        if original is None:
+            log("refresh: cannot read the current mode, not changing it")
+            return
+        # The daemon keeps the mode to put back at exit; it is the one that
+        # holds the master, so it is also the one that restores it.
+        subd_ctl("mode remember %d %d %.3f" % original)
+        if original[2] > 0 and abs(original[2] - rate) < 0.05:
+            log("refresh: source %.3f fps -> mode %.3f Hz (already applied)"
+                % (fps, original[2]))
+            self.refresh_applied = original
+            return
+        reply = subd_ctl("mode %d %d %.3f" % (original[0], original[1], rate))
+        applied = parse_mode_reply(reply)
+        if applied is None:
+            log("refresh: mode %.3f Hz refused (%s), keeping %.3f Hz"
+                % (rate, reply or "no reply", original[2]))
+            return
+        self.refresh_applied = applied
+        # Fresh read, not the value cached at startup: the panel line has to
+        # show what the CRTC scans out now, which is the whole point of the
+        # startup banner.
+        self.display.update({k2: v for k2, v in display_info().items()
+                             if v not in (None, 0)})
+        self.display["vrefresh"] = self._refresh_label()
+        multiplier = ("x%d, ecart %.2f%%" % (k, error)) if k else "demande explicite"
+        log("refresh: source %.3f fps -> mode %.3f Hz (%s)"
+            % (fps, applied[2], multiplier))
+        log("refresh: CRTC now %dx%d@%.3f, restore %.3f Hz on exit"
+            % (applied + (original[2],)))
+
+    def _restore_refresh(self):
+        """Put the desktop mode back before leaving the player's VT.
+
+        Skipped when no mode was changed: asking for a restore without a
+        remembered mode would be answered with an error, and that is noise.
+        The daemon verifies the result by reading the CRTC back."""
+        if not self.refresh_applied or self.refresh_original is None:
+            return
+        if self.refresh_original[2] > 0 \
+                and abs(self.refresh_applied[2] - self.refresh_original[2]) < 0.05:
+            return
+        reply = subd_ctl("mode restore")
+        restored = parse_mode_reply(reply)
+        if restored is None:
+            log("refresh: restore failed (%s)" % (reply or "no reply"))
+            return
+        log("refresh: restored %.3f Hz (%dx%d)" % (restored[2], restored[0], restored[1]))
+
     def inhibit_session(self):
         """Ask GNOME to inhibit suspend/idle for the duration of the film.
 
@@ -3176,6 +3421,21 @@ class Player:
         # as the software decoder produced them, in system memory.
         pad = video_sink.get_static_pad("sink")
         pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_caps)
+        if STATS_ENABLED:
+            # Pacing counters. A 24p film leaves the decoder at 23.976 fps
+            # whatever the screen does, so what this measures is the pipeline
+            # side (frames delivered, gaps, clumps); the refresh rate comes
+            # from the CRTC's vblank counter in _stats_report(). Together they
+            # give refreshes per frame, which is the judder itself.
+            self.stats = {"frames": 0, "late": 0, "dup": 0, "max_gap": 0.0,
+                          "gaps": 0.0, "gap_count": 0, "last": None,
+                          "start": monotonic(), "vseq": None,
+                          "nominal": 1.0 / (source_rate(self.probe_video,
+                                                       self.video_framerate) or 24.0)}
+            self.stats_total = {"frames": 0, "late": 0, "dup": 0, "max_gap": 0.0,
+                                "start": monotonic()}
+            pad.add_probe(Gst.PadProbeType.BUFFER, self._on_stats_buffer)
+            GLib.timeout_add(int(STATS_WINDOW * 1000), self._stats_report)
         audio_pad = audio_bin.get_static_pad("sink")
         audio_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_audio_caps)
 
@@ -3212,6 +3472,77 @@ class Player:
                 log("software tier: force-sw-decoders on", obj.get_name())
             except Exception as exc:
                 log("software tier: cannot force software decoders:", exc)
+
+    def _on_stats_buffer(self, _pad, _info):
+        """Count one buffer. Runs on the streaming thread: no logging here."""
+        stats = self.stats
+        if stats is None:
+            return Gst.PadProbeReturn.OK
+        now = monotonic()
+        stats["frames"] += 1
+        if self.stats_total is not None:
+            self.stats_total["frames"] += 1
+        last = stats["last"]
+        stats["last"] = now
+        if last is None:
+            return Gst.PadProbeReturn.OK
+        gap = now - last
+        nominal = stats["nominal"]
+        if gap > nominal * 1.6:
+            # A whole frame slot went by without a new frame: on screen the
+            # previous frame stayed up for one extra refresh.
+            stats["late"] += 1
+            if self.stats_total is not None:
+                self.stats_total["late"] += 1
+        elif gap < nominal * 0.5:
+            # Two frames in less than half a frame time: they were presented
+            # together, so one of them never got its own refresh.
+            stats["dup"] += 1
+            if self.stats_total is not None:
+                self.stats_total["dup"] += 1
+        stats["gaps"] += gap
+        stats["gap_count"] += 1
+        if gap > stats["max_gap"]:
+            stats["max_gap"] = gap
+        if self.stats_total is not None and gap > self.stats_total["max_gap"]:
+            self.stats_total["max_gap"] = gap
+        return Gst.PadProbeReturn.OK
+
+    def _stats_report(self):
+        """One counter line per window, with the measured refresh rate."""
+        if self.finished or self.stats is None:
+            return False
+        stats = self.stats
+        now = monotonic()
+        window = now - stats["start"]
+        refresh = 0.0
+        reply = subd_ctl("vblank", timeout=1.5)
+        seq = None
+        if reply.startswith("ok "):
+            try:
+                seq = int(reply[3:])
+            except ValueError:
+                seq = None
+        # First window has no reference count: it only stores one.
+        if seq is not None and stats["vseq"] is not None and window > 0.2:
+            refresh = (seq - stats["vseq"]) / window
+        stats["vseq"] = seq
+        frames = stats["frames"]
+        mean = (stats["gaps"] / stats["gap_count"] * 1000.0) if stats["gap_count"] else 0.0
+        per_frame = (refresh / (frames / window)) if (refresh and frames) else 0.0
+        log("stats: %.1fs frames=%d late=%d dup=%d max_gap=%.1f ms mean=%.1f ms"
+            " refresh=%.2f Hz refreshes_per_frame=%.3f"
+            % (window, frames, stats["late"], stats["dup"], stats["max_gap"] * 1000.0,
+               mean, refresh, per_frame))
+        total = self.stats_total
+        if total is not None:
+            elapsed = max(now - total["start"], 0.001)
+            log("stats: total %.1fs frames=%d (%.3f fps) late=%d dup=%d max_gap=%.1f ms"
+                % (elapsed, total["frames"], total["frames"] / elapsed,
+                   total["late"], total["dup"], total["max_gap"] * 1000.0))
+        stats.update({"frames": 0, "late": 0, "dup": 0, "max_gap": 0.0,
+                      "gaps": 0.0, "gap_count": 0, "start": now})
+        return True
 
     def _on_video_caps(self, pad, info):
         event = info.get_event()
@@ -3254,6 +3585,12 @@ class Player:
                         self.plane_check_scheduled = True
                         GLib.timeout_add(PLANE_VERIFY_INTERVAL_MS,
                                          self._verify_video_plane)
+                    if self.refresh_pending and self.video_framerate:
+                        # ffprobe could not tell the cadence: it came with the
+                        # caps, i.e. after the sink took the plane. DRM keeps
+                        # the plane attached across a CRTC mode change, so the
+                        # new timings apply without reprogramming it.
+                        GLib.idle_add(self._late_refresh)
                     if not self.startup_panel_shown:
                         self.startup_panel_shown = True
                         GLib.idle_add(self._show_startup_panel)
@@ -3322,6 +3659,16 @@ class Player:
         except Exception as exc:
             log("plane verify: kmssink lookup failed:", exc)
         return None
+
+    def _late_refresh(self):
+        """idle_add target: apply the mode once the caps gave the framerate."""
+        if self.finished or not self.refresh_pending:
+            return False
+        fps = source_rate(self.probe_video, self.video_framerate)
+        if fps > 0:
+            log("refresh: source rate from the caps (%.3f fps), applying now" % fps)
+            self._apply_refresh(fps)
+        return False
 
     def _verify_video_plane(self):
         """GLib timeout entry point: never let an exception escape.
@@ -3556,7 +3903,7 @@ class Player:
             "connector": self.display.get("name"),
             "width": self.display.get("width") or self.width,
             "height": self.display.get("height") or self.height,
-            "vrefresh": self.display.get("vrefresh"),
+            "vrefresh": self._refresh_label(),
         })
 
     def _panel_lines(self):
@@ -4242,6 +4589,10 @@ class Player:
 
         self.switch_vt()
         self.start_subdaemon()
+        # After the VT switch (the kernel reprogrammed the CRTC) and after the
+        # daemon took the DRM master, but before PLAYING: the video plane must
+        # be programmed on top of the mode we want, not before it.
+        self._setup_refresh()
         self.inhibit_session()
         self.build_pipeline()
         self.start_keyboard()
@@ -4286,6 +4637,16 @@ class Player:
             except Exception:
                 pass
         if self.subdaemon:
+            if self.stats_total is not None:
+                total = self.stats_total
+                elapsed = max(monotonic() - total["start"], 0.001)
+                log("stats: final %.1fs frames=%d (%.3f fps) late=%d dup=%d"
+                    " max_gap=%.1f ms"
+                    % (elapsed, total["frames"], total["frames"] / elapsed,
+                       total["late"], total["dup"], total["max_gap"] * 1000.0))
+            # Give the desktop its mode back while the daemon that owns the
+            # master is still alive, and before the VT switch.
+            self._restore_refresh()
             try:
                 self.subdaemon.stdin.write("quit\n")
                 self.subdaemon.stdin.flush()

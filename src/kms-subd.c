@@ -173,6 +173,308 @@ static uint32_t find_crtc(void)
     return c;
 }
 
+/* ==========================================================================
+ * Display mode control
+ * ==========================================================================
+ * The player switches VT before this daemon starts, and the kernel's fbdev
+ * emulation reprograms the CRTC to its own preferred timing (measured: the
+ * desktop's 2560x1440@75 becomes @60 on tty4). Only the DRM master can put a
+ * different mode back, so the daemon exposes a small request/reply protocol
+ * on a second Unix socket (<sock>.ctl):
+ *
+ *   rates                     -> ok <r1> <r2> ...   (at the active resolution)
+ *   current                   -> ok <W>x<H>@<rate>
+ *   mode remember <W> <H> <r> -> ok          (mode to restore later)
+ *   mode <W> <H> <r>          -> ok <W>x<H>@<rate> | err ...
+ *   mode restore              -> ok <W>x<H>@<rate> | err ...
+ *
+ * The mode is chosen among the connector's modes whose resolution equals the
+ * active one, closest to the requested rate, within 1 Hz. Every change is
+ * verified by reading the CRTC back; a mismatch reverts to the previous mode.
+ * Nothing here can leave a black screen: on any error the old mode is kept.
+ */
+
+struct saved_mode {
+    int valid;
+    drmModeModeInfo mode;
+    uint32_t fb;
+    uint32_t conns[8];
+    int nconns;
+};
+
+static struct saved_mode g_prev;                  /* rollback of the last set */
+static struct { int valid; int w, h; double rate; } g_target;  /* restore */
+static int g_mode_changed;
+
+/* Real refresh from the mode timings: drmModeModeInfo.vrefresh is rounded to
+ * an integer, which cannot tell 119.998 from 120. clock is in kHz. */
+static double mode_rate(const drmModeModeInfo *m)
+{
+    if (!m->htotal || !m->vtotal || !m->clock) return (double)m->vrefresh;
+    return (double)m->clock * 1000.0 / ((double)m->htotal * (double)m->vtotal);
+}
+
+/* Best mode for WxH closest to `want`, + the connectors routed to `crtc`.
+ * Returns 1 when one was found (even if far from `want`; the caller applies
+ * the 1 Hz tolerance so it can report the distance). */
+static int find_mode(uint32_t crtc, int w, int h, double want,
+                     drmModeModeInfo *best, double *best_rate,
+                     uint32_t *conns, int *nconn)
+{
+    drmModeRes *res = drmModeGetResources(g_fd);
+    int found = 0;
+    double best_delta = 0.0;
+    *nconn = 0;
+    if (!res) return 0;
+    for (int i = 0; i < res->count_connectors; i++) {
+        drmModeConnector *c = drmModeGetConnector(g_fd, res->connectors[i]);
+        if (!c) continue;
+        uint32_t routed = 0;
+        if (c->encoder_id) {
+            drmModeEncoder *e = drmModeGetEncoder(g_fd, c->encoder_id);
+            if (e) { routed = e->crtc_id; drmModeFreeEncoder(e); }
+        }
+        if (c->connection != DRM_MODE_CONNECTED || routed != crtc) {
+            drmModeFreeConnector(c);
+            continue;
+        }
+        if (*nconn < 8) conns[(*nconn)++] = c->connector_id;
+        for (int k = 0; k < c->count_modes; k++) {
+            drmModeModeInfo *m = &c->modes[k];
+            if (m->hdisplay != w || m->vdisplay != h) continue;
+            double rate = mode_rate(m);
+            double d = rate - want;
+            if (d < 0) d = -d;
+            if (!found || d < best_delta) {
+                *best = *m;
+                *best_rate = rate;
+                best_delta = d;
+                found = 1;
+            }
+        }
+        drmModeFreeConnector(c);
+    }
+    drmModeFreeResources(res);
+    return found;
+}
+
+/* Available rates at WxH, as a printable space-separated list. */
+static void list_rates(uint32_t crtc, int w, int h, char *out, size_t len)
+{
+    drmModeRes *res = drmModeGetResources(g_fd);
+    double seen[32];
+    int n = 0;
+    out[0] = 0;
+    if (!res) return;
+    for (int i = 0; i < res->count_connectors; i++) {
+        drmModeConnector *c = drmModeGetConnector(g_fd, res->connectors[i]);
+        if (!c) continue;
+        uint32_t routed = 0;
+        if (c->encoder_id) {
+            drmModeEncoder *e = drmModeGetEncoder(g_fd, c->encoder_id);
+            if (e) { routed = e->crtc_id; drmModeFreeEncoder(e); }
+        }
+        if (c->connection != DRM_MODE_CONNECTED || routed != crtc) {
+            drmModeFreeConnector(c);
+            continue;
+        }
+        for (int k = 0; k < c->count_modes; k++) {
+            drmModeModeInfo *m = &c->modes[k];
+            if (m->hdisplay != w || m->vdisplay != h) continue;
+            double rate = mode_rate(m);
+            int dup = 0;
+            for (int j = 0; j < n; j++)
+                if (seen[j] > rate - 0.05 && seen[j] < rate + 0.05) dup = 1;
+            if (dup || n >= 32) continue;
+            seen[n++] = rate;
+        }
+        drmModeFreeConnector(c);
+    }
+    drmModeFreeResources(res);
+    for (int i = 1; i < n; i++) {              /* ascending, tiny list */
+        double key = seen[i];
+        int j = i - 1;
+        while (j >= 0 && seen[j] > key) { seen[j + 1] = seen[j]; j--; }
+        seen[j + 1] = key;
+    }
+    for (int i = 0; i < n; i++) {
+        size_t used = strlen(out);
+        snprintf(out + used, len - used, "%s%.3f", i ? " " : "", seen[i]);
+    }
+}
+
+/* Apply one mode. On success reply is "ok WxH@rate"; on failure "err ...".
+ * On a verification failure the previous mode is put back. */
+static int apply_mode(int w, int h, double want, char *reply, size_t rlen)
+{
+    uint32_t crtc = g_crtc ? g_crtc : find_crtc();
+    if (!crtc) { snprintf(reply, rlen, "err no crtc"); return -1; }
+    drmModeCrtc *cur = drmModeGetCrtc(g_fd, crtc);
+    if (!cur) { snprintf(reply, rlen, "err no crtc"); return -1; }
+    uint32_t fb = cur->buffer_id;
+
+    drmModeModeInfo mode;
+    uint32_t conns[8];
+    int nconn = 0;
+    double rate = 0.0;
+    if (!find_mode(crtc, w, h, want, &mode, &rate, conns, &nconn) || nconn == 0) {
+        char avail[256];
+        list_rates(crtc, w, h, avail, sizeof avail);
+        snprintf(reply, rlen, "err no mode %.3f (available: %s)", want,
+                 avail[0] ? avail : "none");
+        drmModeFreeCrtc(cur);
+        return -1;
+    }
+    double delta = rate - want;
+    if (delta < 0) delta = -delta;
+    if (delta > 1.0) {
+        char avail[256];
+        list_rates(crtc, w, h, avail, sizeof avail);
+        snprintf(reply, rlen, "err no mode %.3f (available: %s)", want,
+                 avail[0] ? avail : "none");
+        drmModeFreeCrtc(cur);
+        return -1;
+    }
+
+    if (!g_prev.valid) {
+        g_prev.mode = cur->mode;
+        g_prev.fb = fb;
+        memcpy(g_prev.conns, conns, sizeof conns);
+        g_prev.nconns = nconn;
+        g_prev.valid = 1;
+    }
+    if (drmModeSetCrtc(g_fd, crtc, fb, 0, 0, conns, nconn, &mode) != 0) {
+        snprintf(reply, rlen, "err setcrtc %s", strerror(errno));
+        drmModeFreeCrtc(cur);
+        return -1;
+    }
+    /* Read back: the mode really scanned out is the only proof, and the
+     * fallback must be the previous mode, not a blind guess. */
+    drmModeCrtc *now = drmModeGetCrtc(g_fd, crtc);
+    int ok = now && now->mode_valid
+        && now->mode.hdisplay == mode.hdisplay
+        && now->mode.vdisplay == mode.vdisplay;
+    double got = ok ? mode_rate(&now->mode) : 0.0;
+    if (ok) {
+        double d = got - rate;
+        if (d < 0) d = -d;
+        if (d > 0.5) ok = 0;
+    }
+    if (!ok) {
+        if (g_prev.valid) {
+            drmModeSetCrtc(g_fd, crtc, g_prev.fb, 0, 0, g_prev.conns,
+                           g_prev.nconns, &g_prev.mode);
+            TLOG("kms-subd: mode %.3f verification failed, reverted\n", rate);
+        }
+        snprintf(reply, rlen, "err verify");
+        if (now) drmModeFreeCrtc(now);
+        drmModeFreeCrtc(cur);
+        return -1;
+    }
+    drmModeFreeCrtc(now);
+    drmModeFreeCrtc(cur);
+    g_mode_changed = 1;
+    snprintf(reply, rlen, "ok %dx%d@%.3f", w, h, got);
+    TLOG("kms-subd: mode %dx%d@%.3f applied (asked %.3f)\n", w, h, got, want);
+    return 0;
+}
+
+/* Restore the mode remembered by the player before playback. */
+static int restore_mode(char *reply, size_t rlen)
+{
+    if (!g_target.valid) { snprintf(reply, rlen, "err no saved mode"); return -1; }
+    int rc = apply_mode(g_target.w, g_target.h, g_target.rate, reply, rlen);
+    if (rc == 0) g_mode_changed = 0;
+    return rc;
+}
+
+/* One control request, one reply line. Request/reply on its own socket keeps
+ * the fd-passing protocol (single byte + SCM_RIGHTS) untouched. */
+static void handle_ctl(const char *line, char *reply, size_t rlen)
+{
+    unsigned w = 0, h = 0;
+    double rate = 0.0;
+    uint32_t crtc = g_crtc ? g_crtc : find_crtc();
+    reply[0] = 0;
+
+    if (!strcmp(line, "rates")) {
+        if (!crtc) { snprintf(reply, rlen, "err no crtc"); return; }
+        drmModeCrtc *cur = drmModeGetCrtc(g_fd, crtc);
+        if (!cur || !cur->mode_valid) {
+            snprintf(reply, rlen, "err no active mode");
+            if (cur) drmModeFreeCrtc(cur);
+            return;
+        }
+        char avail[256];
+        list_rates(crtc, cur->mode.hdisplay, cur->mode.vdisplay, avail, sizeof avail);
+        snprintf(reply, rlen, "ok %s", avail[0] ? avail : "");
+        drmModeFreeCrtc(cur);
+    } else if (sscanf(line, "mode remember %u %u %lf", &w, &h, &rate) == 3) {
+        g_target.valid = 1;
+        g_target.w = (int)w;
+        g_target.h = (int)h;
+        g_target.rate = rate;
+        snprintf(reply, rlen, "ok");
+        TLOG("kms-subd: restore target %ux%u@%.3f remembered\n", w, h, rate);
+    } else if (!strcmp(line, "mode restore")) {
+        restore_mode(reply, rlen);
+    } else if (!strcmp(line, "current")) {
+        if (!crtc) { snprintf(reply, rlen, "err no crtc"); return; }
+        drmModeCrtc *cur = drmModeGetCrtc(g_fd, crtc);
+        if (!cur || !cur->mode_valid) {
+            snprintf(reply, rlen, "err no active mode");
+        } else {
+            snprintf(reply, rlen, "ok %dx%d@%.3f", cur->mode.hdisplay,
+                     cur->mode.vdisplay, mode_rate(&cur->mode));
+        }
+        if (cur) drmModeFreeCrtc(cur);
+    } else if (!strcmp(line, "vblank")) {
+        /* Monotonic vertical-blank counter of the CRTC. Sampling it twice
+         * gives the refresh rate the hardware is really running at, which is
+         * the only measurement that proves a mode change took effect. */
+        if (!crtc) { snprintf(reply, rlen, "err no crtc"); return; }
+        drmVBlank vbl;
+        memset(&vbl, 0, sizeof vbl);
+        vbl.request.type = DRM_VBLANK_RELATIVE;
+        vbl.request.sequence = 0;
+        if (drmWaitVBlank(g_fd, &vbl) != 0) {
+            snprintf(reply, rlen, "err vblank %s", strerror(errno));
+            return;
+        }
+        snprintf(reply, rlen, "ok %u", vbl.reply.sequence);
+    } else if (sscanf(line, "mode %u %u %lf", &w, &h, &rate) == 3) {
+        apply_mode((int)w, (int)h, rate, reply, rlen);
+    } else {
+        snprintf(reply, rlen, "err unknown request");
+    }
+}
+
+static void serve_ctl(int listen_fd)
+{
+    int c = accept(listen_fd, NULL, NULL);
+    if (c < 0) return;
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    char line[256];
+    size_t len = 0;
+    while (len < sizeof line - 1) {
+        char ch;
+        ssize_t n = read(c, &ch, 1);
+        if (n <= 0 || ch == '\n') break;
+        line[len++] = ch;
+    }
+    line[len] = 0;
+    char reply[512];
+    handle_ctl(line, reply, sizeof reply);
+    if (reply[0]) {
+        size_t rl = strlen(reply);
+        reply[rl] = '\n';
+        ssize_t ignored = write(c, reply, rl + 1);
+        (void)ignored;
+    }
+    close(c);
+}
+
 /* Allocate (or reallocate) a dumb buffer and its framebuffer for w x h.
  * Returns 0 when the buffer already has the right size, so a subtitle line
  * change never reallocates. bpp=32 with depth=32 for the AddFB below makes
@@ -500,6 +802,31 @@ int main(int argc, char **argv)
     chmod(sockpath, 0660);
     listen(lfd, 4);
 
+    /* Control socket: mode requests and their replies. Separate from the fd
+     * socket, whose protocol is a single byte plus SCM_RIGHTS. */
+    struct sockaddr_un ca;
+    char ctlpath[sizeof ca.sun_path];
+    memset(&ca, 0, sizeof ca);
+    ca.sun_family = AF_UNIX;
+    int clfd = -1;
+    /* snprintf truncates silently; a truncated path would bind somewhere else
+     * (or fail), so an over-long name disables the control socket instead. */
+    if (snprintf(ctlpath, sizeof ctlpath, "%s.ctl", sockpath) >= (int)sizeof ctlpath) {
+        TLOG("kms-subd: control socket path too long, mode control disabled\n");
+    } else {
+        memcpy(ca.sun_path, ctlpath, strlen(ctlpath) + 1);
+        unlink(ctlpath);
+        clfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (clfd < 0 || bind(clfd, (struct sockaddr *)&ca, sizeof ca) < 0) {
+            TLOG("kms-subd: mode control socket unavailable: %s\n", strerror(errno));
+            if (clfd >= 0) close(clfd);
+            clfd = -1;
+        } else {
+            chmod(ctlpath, 0660);
+            listen(clfd, 4);
+        }
+    }
+
     /* Take the master. The player switched VT beforehand; without that switch
      * this ioctl fails with EACCES because the current VT still owns the
      * console. A failure is not fatal: if another process already holds the
@@ -517,14 +844,16 @@ int main(int argc, char **argv)
     size_t len = 0;
     int done = 0;
     while (!done) {
-        struct pollfd pf[2] = {
+        struct pollfd pf[3] = {
             { .fd = 0, .events = POLLIN },
             { .fd = lfd, .events = POLLIN },
+            { .fd = clfd, .events = POLLIN },
         };
-        int r = poll(pf, 2, -1);
+        int r = poll(pf, 3, -1);
         if (r < 0) { if (errno == EINTR) continue; break; }
 
         if (pf[1].revents & POLLIN) serve_fd(lfd);
+        if (clfd >= 0 && (pf[2].revents & POLLIN)) serve_ctl(clfd);
         if (!(pf[0].revents & (POLLIN | POLLHUP))) continue;
 
         char c;
@@ -579,8 +908,20 @@ int main(int argc, char **argv)
      * nor the OSD stays on screen over the console), then release buffers and
      * drop master. */
     disable_all_planes();
+    /* Defensive restore: if the player disappeared without asking, put the
+     * desktop mode back before dropping the master. The planes are already
+     * off, so the mode change cannot leave a video buffer on screen. */
+    if (g_mode_changed) {
+        char reply[128];
+        if (restore_mode(reply, sizeof reply) == 0)
+            TLOG("kms-subd: mode restored on exit (%s)\n", reply);
+        else
+            TLOG("kms-subd: mode restore on exit failed (%s)\n", reply);
+    }
     close(lfd);
+    if (clfd >= 0) close(clfd);
     unlink(sockpath);
+    unlink(ctlpath);
     for (int p = 0; p < NPLANS; p++)
         for (int i = 0; i < MAXBUF; i++) {
             struct dumbuf *b = &g_pl[p].buf[i];

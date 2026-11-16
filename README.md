@@ -163,6 +163,113 @@ What is *still* not portable, even with this work:
 
 ---
 
+## Display refresh
+
+A 23.976 fps film on a 60 Hz screen is shown for 2 refreshes, then 3, then 2
+(60 / 23.976 = 2.5025): the picture advances unevenly, which is the judder.
+Only a refresh rate that is an integer multiple of the frame rate removes it,
+and 5 x 23.976 = 119.88 is 0.1 % away from the panel's 120 Hz timing.
+
+`kmssink` does not mode-set (`force-modesetting=false`), and the VT switch
+itself reprograms the CRTC through fbdev emulation (measured: 75 Hz on the
+desktop becomes 60 Hz on the player's VT). Only the process holding the DRM
+master can put another mode back, so the mode is owned by `kms-subd` and
+requested over a second Unix socket, `<player socket>.ctl`, one request line
+and one reply line per connection:
+
+| request | reply |
+|---|---|
+| `current` | `ok <W>x<H>@<rate>` — mode the CRTC really scans out |
+| `rates` | `ok <r1> <r2> ...` — available rates at the active resolution |
+| `mode remember <W> <H> <rate>` | `ok` — mode to restore later |
+| `mode <W> <H> <rate>` | `ok <W>x<H>@<rate>` or `err ...` |
+| `mode restore` | `ok <W>x<H>@<rate>` or `err ...` |
+| `vblank` | `ok <sequence>` — CRTC vblank counter, for measuring |
+
+The daemon picks the connector mode whose resolution equals the active one and
+whose rate is closest to the request (±1 Hz), programs it with
+`drmModeSetCrtc`, **reads the CRTC back** and only then reports success; a
+read-back mismatch reverts to the previous mode. Every failure is answered with
+`err ...` and a list of the rates that do exist — the player then keeps the
+current mode, logs one line and plays on. Nothing here can leave a black screen:
+the fallback is always the mode that was already running.
+
+`kms-play-py` decides the rate before playback starts, because the order is the
+whole trick:
+
+1. `switch_vt()` — the kernel rewrites the CRTC (75 -> 60 Hz);
+2. `start_subdaemon()` — `kms-subd` takes the DRM master;
+3. `_setup_refresh()` — the mode is applied **now**, while no video plane is
+   programmed yet;
+4. the pipeline goes to `PLAYING` and `kmssink` programmes the plane on top of
+   the mode that is already running.
+
+If the frame rate is unknown until the caps arrive (`fps=`), the mode is
+applied from the first caps event instead; DRM keeps a plane attached across a
+CRTC timing change, so the picture is not interrupted (the log says
+`source rate from the caps`).
+
+The rate itself: with the source frame rate `f`, every integer multiplier
+`k = 2..6` is tried and the best available mode within 0.5 % wins.
+
+```
+refresh: current mode 2560x1440@59.968
+refresh: source 23.976 fps -> mode 120.000 Hz (x5, ecart 0.10%)
+refresh: CRTC now 2560x1440@119.998, restore 59.968 Hz on exit
+```
+
+On exit (Q, ESC, EOS, error, signal) the previous mode is restored **before**
+the VT switch back, and read back; `kms-subd` also restores it defensively if
+the player disappears without asking. The startup banner prints the rate really
+applied, read back after the change (not the value cached at startup).
+
+| variable | meaning |
+|---|---|
+| `KMS_PLAY_REFRESH=auto` | default: choose `k` from the source rate |
+| `KMS_PLAY_REFRESH=off` | never touch the mode (pre-refresh behaviour) |
+| `KMS_PLAY_REFRESH=120` | ask for that rate (±1 Hz), else keep the current mode |
+| `KMS_PLAY_STATS=1` | log one pacing line per 5 s window |
+
+The stats line is what proves the cadence, from two measured values rather than
+from the file's metadata: frames delivered to the sink, their gaps, and the
+CRTC's refresh rate from its vblank counter.
+
+```
+stats: 5.0s frames=120 late=0 dup=0 max_gap=53.6 ms mean=41.9 ms refresh=75.00 Hz refreshes_per_frame=3.125
+stats: total 35.0s frames=766 (21.885 fps) late=4 dup=0 max_gap=93.5 ms
+```
+
+`refreshes_per_frame` is `refresh / delivered fps`: 2.500 at 60 Hz and 23.976
+fps (2,3,2,3 — judder), 3.125 at 75 Hz (3,3,3,3,4), and exactly 5.000 would be
+the 120 Hz case.
+
+### Measured on the BPI-M7: 120 Hz is not reachable
+
+This is the honest outcome of the increment, and it is a kernel/driver limit,
+not a bug in this code.
+
+- The panel's EDID (CTA-861 block) really does carry `DTD4 2560x1440@119.998`
+  (497.750 MHz) and `DTD5 2560x1440@144.002` (583.610 MHz), with a monitor range
+  of 48-146 Hz and a 600 MHz max dotclock.
+- The kernel exposes **90** modes for this connector and drops those two: at
+  2560x1440 only `@59.968` (241.570 MHz) and `@75.000` (302.330 MHz) exist. The
+  highest clock it accepts at all is 333.250 MHz (1792x1344@120); every mode
+  above that is missing, including 3840x2160@60 (594 MHz). That is an HDMI TMDS
+  ceiling around 340 MHz, not a panel limit.
+- Programming the EDID timing directly (`drmModeSetCrtc` with DTD4, CRTC 81,
+  fbcon framebuffer) returns **EINVAL**; the CRTC keeps its previous mode.
+
+So `KMS_PLAY_REFRESH=auto` on this board answers
+`no available mode fits 23.976 fps (available: 59.968 75.000)` and keeps 60 Hz.
+The machinery is in place and tested with modes that *do* exist: 25 fps chooses
+75.000 Hz (x3, 0.00 %) and the measured refresh follows (74.98-75.20 Hz from the
+vblank counter), then comes back to 59.968 Hz on exit. Removing the judder at
+1440p needs a kernel/driver that can drive 119.998 Hz; forcing the mode does not
+work and would not be a fix. (A 24 Hz mode would be the other way out, but the
+panel's own range starts at 48 Hz.)
+
+---
+
 ## Keyboard
 
 | Key | Action |
