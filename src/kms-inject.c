@@ -23,17 +23,25 @@
  * USAGE
  * ============================================================================
  *   kms-inject <NAME> [--delay SEC] [--hold MS] [--repeat N] [--interval MS]
- *                     [--ts FILE]
+ *                     [--taps N] [--tap-interval MS] [--ts FILE]
  *
  *   --delay     wait before emitting, lets the player finish starting (1.0 s)
  *   --hold      how long the key stays pressed, in ms (60)
  *   --repeat N  emit N value=2 (repeat) events, simulating a kernel repeat
  *   --interval  spacing between repeats, in ms (40)
  *   --ts        timestamp file, default /tmp/kms-inject.ts
+ *   --taps N    emit N full press/release taps from the SAME device (1)
+ *   --tap-interval  spacing between taps, press to press, in ms (450)
  *
  * Note on --repeat: since kms-keys owns autorepeat and drops kernel value=2
  * events (see kms-keys.c), these synthetic repeats are ignored by the player.
  * Use --hold to exercise the real autorepeat path instead.
+ *
+ * Note on --taps: creating a uinput device costs ~0.8 s (node, udev, settle),
+ * so injecting N presses as N separate runs spaces them 1.3 s apart — longer
+ * than the player's 1 s scale-reset window, which makes the scale look broken
+ * when it is not. --taps emits the whole sequence from one device, at the
+ * cadence a human actually uses.
  *
  * The device is chmod 0666 as soon as it appears: the player runs as an
  * unprivileged user and must be able to open the new event node before the
@@ -115,6 +123,8 @@ int main(int argc, char **argv)
     int hold = 60;
     int repeat = 0;
     int interval = 40;
+    int taps = 1;
+    int tap_interval = 450;
     const char *tsfile = "/tmp/kms-inject.ts";
 
     for (int i = 2; i < argc; i++) {
@@ -123,6 +133,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ts") && i + 1 < argc) tsfile = argv[++i];
         else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) interval = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--taps") && i + 1 < argc) taps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tap-interval") && i + 1 < argc) tap_interval = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
 
@@ -184,13 +196,20 @@ int main(int argc, char **argv)
     printf("inject %s %.6f\n", name, t0);
     fflush(stdout);
 
-    emit_key(fd, code, 1);
-    for (int i = 0; i < repeat; i++) {
-        usleep((useconds_t)interval * 1000);
-        emit_key(fd, code, 2);        /* value 2 = autorepeat, ignored by kms-keys */
+    if (taps < 1) taps = 1;
+    for (int tap = 0; tap < taps; tap++) {
+        emit_key(fd, code, 1);
+        for (int i = 0; i < repeat; i++) {
+            usleep((useconds_t)interval * 1000);
+            emit_key(fd, code, 2);    /* value 2 = autorepeat, ignored by kms-keys */
+        }
+        if (hold > 0) usleep((useconds_t)hold * 1000);
+        emit_key(fd, code, 0);
+        if (tap + 1 < taps) {
+            int gap = tap_interval - hold;
+            if (gap > 0) usleep((useconds_t)gap * 1000);
+        }
     }
-    if (hold > 0) usleep((useconds_t)hold * 1000);
-    emit_key(fd, code, 0);
     usleep(50 * 1000);
 
     ioctl(fd, UI_DEV_DESTROY);

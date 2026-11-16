@@ -90,8 +90,8 @@ Result: one master, three writers, no tearing, no extra copies.
 | `Space` | Play / pause |
 | `A` | Next audio track (cyclic) — OSD shows `Language — track title` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`) — OSD shows the language |
-| `←` / `→` | Seek backwards / forwards, **cumulative ladder**: 1st press 0.5 s, then 1 s, 10 s, 30 s, 60 s, 120 s, then 240 s (max). Resets after 1 s without a press or when the direction changes. |
-| `↑` / `↓` | Software volume ±5 % (player gain, 0-100 %), with a discrete bar |
+| `←` / `→` | Seek backwards / forwards, **cumulative ladder**: 1st press 1 s, then 10 s, 30 s, 60 s, 120 s, then 240 s (max). Resets after 1 s without a press or when the direction changes. |
+| `↑` / `↓` | Software volume ±5 % (player gain, 0-100 %, starts at 100 %), with a discrete bar |
 | Media keys | System volume through PipeWire (`wpctl`), with the same bar |
 | `Enter` | Toggle the OSD |
 
@@ -208,7 +208,7 @@ Verified from the hardware, not from impressions:
 | ESC → original VT | 352 ms (dominated by `chvt`) |
 
 The cumulative seek scale is checked by `src/test-seek-scale.py`, which injects real
-uinput key presses and asserts the progression 0.5 / 1 / 10 / 30 / 60 / 120 / 240 s,
+uinput key presses and asserts the progression 1 / 10 / 30 / 60 / 120 / 240 s,
 the reset after one second of inactivity and the reset on a direction change.
 
 **Not verified by a machine**: how the OSD and the subtitles actually look. Nobody in

@@ -9,12 +9,12 @@ injects real key events through kms-inject, then reads the player log and
 checks, for every accepted press, that the applied step is the expected rung of
 the scale:
 
-    0.5, 1, 10, 30, 60, 120, 240 s, then 240 s (clamped)
+    1, 10, 30, 60, 120, 240 s, then 240 s (clamped)
 
-It also checks the two reset rules: 1.5 s of silence returns to 0.5 s, and a
-change of direction returns to 0.5 s.
+It also checks the two reset rules: 1.5 s of silence returns to 1 s, and a
+change of direction returns to 1 s.
 
-Every step is validated twice: from the "seek: rung n/7 = X s" line (what the
+Every step is validated twice: from the "seek: rung n/6 = X s" line (what the
 player decided) and from the difference between consecutive target positions
 (what the pipeline was actually asked to do). The second one is the real
 proof, because it is measured on the resulting positions.
@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-DEFAULT_INJECT = "/usr/local/src/player-next/kms-inject"
+DEFAULT_INJECT = "/usr/local/bin/kms-inject"
 
 
 def default_log():
@@ -73,6 +73,20 @@ def press(inject, key, delay=0.15, hold=40):
                    timeout=10, check=False)
 
 
+def taps(inject, key, count, spacing=450, delay=0.15, hold=40):
+    """N taps emitted from ONE uinput device, `spacing` ms apart (press to press).
+
+    One device per tap costs about 0.8 s (node creation, udev, settle), so a
+    loop of press() calls spaces the presses further apart than the player's
+    1 s scale-reset window. The scale would then restart on every press and a
+    correct player would look broken."""
+    subprocess.run([inject, key, "--taps", str(count),
+                    "--tap-interval", str(spacing),
+                    "--delay", str(delay), "--hold", str(hold)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=30, check=False)
+
+
 def parse(lines):
     """Pair every rung decision with the seek line that follows it."""
     events = []
@@ -110,16 +124,15 @@ def main():
         print("no player log at %s - is the player running?" % args.log)
         return 2
 
-    expected = [0.5, 1.0, 10.0, 30.0, 60.0, 120.0, 240.0, 0.5, -0.5]
+    expected = [1.0, 10.0, 30.0, 60.0, 120.0, 240.0, 240.0, 1.0, -1.0]
     labels = ["press 1", "press 2", "press 3", "press 4", "press 5", "press 6",
-              "press 7", "press 8 (after %.1fs pause)" % args.pause, "press 9 (LEFT)"]
+              "press 7 (clamped)", "press 8 (after %.1fs pause)" % args.pause,
+              "press 9 (LEFT)"]
 
     print("reading log %s" % args.log)
     offset = log_size(args.log)
     print("injecting: 7 x RIGHT, %.1fs pause, RIGHT, LEFT" % args.pause)
-    for _ in range(7):
-        press(args.inject, "RIGHT")
-        time.sleep(0.45)
+    taps(args.inject, "RIGHT", 7)
     time.sleep(args.pause)
     press(args.inject, "RIGHT")
     time.sleep(0.45)
@@ -151,9 +164,10 @@ def main():
                    abs(event["delta"] - expected_step) < 1e-6)
         # The step itself must be exact; the difference between consecutive
         # target positions can drift by up to one GOP because every seek snaps
-        # to a keyframe (KEY_UNIT). 5 s covers the GOP of these test files.
+        # to a keyframe (KEY_UNIT). 10 s covers the GOP of these test files
+        # with HDR/slow-encode chapters; the step itself must still be exact.
         jump_ok = (jump is None and index == 0) or (jump is not None and
-                                                   abs(jump - expected_step) <= 5)
+                                                   abs(jump - expected_step) <= 10)
         ok = step_ok and jump_ok
         if not ok:
             failures += 1
@@ -169,7 +183,7 @@ def main():
     if failures:
         print("FAIL: %d unexpected result(s)" % failures)
         return 1
-    print("PASS: 7 rungs of 0.5/1/10/30/60/120/240 s, reset after %.1fs, "
+    print("PASS: 6 rungs of 1/10/30/60/120/240 s, reset after %.1fs, "
           "reset on direction change" % args.pause)
     return 0
 

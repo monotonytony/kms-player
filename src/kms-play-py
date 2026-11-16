@@ -97,12 +97,12 @@ CHILD_ENV = {k: v for k, v in os.environ.items()
 # Seek scale
 # ---------------------------------------------------------------------------
 # Cumulative scale on successive presses in the SAME direction, as specified:
-#   1st press 0.5 s, 2nd 1 s, 3rd 10 s, 4th 30 s, 5th 60 s, 6th 120 s,
-#   7th and beyond 240 s (clamped to the last entry).
+#   1st press 1 s, 2nd 10 s, 3rd 30 s, 4th 60 s, 5th 120 s,
+#   6th and beyond 240 s (clamped to the last entry).
 # Each accepted press jumps exactly the current rung, then advances the rung.
 # The index returns to the first rung after SEEK_RESET_AFTER without a press,
 # or as soon as the direction changes (LEFT after RIGHT).
-SEEK_SCALE = (0.5, 1.0, 10.0, 30.0, 60.0, 120.0, 240.0)
+SEEK_SCALE = (1.0, 10.0, 30.0, 60.0, 120.0, 240.0)
 
 # Minimum delay between two accepted steps. Kernel/hardware repeat can be as
 # fast as 30-40 ms; without this, one held key would consume two rungs per
@@ -110,7 +110,7 @@ SEEK_SCALE = (0.5, 1.0, 10.0, 30.0, 60.0, 120.0, 240.0)
 # fast but still controllable.
 SEEK_DEBOUNCE = 0.120
 
-# Idle time after which the scale restarts at 0.5 s.
+# Idle time after which the scale restarts at 1 s.
 SEEK_RESET_AFTER = 1.0
 
 # ---------------------------------------------------------------------------
@@ -118,10 +118,10 @@ SEEK_RESET_AFTER = 1.0
 # ---------------------------------------------------------------------------
 # Arrow Up/Down drive the pipeline's "volume" element, i.e. a software gain,
 # independent from the PipeWire sink volume used by the multimedia keys.
-# It starts at 85 % instead of 100 % on purpose: the ceiling is 100 %, so
-# starting saturated would make the first Up presses silent no-ops. 15 % of
-# headroom leaves room to demonstrate both directions.
-SOFTWARE_GAIN_START = 0.85
+# It starts saturated at 100 %: the film plays at its own level, the sink
+# volume is left to the system keys, and the first Down press is audible
+# immediately.
+SOFTWARE_GAIN_START = 1.0
 SOFTWARE_GAIN_MAX = 1.0
 SOFTWARE_GAIN_STEP = 0.05       # 5 % per press
 
@@ -812,22 +812,25 @@ class Player:
             self.duration = duration / Gst.SECOND
         return self.duration
 
-    def seek_step(self, direction):
+    def seek_step(self, direction, now=None):
         """Return the signed step to apply, or None if the press is debounced.
 
         THE SCALE (validated by Thony, 2026-11-15), not a hold acceleration:
           - each accepted press jumps the CURRENT rung and then advances one
-            rung: 0.5, 1, 10, 30, 60, 120, 240 s, clamped at 240 s;
-          - the index restarts at 0.5 s after SEEK_RESET_AFTER without a press;
-          - it restarts at 0.5 s as soon as the direction flips;
+            rung: 1, 10, 30, 60, 120, 240 s, clamped at 240 s;
+          - the index restarts at 1 s after SEEK_RESET_AFTER without a press;
+          - it restarts at 1 s as soon as the direction flips;
           - press and autorepeat are both "presses": a held arrow walks the
             scale, exactly like tapping it;
           - SEEK_DEBOUNCE prevents one physical press (press event followed by
             fast repeats) from consuming two rungs.
 
-        The direction is tracked here, so a change of direction is detected
-        even if the other key's release was lost."""
-        now = monotonic()
+        `now` is when the event was READ, not when it is handled: a seek to a
+        distant keyframe blocks the main loop for up to a second, and timing
+        the ladder on handling time would reset the scale between two taps the
+        viewer made 400 ms apart. The direction is tracked here, so a change
+        of direction is detected even if the other key's release was lost."""
+        now = monotonic() if now is None else now
         if direction != self.seek_direction:
             self.seek_direction = direction
             self.seek_index = 0
@@ -886,7 +889,9 @@ class Player:
     def software_volume(self, delta_percent):
         """Arrow Up/Down: software gain of the player, not the sink volume.
 
-        Starts at SOFTWARE_GAIN_START (85 %) so both arrows have headroom."""
+        Starts at SOFTWARE_GAIN_START (100 %): the ceiling is already
+        reached, so only Down has room — which is what a viewer expects from
+        a player that plays at nominal level."""
         self.gain = max(0.0, min(SOFTWARE_GAIN_MAX, self.gain + delta_percent / 100.0))
         self.volume_element.set_property("volume", self.gain)
         percent = int(round(self.gain * 100))
@@ -1038,22 +1043,25 @@ class Player:
                             value = int(fields[2])
                         except ValueError:
                             continue
+                        # Stamp at read time: the main loop may already be
+                        # busy with a seek, and the ladder must follow the
+                        # viewer's cadence, not our latency.
                         GLib.idle_add(self._dispatch_key, fields[1], value,
-                                      priority=GLib.PRIORITY_HIGH)
+                                      monotonic(), priority=GLib.PRIORITY_HIGH)
         except Exception as exc:
             log("keyboard: read error:", exc)
         self._keyboard_dead = True
 
-    def _dispatch_key(self, name, value):
+    def _dispatch_key(self, name, value, seen=None):
         try:
-            self.on_key(name, value)
+            self.on_key(name, value, seen)
         except Exception as exc:
             import traceback
             log("ERROR key %s: %s" % (name, exc))
             traceback.print_exc(file=log_file)
         return False
 
-    def on_key(self, name, value):
+    def on_key(self, name, value, seen=None):
         """Handle one keyboard event. value: 0 release, 1 press, 2 repeat."""
         if self.finished:
             return
@@ -1067,7 +1075,7 @@ class Player:
             # Both press and autorepeat advance the cumulative scale; the
             # debounce inside seek_step() decides what is accepted.
             if value != 0:
-                step = self.seek_step(-1 if name == "LEFT" else 1)
+                step = self.seek_step(-1 if name == "LEFT" else 1, seen)
                 if step is not None:
                     self.seek(step, "scale")
             return

@@ -91,7 +91,7 @@ wear) and `kms-subd` copies them row by row — the kernel pitch can be larger t
 | `A` | Next audio track (cyclic), OSD `Audio : Français — VFF` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`), OSD shows the language |
 | `←` / `→` | Cumulative seek, see below |
-| `↑` / `↓` | Software gain ±5 % (starts at 85 %, ceiling 100 %) |
+| `↑` / `↓` | Software gain ±5 % (starts at 100 %, ceiling 100 %) |
 | `VOLUMEUP` / `VOLUMEDOWN` / `MUTE` | PipeWire sink volume (`wpctl`), OSD |
 | `Enter` | Toggle the OSD |
 | `NEXTSONG` / `PREVIOUSSONG` | Fixed ±60 s jump |
@@ -101,12 +101,12 @@ wear) and `kms-subd` copies them row by row — the kernel pitch can be larger t
 Not a hold acceleration. Each accepted press jumps the current rung and advances
 one rung, in the direction pressed:
 
-| Press | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |
-|---|---|---|---|---|---|---|---|
-| Jump | 0.5 s | 1 s | 10 s | 30 s | 60 s | 120 s | 240 s |
+| Press | 1 | 2 | 3 | 4 | 5 | 6+ |
+|---|---|---|---|---|---|---|
+| Jump | 1 s | 10 s | 30 s | 60 s | 120 s | 240 s |
 
-* The index returns to 0.5 s after **1 s** without a press.
-* The index returns to 0.5 s as soon as the **direction changes**.
+* The index returns to 1 s after **1 s** without a press.
+* The index returns to 1 s as soon as the **direction changes**.
 * Autorepeat counts as successive presses (a held arrow walks the scale), with a
   **120 ms debounce** so one physical press cannot consume two rungs.
 * The target is clamped to `[0, duration - 0.25 s]`; seeking to the very end would
@@ -114,7 +114,7 @@ one rung, in the direction pressed:
 
 ### Two independent volumes
 
-* `↑`/`↓` → GStreamer `volume` element (software gain), 0-100 %, starts at 85 %.
+* `↑`/`↓` → GStreamer `volume` element (software gain), 0-100 %, starts at 100 %.
 * Multimedia keys → PipeWire sink volume, shared with the rest of the session.
 
 They are intentionally separate: the first one is the player's own level, the
