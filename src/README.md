@@ -164,10 +164,26 @@ decode tier: software (confirmed, I420 in system memory)
 | H.265 10-bit (4K) | `v4l2slh265dec` | hardware | `DMA_DRM` / DMABuf | 0.19 core |
 | AV1 | `v4l2slav1dec` | hardware | `DMA_DRM` / DMABuf | ~0.06 core |
 | MPEG-2 | `v4l2slmpeg2dec` | hardware | `DMA_DRM` / DMABuf | ~0.09 core |
-| VP8 | `v4l2slvp8dec` (present, not tested) | expected hardware | — | — |
+| VP8 | `v4l2slvp8dec` | hardware | `DMA_DRM` / DMABuf | ~0.03 core |
 | H.264 8-bit | `avdec_h264` | software | `I420` / system | ~0.57 core |
 | H.264 High 10 | `avdec_h264` | software | `I420_10LE` / system | ~0.85 core |
+| H.264 8-bit, 4K | `avdec_h264` | software | `I420` / system | ~1.4 core (2160p30) |
 | VP9 | `avdec_vp9` | software | `NV12` / system | ~0.31 core (720p) |
+
+**VP8 is hardware too.** `v4l2slvp8dec` decodes a 1920x1080 clip at `DMA_DRM` in
+zero copy, 0.03 core once running (0.20 at startup), exactly like
+HEVC/AV1/MPEG-2 — tier 1 never falls back and the log confirms
+`decode tier: hardware (zero copy, DMA_DRM -> kmssink)`.
+
+**H.264 4K in software is sustainable, but only just.** A 3840x2160 10 s clip at
+30 fps played from the first frame to EOS in 9.97 s of wall time, i.e. real time,
+with a steady 1.3-1.7 core (average ~1.4). The ceiling was measured separately
+(`avdec_h264 ! videoconvert ! fakesink sync=false`): 300 frames in 3.10 s, so
+~97 fps at 5.1 cores. At 30 fps that leaves roughly a factor of three of headroom,
+which a real 4K film — more entropy, higher bitrate, 60 fps or 10-bit H.264 — will
+consume. 4K H.264 therefore still ends up in the software tier by design (the
+hardware decoder cannot negotiate with `kmssink`), and it is the one case where the
+fallback costs most of a core.
 
 **VP9 has no hardware decoder on this kernel, and that is a kernel problem, not a
 GStreamer one.** The rkvdec instance does not register (`missing multi-core support,
@@ -360,6 +376,37 @@ It pretends the switch failed as soon as it succeeded; the log must show
 
 The previous run's log is kept as `last.log.prev` (rotated at startup): a crash
 or a failed switch leaves no other trace.
+
+## Decode tier self-tests
+
+Two environment variables exercise the fallback path. Both are read at startup
+and are inactive by default; nothing changes in normal use.
+
+`KMS_PLAY_TIER_WATCHDOG_MS` shortens the watchdog that gives tier 1 before it is
+declared stalled (default 12000 ms). It is the only way to hit that branch
+quickly, because the usual fallback is a negotiation error, not a stall:
+
+```sh
+KMS_PLAY_TIER_WATCHDOG_MS=2000 kms-play /tmp/t-trunc.mkv   # head -c 200000 of a clip
+```
+
+The log must show `state ready, pending playing`, then
+`decode tier: software (reason: tier 1 did not reach PLAYING in 2 s ...)`, then
+either playback (`decode tier: software (confirmed, ...)`) or, if the software
+tier fails too, `decode tier: none (software fallback failed)`.
+
+`KMS_PLAY_FORCE_SOFT_AT=<seconds>` drops to the software tier once playback
+reaches that position. Real H.264 failures happen at 0 s, so this is what
+validates the resume seek:
+
+```sh
+KMS_PLAY_FORCE_SOFT_AT=5 kms-play clip.webm   # a hardware codec, e.g. VP8/HEVC
+```
+
+The log must show `test hook: forcing software tier at 0:05`, `fallback:
+rebuilding playbin with software decoders at 0:05`, then `fallback: seek to
+0:05 -> ok`, then `decode tier: software (confirmed, ...)`, and the video plane
+must keep changing framebuffers (`plane[57] fb=`) after the switch.
 
 ## Keyboard layout
 

@@ -152,7 +152,23 @@ AUDIO_SWITCH_SELFTEST = os.environ.get("KMS_PLAY_AUDIO_SELFTEST") == "1"
 # A tier 1 that never reaches PLAYING is treated as a failure too: some broken
 # decoders stall instead of posting an error. The watchdog below gives tier 1
 # this many seconds to start before falling back.
-FALLBACK_START_TIMEOUT = 12.0
+#
+# Test hook: KMS_PLAY_TIER_WATCHDOG_MS shortens that delay so the fallback path
+# can be exercised against a file that really stalls. Never set in normal use.
+try:
+    FALLBACK_START_TIMEOUT = max(
+        0.2, float(os.environ.get("KMS_PLAY_TIER_WATCHDOG_MS", "12000")) / 1000.0)
+except ValueError:
+    FALLBACK_START_TIMEOUT = 12.0
+
+# Test hook: force the software tier once playback reaches this many seconds,
+# so the resume seek can be checked at a position other than the start of the
+# file. Unset in normal use; the value is the trigger position in seconds.
+_force_soft_at = os.environ.get("KMS_PLAY_FORCE_SOFT_AT")
+try:
+    FORCE_SOFT_AT = float(_force_soft_at) if _force_soft_at else None
+except ValueError:
+    FORCE_SOFT_AT = None
 
 # ---------------------------------------------------------------------------
 # Software gain
@@ -1107,6 +1123,20 @@ class Player:
         one-shot: it removes itself once the tier has been decided."""
         if self.finished or self.tier != 1 or self.fallback_done:
             return False
+        # Test hook: drop to software at a chosen position instead of waiting
+        # for a real negotiation failure, so the resume seek is exercised at
+        # something other than zero. Inactive unless KMS_PLAY_FORCE_SOFT_AT is
+        # set; it triggers once and then behaves like any other fallback.
+        if FORCE_SOFT_AT is not None:
+            try:
+                here = self.position()
+            except Exception:
+                here = 0.0
+            if here >= FORCE_SOFT_AT:
+                log("test hook: forcing software tier at %s" % hms(here))
+                self.degrade_to_software(
+                    "forced at %s by KMS_PLAY_FORCE_SOFT_AT" % hms(here))
+                return False
         if monotonic() - self.play_requested_at < FALLBACK_START_TIMEOUT:
             return True
         ok, state, pending = self.pipeline.get_state(0)
