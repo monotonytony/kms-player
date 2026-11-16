@@ -158,8 +158,10 @@ software tier is the answer; details and the failed workarounds are in
 ## Startup banner and information panel
 
 When playback is confirmed — the decode tier is decided and the video caps are
-negotiated — the OSD plane shows a four-line panel in the top left corner, in
-English, for 8 seconds, then fades out over 0.8 s and disappears:
+negotiated — the OSD plane shows a four-line panel in the top left corner, for
+8 seconds, then fades out over 0.8 s and disappears. The labels are translated
+(30 languages, see [`src/README.md`](src/README.md#language)); this is the
+English wording:
 
 ```
 HARDWARE · zero-copy
@@ -189,9 +191,18 @@ e.g. `Plane 57 · NV12 (I420 negotiated) · system · zpos 4`. The startup panel
 cancelled by the first key, before that key is interpreted, so the usual band appears
 immediately; the I panel ignores every key except I.
 
-The panel is the one English surface in the player: it reports technical facts and is
-read as a diagnostic. The other OSD labels (« Pause », « Décodage logiciel », track
-names) stay in French and are handled separately.
+Every label in the panel, in the bottom band (`Pause`, `Décodage logiciel`,
+`Audio : …`) and in the displayed error messages comes from one string table, in
+the language chosen by `KMS_PLAY_LANG` or the locale — English when none is
+recognised. The values never change with the language: a codec name, a DRM fourcc
+and a connector name are facts. A string whose glyphs the language's font cannot
+draw is replaced by its English form rather than shown as boxes, and the event is
+logged.
+
+```bash
+KMS_PLAY_LANG=ko kms-play film.mkv     # Korean
+LANG=ja_JP.UTF-8 kms-play film.mkv     # Japanese, from the locale
+```
 
 The fade is the only animation in the player: 12 bounded renders, then the plane is
 cleared and the buffer blanked. The panel and the bottom band are two different

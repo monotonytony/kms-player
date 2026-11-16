@@ -58,6 +58,23 @@ the plane for the usual bottom band. Both surfaces are written to
 kms-shot cannot otherwise tell which geometry a dump contains.
 
 ============================================================================
+LANGUAGE
+============================================================================
+Every visible string - the panel, the bottom band, the track names - comes
+from STRINGS, one positional table with 30 entries (the 28 requested
+languages plus Simplified, Traditional and Hong Kong Chinese). The language is
+picked from KMS_PLAY_LANG, then LC_MESSAGES, LANG and LANGUAGE, and defaults
+to English. Two guards keep the screen honest: a missing key falls back to its
+English form, and so does any string whose glyphs the language's font cannot
+draw (measured with Pango, logged as "i18n: ko missing glyphs"), so a partially
+installed font set can never paint tofu. The font family is chosen per
+language: fontconfig's fallback does not respect the CJK regional variants.
+Arabic, Persian and Hebrew get an RTL base direction and a right-aligned
+panel; their technical values (3840x1600, NV15, zpos 4) are drawn in a
+separate LTR layout, because Pango ignores LRE/PDF embedding marks and the
+numbers would otherwise be detached from their labels.
+
+============================================================================
 KEYBOARD MODEL
 ============================================================================
 kms-keys emits a press (1), a release (0) and, while a key is held, repeats
@@ -388,16 +405,1187 @@ class KeyLayout:
         return name
 
 
-# Displayed on screen, therefore intentionally French: these are user-facing
-# labels, the only place where French is allowed in this project.
-LANGUAGE_NAMES = {
-    "fre": "Français", "fra": "Français", "eng": "Anglais", "en": "Anglais",
-    "spa": "Espagnol", "ger": "Allemand", "deu": "Allemand", "ita": "Italien",
-    "jpn": "Japonais", "chi": "Chinois", "zho": "Chinois", "kor": "Coréen",
-    "por": "Portugais", "rus": "Russe", "ara": "Arabe", "nld": "Néerlandais",
-    "dut": "Néerlandais", "pol": "Polonais", "swe": "Suédois", "dan": "Danois",
-    "nor": "Norvégien", "fin": "Finnois", "tur": "Turc", "hin": "Hindi",
-    "und": "Indéterminé",
+# ---------------------------------------------------------------------------
+# Language
+# ---------------------------------------------------------------------------
+# One table, one lookup. Every string the viewer can read comes from STRINGS;
+# adding a language means adding one tuple and nothing else. Entries are
+# positional and KEYS gives their order: a short tuple is a loud import-time
+# error instead of a panel whose labels have silently shifted by one.
+#
+# Three Chinese entries on purpose: a Hong Kong viewer must not get Simplified
+# characters, and Traditional (Taiwan/Macau) and Hong Kong differ in everyday
+# vocabulary ("軟件" vs "軟體").
+#
+# Fonts are chosen per language instead of trusting fontconfig to fall back:
+# measured on this image, fc-match :charset=9F8D answers "Noto Sans CJK JP" for
+# a Traditional character, i.e. the fallback does not honour the regional
+# variant and 骨/骨-style glyph differences end up in the wrong script.
+KEYS = (
+    "panel.hardware",            # decode tier, bold headline
+    "panel.software",
+    "panel.plane",               # "Plane 57 · NV15"
+    "panel.negotiated",          # "(I420 negotiated)"
+    "panel.mem_dmabuf",
+    "panel.mem_system",
+    "panel.zpos",
+    "panel.screen",              # "HDMI-A-1 · 2560x1440"
+    "panel.refresh",             # "@ 75 Hz"
+    "osd.play",
+    "osd.pause",
+    "osd.volume_player",
+    "osd.volume_system",
+    "osd.muted",
+    "osd.no_audio",
+    "osd.audio",
+    "osd.audio_unavailable",
+    "osd.no_subtitles",
+    "osd.subtitles_off",
+    "osd.subtitles",
+    "osd.software_decode",
+    "osd.playback_failed",
+    "osd.preparing_subtitles",
+    "osd.seek_step",             # signed seek step, "{sign}{value} s"
+    "osd.percent",
+    "lang.fr", "lang.en", "lang.es", "lang.de", "lang.it", "lang.ja",
+    "lang.zh", "lang.ko", "lang.pt", "lang.ru", "lang.ar", "lang.nl",
+    "lang.pl", "lang.sv", "lang.da", "lang.nb", "lang.fi", "lang.tr",
+    "lang.hi", "lang.und",
+)
+
+# The 28 requested languages, with Chinese as three variants: 30 entries.
+STRINGS = {
+    "en": (
+        "HARDWARE · zero-copy",
+        "SOFTWARE · CPU fallback",
+        "Plane",
+        "({fmt} negotiated)",
+        "DMABuf",
+        "system",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Playing",
+        "Pause",
+        "Volume (player)",
+        "System",
+        "muted",
+        "No audio track",
+        "Audio: {name}",
+        "Audio track unavailable",
+        "No subtitles",
+        "Subtitles: Off",
+        "Subtitles: {name}",
+        "Software decoding",
+        "Playback failed",
+        "Preparing subtitles…",
+        "{sign}{value} s",
+        "{value} %",
+        "French", "English", "Spanish", "German", "Italian", "Japanese",
+        "Chinese", "Korean", "Portuguese", "Russian", "Arabic", "Dutch",
+        "Polish", "Swedish", "Danish", "Norwegian", "Finnish", "Turkish",
+        "Hindi", "Unknown",
+    ),
+    "fr": (
+        "MATÉRIEL · zéro copie",
+        "LOGICIEL · repli CPU",
+        "Plan",
+        "({fmt} négocié)",
+        "DMABuf",
+        "système",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Lecture",
+        "Pause",
+        "Volume (lecteur)",
+        "Système",
+        "muet",
+        "Aucune piste audio",
+        "Audio : {name}",
+        "Piste audio indisponible",
+        "Aucun sous-titre",
+        "Sous-titres : Désactivé",
+        "Sous-titres : {name}",
+        "Décodage logiciel",
+        "Lecture impossible",
+        "Préparation des sous-titres…",
+        "{sign}{value} s",
+        "{value} %",
+        "Français", "Anglais", "Espagnol", "Allemand", "Italien", "Japonais",
+        "Chinois", "Coréen", "Portugais", "Russe", "Arabe", "Néerlandais",
+        "Polonais", "Suédois", "Danois", "Norvégien", "Finnois", "Turc",
+        "Hindi", "Indéterminé",
+    ),
+    "de": (
+        "HARDWARE · Zero-Copy",
+        "SOFTWARE · CPU-Fallback",
+        "Ebene",
+        "({fmt} ausgehandelt)",
+        "DMABuf",
+        "Systemspeicher",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Wiedergabe",
+        "Pause",
+        "Lautstärke (Player)",
+        "System",
+        "stumm",
+        "Keine Tonspur",
+        "Audio: {name}",
+        "Tonspur nicht verfügbar",
+        "Keine Untertitel",
+        "Untertitel: Aus",
+        "Untertitel: {name}",
+        "Software-Dekodierung",
+        "Wiedergabe fehlgeschlagen",
+        "Untertitel werden vorbereitet…",
+        "{sign}{value} s",
+        "{value} %",
+        "Französisch", "Englisch", "Spanisch", "Deutsch", "Italienisch",
+        "Japanisch", "Chinesisch", "Koreanisch", "Portugiesisch", "Russisch",
+        "Arabisch", "Niederländisch", "Polnisch", "Schwedisch", "Dänisch",
+        "Norwegisch", "Finnisch", "Türkisch", "Hindi", "Unbekannt",
+    ),
+    "es": (
+        "HARDWARE · sin copia",
+        "SOFTWARE · respaldo CPU",
+        "Plano",
+        "({fmt} negociado)",
+        "DMABuf",
+        "sistema",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Reproduciendo",
+        "Pausa",
+        "Volumen (reproductor)",
+        "Sistema",
+        "silenciado",
+        "Sin pista de audio",
+        "Audio: {name}",
+        "Pista de audio no disponible",
+        "Sin subtítulos",
+        "Subtítulos: desactivados",
+        "Subtítulos: {name}",
+        "Decodificación por software",
+        "No se puede reproducir",
+        "Preparando los subtítulos…",
+        "{sign}{value} s",
+        "{value} %",
+        "Francés", "Inglés", "Español", "Alemán", "Italiano", "Japonés",
+        "Chino", "Coreano", "Portugués", "Ruso", "Árabe", "Neerlandés",
+        "Polaco", "Sueco", "Danés", "Noruego", "Finés", "Turco",
+        "Hindi", "Indeterminado",
+    ),
+    "pt": (
+        "HARDWARE · sem cópia",
+        "SOFTWARE · recurso à CPU",
+        "Plano",
+        "({fmt} negociado)",
+        "DMABuf",
+        "sistema",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "A reproduzir",
+        "Pausa",
+        "Volume (leitor)",
+        "Sistema",
+        "sem som",
+        "Sem faixa de áudio",
+        "Áudio: {name}",
+        "Faixa de áudio indisponível",
+        "Sem legendas",
+        "Legendas: desativadas",
+        "Legendas: {name}",
+        "Descodificação por software",
+        "Reprodução impossível",
+        "A preparar as legendas…",
+        "{sign}{value} s",
+        "{value} %",
+        "Francês", "Inglês", "Espanhol", "Alemão", "Italiano", "Japonês",
+        "Chinês", "Coreano", "Português", "Russo", "Árabe", "Neerlandês",
+        "Polaco", "Sueco", "Dinamarquês", "Norueguês", "Finlandês", "Turco",
+        "Hindi", "Indeterminado",
+    ),
+    "it": (
+        "HARDWARE · zero-copy",
+        "SOFTWARE · fallback CPU",
+        "Piano",
+        "({fmt} negoziato)",
+        "DMABuf",
+        "sistema",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Riproduzione",
+        "Pausa",
+        "Volume (lettore)",
+        "Sistema",
+        "muto",
+        "Nessuna traccia audio",
+        "Audio: {name}",
+        "Traccia audio non disponibile",
+        "Nessun sottotitolo",
+        "Sottotitoli: disattivati",
+        "Sottotitoli: {name}",
+        "Decodifica software",
+        "Riproduzione impossibile",
+        "Preparazione dei sottotitoli…",
+        "{sign}{value} s",
+        "{value} %",
+        "Francese", "Inglese", "Spagnolo", "Tedesco", "Italiano",
+        "Giapponese", "Cinese", "Coreano", "Portoghese", "Russo",
+        "Arabo", "Olandese", "Polacco", "Svedese", "Danese",
+        "Norvegese", "Finlandese", "Turco", "Hindi", "Indeterminato",
+    ),
+    "nl": (
+        "HARDWARE · zero-copy",
+        "SOFTWARE · CPU-terugval",
+        "Vlak",
+        "({fmt} onderhandeld)",
+        "DMABuf",
+        "systeem",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Afspelen",
+        "Pauze",
+        "Volume (speler)",
+        "Systeem",
+        "gedempt",
+        "Geen audiospoor",
+        "Audio: {name}",
+        "Audiospoor niet beschikbaar",
+        "Geen ondertitels",
+        "Ondertitels: uit",
+        "Ondertitels: {name}",
+        "Softwarematige decodering",
+        "Afspelen mislukt",
+        "Ondertitels voorbereiden…",
+        "{sign}{value} s",
+        "{value} %",
+        "Frans", "Engels", "Spaans", "Duits", "Italiaans", "Japans",
+        "Chinees", "Koreaans", "Portugees", "Russisch", "Arabisch",
+        "Nederlands", "Pools", "Zweeds", "Deens", "Noors", "Fins",
+        "Turks", "Hindi", "Onbekend",
+    ),
+    "sv": (
+        "HÅRDVARA · zero-copy",
+        "PROGRAMVARA · CPU-fallback",
+        "Plan",
+        "({fmt} förhandlat)",
+        "DMABuf",
+        "system",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Spelar upp",
+        "Paus",
+        "Volym (spelare)",
+        "System",
+        "ljud av",
+        "Inget ljudspår",
+        "Ljud: {name}",
+        "Ljudspåret är inte tillgängligt",
+        "Inga undertexter",
+        "Undertexter: av",
+        "Undertexter: {name}",
+        "Programvaruavkodning",
+        "Uppspelningen misslyckades",
+        "Förbereder undertexter…",
+        "{sign}{value} s",
+        "{value} %",
+        "Franska", "Engelska", "Spanska", "Tyska", "Italienska", "Japanska",
+        "Kinesiska", "Koreanska", "Portugisiska", "Ryska", "Arabiska",
+        "Nederländska", "Polska", "Svenska", "Danska", "Norska", "Finska",
+        "Turkiska", "Hindi", "Okänt",
+    ),
+    "pl": (
+        "SPRZĘT · zero-copy",
+        "SOFTWARE · dekodowanie CPU",
+        "Płaszczyzna",
+        "({fmt} wynegocjowane)",
+        "DMABuf",
+        "system",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Odtwarzanie",
+        "Pauza",
+        "Głośność (odtwarzacz)",
+        "System",
+        "wyciszony",
+        "Brak ścieżki audio",
+        "Audio: {name}",
+        "Ścieżka audio niedostępna",
+        "Brak napisów",
+        "Napisy: wyłączone",
+        "Napisy: {name}",
+        "Dekodowanie programowe",
+        "Nie można odtworzyć",
+        "Przygotowywanie napisów…",
+        "{sign}{value} s",
+        "{value} %",
+        "Francuski", "Angielski", "Hiszpański", "Niemiecki", "Włoski",
+        "Japoński", "Chiński", "Koreański", "Portugalski", "Rosyjski",
+        "Arabski", "Niderlandzki", "Polski", "Szwedzki", "Duński",
+        "Norweski", "Fiński", "Turecki", "Hindi", "Nieokreślony",
+    ),
+    "ru": (
+        "АППАРАТНО · без копирования",
+        "ПРОГРАММНО · запасной путь CPU",
+        "Плоскость",
+        "({fmt} согласовано)",
+        "DMABuf",
+        "системная память",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Гц",
+        "Воспроизведение",
+        "Пауза",
+        "Громкость (плеер)",
+        "Система",
+        "без звука",
+        "Нет звуковой дорожки",
+        "Звук: {name}",
+        "Звуковая дорожка недоступна",
+        "Нет субтитров",
+        "Субтитры: выкл.",
+        "Субтитры: {name}",
+        "Программное декодирование",
+        "Воспроизведение невозможно",
+        "Подготовка субтитров…",
+        "{sign}{value} с",
+        "{value} %",
+        "Французский", "Английский", "Испанский", "Немецкий", "Итальянский",
+        "Японский", "Китайский", "Корейский", "Португальский", "Русский",
+        "Арабский", "Нидерландский", "Польский", "Шведский", "Датский",
+        "Норвежский", "Финский", "Турецкий", "Хинди", "Не определён",
+    ),
+    "uk": (
+        "АПАРАТНО · без копіювання",
+        "ПРОГРАМНО · резервний шлях CPU",
+        "Площина",
+        "({fmt} узгоджено)",
+        "DMABuf",
+        "системна пам’ять",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Гц",
+        "Відтворення",
+        "Пауза",
+        "Гучність (плеєр)",
+        "Система",
+        "без звуку",
+        "Немає звукової доріжки",
+        "Звук: {name}",
+        "Звукова доріжка недоступна",
+        "Немає субтитрів",
+        "Субтитри: вимк.",
+        "Субтитри: {name}",
+        "Програмне декодування",
+        "Відтворення неможливе",
+        "Підготовка субтитрів…",
+        "{sign}{value} с",
+        "{value} %",
+        "Французька", "Англійська", "Іспанська", "Німецька", "Італійська",
+        "Японська", "Китайська", "Корейська", "Португальська", "Російська",
+        "Арабська", "Нідерландська", "Польська", "Шведська", "Данська",
+        "Норвезька", "Фінська", "Турецька", "Гінді", "Не визначено",
+    ),
+    "cs": (
+        "HARDWARE · zero-copy",
+        "SOFTWARE · záložní CPU",
+        "Vrstva",
+        "({fmt} vyjednáno)",
+        "DMABuf",
+        "systém",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Přehrávání",
+        "Pauza",
+        "Hlasitost (přehrávač)",
+        "Systém",
+        "ztlumeno",
+        "Žádná zvuková stopa",
+        "Zvuk: {name}",
+        "Zvuková stopa není dostupná",
+        "Žádné titulky",
+        "Titulky: vypnuto",
+        "Titulky: {name}",
+        "Softwarové dekódování",
+        "Přehrávání nelze zahájit",
+        "Příprava titulků…",
+        "{sign}{value} s",
+        "{value} %",
+        "Francouzština", "Angličtina", "Španělština", "Němčina", "Italština",
+        "Japonština", "Čínština", "Korejština", "Portugalština", "Ruština",
+        "Arabština", "Nizozemština", "Polština", "Švédština", "Dánština",
+        "Norština", "Finština", "Turečtina", "Hindština", "Neurčeno",
+    ),
+    "ro": (
+        "HARDWARE · fără copiere",
+        "SOFTWARE · rezervă CPU",
+        "Plan",
+        "({fmt} negociat)",
+        "DMABuf",
+        "sistem",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Redare",
+        "Pauză",
+        "Volum (player)",
+        "Sistem",
+        "fără sunet",
+        "Nicio pistă audio",
+        "Audio: {name}",
+        "Pista audio nu este disponibilă",
+        "Niciun subtitlu",
+        "Subtitrări: dezactivate",
+        "Subtitrări: {name}",
+        "Decodare software",
+        "Redarea nu este posibilă",
+        "Se pregătesc subtitrările…",
+        "{sign}{value} s",
+        "{value} %",
+        "Franceză", "Engleză", "Spaniolă", "Germană", "Italiană",
+        "Japoneză", "Chineză", "Coreeană", "Portugheză", "Rusă",
+        "Arabă", "Neerlandeză", "Poloneză", "Suedeză", "Daneză",
+        "Norvegiană", "Finlandeză", "Turcă", "Hindi", "Nedeterminată",
+    ),
+    "el": (
+        "ΥΛΙΚΟ · χωρίς αντιγραφή",
+        "ΛΟΓΙΣΜΙΚΟ · εφεδρικό CPU",
+        "Επίπεδο",
+        "({fmt} διαπραγματευμένο)",
+        "DMABuf",
+        "σύστημα",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Αναπαραγωγή",
+        "Παύση",
+        "Ένταση (αναπαραγωγή)",
+        "Σύστημα",
+        "σε σίγαση",
+        "Κανένα κομμάτι ήχου",
+        "Ήχος: {name}",
+        "Το κομμάτι ήχου δεν είναι διαθέσιμο",
+        "Χωρίς υπότιτλους",
+        "Υπότιτλοι: ανενεργοί",
+        "Υπότιτλοι: {name}",
+        "Αποκωδικοποίηση λογισμικού",
+        "Η αναπαραγωγή απέτυχε",
+        "Προετοιμασία υπότιτλων…",
+        "{sign}{value} δευτ.",
+        "{value} %",
+        "Γαλλικά", "Αγγλικά", "Ισπανικά", "Γερμανικά", "Ιταλικά",
+        "Ιαπωνικά", "Κινεζικά", "Κορεατικά", "Πορτογαλικά", "Ρωσικά",
+        "Αραβικά", "Ολλανδικά", "Πολωνικά", "Σουηδικά", "Δανικά",
+        "Νορβηγικά", "Φινλανδικά", "Τουρκικά", "Χίντι", "Απροσδιόριστο",
+    ),
+    "tr": (
+        "DONANIM · kopyasız",
+        "YAZILIM · CPU yedeği",
+        "Düzlem",
+        "({fmt} anlaşıldı)",
+        "DMABuf",
+        "sistem",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Oynatılıyor",
+        "Duraklat",
+        "Ses (oynatıcı)",
+        "Sistem",
+        "sessiz",
+        "Ses parçası yok",
+        "Ses: {name}",
+        "Ses parçası kullanılamıyor",
+        "Altyazı yok",
+        "Altyazılar: kapalı",
+        "Altyazılar: {name}",
+        "Yazılımla çözme",
+        "Oynatma başarısız",
+        "Altyazılar hazırlanıyor…",
+        "{sign}{value} sn",
+        "%{value}",
+        "Fransızca", "İngilizce", "İspanyolca", "Almanca", "İtalyanca",
+        "Japonca", "Çince", "Korece", "Portekizce", "Rusça",
+        "Arapça", "Felemenkçe", "Lehçe", "İsveççe", "Danca",
+        "Norveççe", "Fince", "Türkçe", "Hintçe", "Belirsiz",
+    ),
+    "ar": (
+        "عتاد · بدون نسخ",
+        "برنامج · احتياطي المعالج",
+        "المستوى",
+        "({fmt} متفاوض عليه)",
+        "DMABuf",
+        "ذاكرة النظام",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} هرتز",
+        "قيد التشغيل",
+        "إيقاف مؤقت",
+        "مستوى الصوت (المشغل)",
+        "النظام",
+        "صامت",
+        "لا يوجد مسار صوتي",
+        "الصوت: {name}",
+        "المسار الصوتي غير متاح",
+        "لا توجد ترجمات",
+        "الترجمات: معطلة",
+        "الترجمات: {name}",
+        "فك الترميز برمجيًا",
+        "تعذر التشغيل",
+        "جارٍ تحضير الترجمات…",
+        "{sign}{value} ث",
+        "{value}٪",
+        "الفرنسية", "الإنجليزية", "الإسبانية", "الألمانية", "الإيطالية",
+        "اليابانية", "الصينية", "الكورية", "البرتغالية", "الروسية",
+        "العربية", "الهولندية", "البولندية", "السويدية", "الدنماركية",
+        "النرويجية", "الفنلندية", "التركية", "الهندية", "غير محدد",
+    ),
+    "fa": (
+        "سخت‌افزار · بدون کپی",
+        "نرم‌افزار · پردازش CPU",
+        "صفحه",
+        "({fmt} مذاکره‌شده)",
+        "DMABuf",
+        "حافظه سیستم",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} هرتز",
+        "در حال پخش",
+        "مکث",
+        "صدا (پخش‌کننده)",
+        "سیستم",
+        "بی‌صدا",
+        "هیچ مسیر صوتی نیست",
+        "صدا: {name}",
+        "مسیر صوتی در دسترس نیست",
+        "زیرنویس نیست",
+        "زیرنویس‌ها: خاموش",
+        "زیرنویس‌ها: {name}",
+        "رمزگشایی نرم‌افزاری",
+        "پخش ناموفق بود",
+        "در حال آماده‌سازی زیرنویس‌ها…",
+        "{sign}{value} ثانیه",
+        "{value}٪",
+        "فرانسوی", "انگلیسی", "اسپانیایی", "آلمانی", "ایتالیایی",
+        "ژاپنی", "چینی", "کره‌ای", "پرتغالی", "روسی",
+        "عربی", "هلندی", "لهستانی", "سوئدی", "دانمارکی",
+        "نروژی", "فنلاندی", "ترکی", "هندی", "نامشخص",
+    ),
+    "he": (
+        "חומרה · ללא העתקה",
+        "תוכנה · גיבוי CPU",
+        "מישור",
+        "({fmt} מוסכם)",
+        "DMABuf",
+        "זיכרון מערכת",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} הרץ",
+        "מנגן",
+        "השהיה",
+        "עוצמת שמע (נגן)",
+        "מערכת",
+        "מושתק",
+        "אין רצועת שמע",
+        "שמע: {name}",
+        "רצועת השמע אינה זמינה",
+        "אין כתוביות",
+        "כתוביות: כבוי",
+        "כתוביות: {name}",
+        "פענוח בתוכנה",
+        "הניגון נכשל",
+        "מכין כתוביות…",
+        "{sign}{value} שנ׳",
+        "{value} %",
+        "צרפתית", "אנגלית", "ספרדית", "גרמנית", "איטלקית",
+        "יפנית", "סינית", "קוריאנית", "פורטוגזית", "רוסית",
+        "ערבית", "הולנדית", "פולנית", "שוודית", "דנית",
+        "נורווגית", "פינית", "טורקית", "הינדי", "לא ידוע",
+    ),
+    "hi": (
+        "हार्डवेयर · शून्य-प्रतिलिपि",
+        "सॉफ़्टवेयर · CPU फ़ॉलबैक",
+        "प्लेन",
+        "({fmt} निगोशिएटेड)",
+        "DMABuf",
+        "सिस्टम मेमोरी",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "चल रहा है",
+        "पॉज़",
+        "वॉल्यूम (प्लेयर)",
+        "सिस्टम",
+        "म्यूट",
+        "कोई ऑडियो ट्रैक नहीं",
+        "ऑडियो: {name}",
+        "ऑडियो ट्रैक उपलब्ध नहीं",
+        "कोई सबटाइटल नहीं",
+        "सबटाइटल: बंद",
+        "सबटाइटल: {name}",
+        "सॉफ़्टवेयर डिकोडिंग",
+        "प्लेबैक विफल",
+        "सबटाइटल तैयार हो रहे हैं…",
+        "{sign}{value} सेकंड",
+        "{value} %",
+        "फ़्रेंच", "अंग्रेज़ी", "स्पेनिश", "जर्मन", "इतालवी",
+        "जापानी", "चीनी", "कोरियाई", "पुर्तगाली", "रूसी",
+        "अरबी", "डच", "पोलिश", "स्वीडिश", "डेनिश",
+        "नॉर्वेजियन", "फ़िनिश", "तुर्की", "हिन्दी", "अज्ञात",
+    ),
+    "bn": (
+        "হার্ডওয়্যার · কপি ছাড়া",
+        "সফটওয়্যার · CPU ফলব্যাক",
+        "প্লেন",
+        "({fmt} নেগোশিয়েটেড)",
+        "DMABuf",
+        "সিস্টেম মেমরি",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "চলছে",
+        "বিরতি",
+        "ভলিউম (প্লেয়ার)",
+        "সিস্টেম",
+        "নীরব",
+        "কোনো অডিও ট্র্যাক নেই",
+        "অডিও: {name}",
+        "অডিও ট্র্যাক পাওয়া যাচ্ছে না",
+        "কোনো সাবটাইটেল নেই",
+        "সাবটাইটেল: বন্ধ",
+        "সাবটাইটেল: {name}",
+        "সফটওয়্যার ডিকোডিং",
+        "চালানো সম্ভব হয়নি",
+        "সাবটাইটেল প্রস্তুত হচ্ছে…",
+        "{sign}{value} সেকেন্ড",
+        "{value} %",
+        "ফরাসি", "ইংরেজি", "স্পেনিশ", "জার্মান", "ইতালীয়",
+        "জাপানি", "চীনা", "কোরীয়", "পর্তুগিজ", "রুশ",
+        "আরবি", "ওলন্দাজ", "পোলিশ", "সুইডিশ", "ডেনিশ",
+        "নরওয়েজিয়ান", "ফিনিশ", "তুর্কি", "হিন্দি", "অজানা",
+    ),
+    "ta": (
+        "வன்பொருள் · நகலெடுக்காமல்",
+        "மென்பொருள் · CPU காப்பு",
+        "தளம்",
+        "({fmt} ஒப்புக்கொள்ளப்பட்டது)",
+        "DMABuf",
+        "கணினி நினைவகம்",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "இயங்குகிறது",
+        "இடைநிறுத்தம்",
+        "ஒலி அளவு (இயக்கி)",
+        "கணினி",
+        "ஒலி அணைக்கப்பட்டது",
+        "ஒலித்தடம் இல்லை",
+        "ஒலி: {name}",
+        "ஒலித்தடம் கிடைக்கவில்லை",
+        "வசன வரிகள் இல்லை",
+        "வசன வரிகள்: அணைந்தது",
+        "வசன வரிகள்: {name}",
+        "மென்பொருள் புரிவிலக்கம்",
+        "இயக்க முடியவில்லை",
+        "வசன வரிகள் தயாராகின்றன…",
+        "{sign}{value} வி",
+        "{value} %",
+        "பிரெஞ்சு", "ஆங்கிலம்", "ஸ்பானிஷ்", "ஜெர்மன்", "இத்தாலியன்",
+        "ஜப்பானியம்", "சீனம்", "கொரியன்", "போர்த்துகீசியம்", "உருசியம்",
+        "அரபு", "டச்சு", "போலிஷ்", "சுவீடிஷ்", "டேனிஷ்",
+        "நார்வேஜியன்", "பின்னிஷ்", "துருக்கியம்", "இந்தி", "தெரியவில்லை",
+    ),
+    "vi": (
+        "PHẦN CỨNG · không sao chép",
+        "PHẦN MỀM · dự phòng CPU",
+        "Mặt phẳng",
+        "({fmt} đã thương lượng)",
+        "DMABuf",
+        "bộ nhớ hệ thống",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Đang phát",
+        "Tạm dừng",
+        "Âm lượng (trình phát)",
+        "Hệ thống",
+        "tắt tiếng",
+        "Không có bản âm thanh",
+        "Âm thanh: {name}",
+        "Bản âm thanh không khả dụng",
+        "Không có phụ đề",
+        "Phụ đề: tắt",
+        "Phụ đề: {name}",
+        "Giải mã bằng phần mềm",
+        "Không phát được",
+        "Đang chuẩn bị phụ đề…",
+        "{sign}{value} giây",
+        "{value} %",
+        "Tiếng Pháp", "Tiếng Anh", "Tiếng Tây Ban Nha", "Tiếng Đức",
+        "Tiếng Ý", "Tiếng Nhật", "Tiếng Trung", "Tiếng Hàn",
+        "Tiếng Bồ Đào Nha", "Tiếng Nga", "Tiếng Ả Rập", "Tiếng Hà Lan",
+        "Tiếng Ba Lan", "Tiếng Thụy Điển", "Tiếng Đan Mạch",
+        "Tiếng Na Uy", "Tiếng Phần Lan", "Tiếng Thổ Nhĩ Kỳ",
+        "Tiếng Hindi", "Không xác định",
+    ),
+    "id": (
+        "PERANGKAT KERAS · tanpa salin",
+        "PERANGKAT LUNAK · cadangan CPU",
+        "Bidang",
+        "({fmt} dinegosiasikan)",
+        "DMABuf",
+        "memori sistem",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Memutar",
+        "Jeda",
+        "Volume (pemutar)",
+        "Sistem",
+        "bisu",
+        "Tidak ada trek audio",
+        "Audio: {name}",
+        "Trek audio tidak tersedia",
+        "Tidak ada subtitel",
+        "Subtel: nonaktif",
+        "Subtel: {name}",
+        "Dekode perangkat lunak",
+        "Pemutaran gagal",
+        "Menyiapkan subtitel…",
+        "{sign}{value} dtk",
+        "{value} %",
+        "Prancis", "Inggris", "Spanyol", "Jerman", "Italia",
+        "Jepang", "Tionghoa", "Korea", "Portugis", "Rusia",
+        "Arab", "Belanda", "Polandia", "Swedia", "Denmark",
+        "Norwegia", "Finlandia", "Turki", "Hindi", "Tidak diketahui",
+    ),
+    "ms": (
+        "KERASINGAN · tanpa salin",
+        "PERISIAN · sandaran CPU",
+        "Satah",
+        "({fmt} dirunding)",
+        "DMABuf",
+        "memori sistem",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "Sedang dimainkan",
+        "Jeda",
+        "Kelantangan (pemain)",
+        "Sistem",
+        "senyap",
+        "Tiada trek audio",
+        "Audio: {name}",
+        "Trek audio tidak tersedia",
+        "Tiada sari kata",
+        "Sari kata: mati",
+        "Sari kata: {name}",
+        "Penyahkodan perisian",
+        "Gagal memainkan",
+        "Menyediakan sari kata…",
+        "{sign}{value} saat",
+        "{value} %",
+        "Perancis", "Inggeris", "Sepanyol", "Jerman", "Itali",
+        "Jepun", "Cina", "Korea", "Portugis", "Rusia",
+        "Arab", "Belanda", "Poland", "Sweden", "Denmark",
+        "Norway", "Finland", "Turki", "Hindi", "Tidak diketahui",
+    ),
+    "th": (
+        "ฮาร์ดแวร์ · ไม่คัดลอก",
+        "ซอฟต์แวร์ · ใช้ CPU สำรอง",
+        "ระนาบ",
+        "({fmt} เจรจาแล้ว)",
+        "DMABuf",
+        "หน่วยความจำระบบ",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "กำลังเล่น",
+        "หยุดชั่วคราว",
+        "ระดับเสียง (เครื่องเล่น)",
+        "ระบบ",
+        "ปิดเสียง",
+        "ไม่มีแทร็กเสียง",
+        "เสียง: {name}",
+        "แทร็กเสียงไม่พร้อมใช้งาน",
+        "ไม่มีคำบรรยาย",
+        "คำบรรยาย: ปิด",
+        "คำบรรยาย: {name}",
+        "ถอดรหัสด้วยซอฟต์แวร์",
+        "เล่นไม่ได้",
+        "กำลังเตรียมคำบรรยาย…",
+        "{sign}{value} วินาที",
+        "{value} %",
+        "ฝรั่งเศส", "อังกฤษ", "สเปน", "เยอรมัน", "อิตาลี",
+        "ญี่ปุ่น", "จีน", "เกาหลี", "โปรตุเกส", "รัสเซีย",
+        "อาหรับ", "ดัตช์", "โปแลนด์", "สวีเดน", "เดนมาร์ก",
+        "นอร์เวย์", "ฟินแลนด์", "ตุรกี", "ฮินดี", "ไม่ระบุ",
+    ),
+    "ja": (
+        "ハードウェア · ゼロコピー",
+        "ソフトウェア · CPU フォールバック",
+        "プレーン",
+        "({fmt} ネゴシエート済み)",
+        "DMABuf",
+        "システムメモリ",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "再生中",
+        "一時停止",
+        "音量 (プレーヤー)",
+        "システム",
+        "ミュート",
+        "音声トラックなし",
+        "音声: {name}",
+        "音声トラックを利用できません",
+        "字幕なし",
+        "字幕: オフ",
+        "字幕: {name}",
+        "ソフトウェアデコード",
+        "再生できません",
+        "字幕を準備しています…",
+        "{sign}{value} 秒",
+        "{value} %",
+        "フランス語", "英語", "スペイン語", "ドイツ語", "イタリア語",
+        "日本語", "中国語", "韓国語", "ポルトガル語", "ロシア語",
+        "アラビア語", "オランダ語", "ポーランド語", "スウェーデン語",
+        "デンマーク語", "ノルウェー語", "フィンランド語", "トルコ語",
+        "ヒンディー語", "不明",
+    ),
+    "ko": (
+        "하드웨어 · 복사 없음",
+        "소프트웨어 · CPU 대체",
+        "평면",
+        "({fmt} 협상됨)",
+        "DMABuf",
+        "시스템 메모리",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "재생 중",
+        "일시정지",
+        "볼륨 (플레이어)",
+        "시스템",
+        "음소거",
+        "오디오 트랙 없음",
+        "오디오: {name}",
+        "오디오 트랙을 사용할 수 없음",
+        "자막 없음",
+        "자막: 끔",
+        "자막: {name}",
+        "소프트웨어 디코딩",
+        "재생할 수 없음",
+        "자막을 준비하는 중…",
+        "{sign}{value}초",
+        "{value} %",
+        "프랑스어", "영어", "스페인어", "독일어", "이탈리아어",
+        "일본어", "중국어", "한국어", "포르투갈어", "러시아어",
+        "아랍어", "네덜란드어", "폴란드어", "스웨덴어", "덴마크어",
+        "노르웨이어", "핀란드어", "터키어", "힌디어", "알 수 없음",
+    ),
+    "zh-Hans": (
+        "硬件 · 零拷贝",
+        "软件 · CPU 回退",
+        "图层",
+        "（{fmt} 已协商）",
+        "DMABuf",
+        "系统内存",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "正在播放",
+        "暂停",
+        "音量（播放器）",
+        "系统",
+        "静音",
+        "无音轨",
+        "音频：{name}",
+        "音轨不可用",
+        "无字幕",
+        "字幕：关闭",
+        "字幕：{name}",
+        "软件解码",
+        "无法播放",
+        "正在准备字幕…",
+        "{sign}{value} 秒",
+        "{value} %",
+        "法语", "英语", "西班牙语", "德语", "意大利语",
+        "日语", "中文", "韩语", "葡萄牙语", "俄语",
+        "阿拉伯语", "荷兰语", "波兰语", "瑞典语", "丹麦语",
+        "挪威语", "芬兰语", "土耳其语", "印地语", "未确定",
+    ),
+    "zh-Hant": (
+        "硬體 · 零複製",
+        "軟體 · CPU 備援",
+        "圖層",
+        "（{fmt} 已協商）",
+        "DMABuf",
+        "系統記憶體",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "播放中",
+        "暫停",
+        "音量（播放器）",
+        "系統",
+        "靜音",
+        "無音軌",
+        "音訊：{name}",
+        "音軌無法使用",
+        "無字幕",
+        "字幕：關閉",
+        "字幕：{name}",
+        "軟體解碼",
+        "無法播放",
+        "正在準備字幕…",
+        "{sign}{value} 秒",
+        "{value} %",
+        "法語", "英語", "西班牙語", "德語", "義大利語",
+        "日語", "中文", "韓語", "葡萄牙語", "俄語",
+        "阿拉伯語", "荷蘭語", "波蘭語", "瑞典語", "丹麥語",
+        "挪威語", "芬蘭語", "土耳其語", "印地語", "未確定",
+    ),
+    "zh-HK": (
+        "硬件 · 零複製",
+        "軟件 · CPU 後備",
+        "圖層",
+        "（{fmt} 已協商）",
+        "DMABuf",
+        "系統記憶體",
+        "zpos {value}",
+        "{name} · {width}x{height}",
+        "@ {hz} Hz",
+        "播放中",
+        "暫停",
+        "音量（播放器）",
+        "系統",
+        "靜音",
+        "無音軌",
+        "音訊：{name}",
+        "音軌無法使用",
+        "無字幕",
+        "字幕：關閉",
+        "字幕：{name}",
+        "軟件解碼",
+        "無法播放",
+        "正在準備字幕…",
+        "{sign}{value} 秒",
+        "{value} %",
+        "法文", "英文", "西班牙文", "德文", "意大利文",
+        "日文", "中文", "韓文", "葡萄牙文", "俄文",
+        "阿拉伯文", "荷蘭文", "波蘭文", "瑞典文", "丹麥文",
+        "挪威文", "芬蘭文", "土耳其文", "印地文", "未確定",
+    ),
+}
+
+# Font family per language. Anything absent uses DEFAULT_FONT_FAMILY: Latin,
+# Greek, Cyrillic and Hebrew all sit in the core Noto/DejaVu set already
+# installed, so only the scripts that need a dedicated family are listed.
+FONT_FAMILIES = {
+    "ja": "Noto Sans CJK JP",
+    "ko": "Noto Sans CJK KR",
+    "zh-Hans": "Noto Sans CJK SC",
+    "zh-Hant": "Noto Sans CJK TC",
+    "zh-HK": "Noto Sans CJK HK",
+    "th": "Noto Sans Thai",
+    "hi": "Noto Sans Devanagari",
+    "bn": "Noto Sans Bengali",
+    "ta": "Noto Sans Tamil",
+    "ar": "Noto Sans Arabic",
+    "fa": "Noto Sans Arabic",
+}
+DEFAULT_FONT_FAMILY = "Sans"
+
+# Right-to-left scripts: the panel mirrors and the labels are flush right, but
+# the technical values are drawn in their own LTR layout (see _render_panel),
+# otherwise "3840x1600" is reordered by the bidi algorithm.
+RTL_LANGUAGES = ("ar", "fa", "he")
+
+_TABLES = {}
+for _code, _values in STRINGS.items():
+    if len(_values) != len(KEYS):
+        raise SystemExit("i18n: %s has %d strings, expected %d"
+                         % (_code, len(_values), len(KEYS)))
+    _TABLES[_code] = dict(zip(KEYS, _values))
+
+# Placeholders are part of the contract: a translation that drops {fmt} would
+# print a sentence with a hole in it, so this is checked once at import.
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+for _code, _table in _TABLES.items():
+    for _key, _text in _table.items():
+        if sorted(_PLACEHOLDER.findall(_text)) != sorted(_PLACEHOLDER.findall(_TABLES["en"][_key])):
+            raise SystemExit("i18n: %s/%s has different placeholders" % (_code, _key))
+
+
+def normalise_language(tag):
+    """Reduce a locale tag to one of our language codes.
+
+    Accepts what the environment actually contains: "fr_FR.UTF-8",
+    "ja_JP.utf8", "zh_TW", "zh-Hant-HK", "pt_BR", "C". Region decides the
+    Chinese variant; every other language is one entry whatever the region."""
+    tag = (tag or "").strip()
+    if not tag or tag in ("C", "POSIX"):
+        return ""
+    # Drop encoding and modifier: "fr_FR.UTF-8@euro" -> "fr_FR".
+    tag = tag.split(":")[0].split(".")[0].split("@")[0]
+    parts = tag.replace("-", "_").split("_")
+    base = parts[0].lower()
+    region = parts[1].upper() if len(parts) > 1 else ""
+    if base == "zh":
+        if region in ("TW", "MO"):
+            return "zh-Hant"
+        if region == "HK":
+            return "zh-HK"
+        if region in ("CN", "SG"):
+            return "zh-Hans"
+        # A bare "zh" or an unknown region: Simplified is the safer default,
+        # it is the writing system of the largest number of readers.
+        return "zh-Hans"
+    if base in ("he", "iw"):
+        return "he"
+    if base in ("id", "in"):
+        return "id"
+    return base
+
+
+def detect_language():
+    """The language to display: KMS_PLAY_LANG, then the usual locale vars.
+
+    Order is the one asked for: explicit override, LC_MESSAGES, LANG, then
+    LANGUAGE (a colon-separated list, first entry wins). Anything absent or
+    unrecognised falls back to English rather than to an empty panel."""
+    for variable in ("KMS_PLAY_LANG", "LC_MESSAGES", "LANG", "LANGUAGE"):
+        value = os.environ.get(variable) or ""
+        for candidate in value.split(":"):
+            code = normalise_language(candidate)
+            if code in STRINGS:
+                return code
+    return "en"
+
+
+LANGUAGE = detect_language()
+_FALLBACK_KEYS = set()          # {(language, key)} already reported
+_MEASURE = {}                   # lazily built measuring layout
+
+
+def language():
+    """The active language code."""
+    return LANGUAGE
+
+
+def set_language(code, quiet=False):
+    """Switch language; used at startup and by src/test-i18n.py."""
+    global LANGUAGE
+    LANGUAGE = code if code in STRINGS else "en"
+    _FALLBACK_KEYS.clear()
+    if not quiet:
+        log("i18n: language %s (%s)" % (LANGUAGE, "rtl" if is_rtl() else "ltr"))
+    return LANGUAGE
+
+
+def font_family(lang=None):
+    """The font family to draw `lang` with (see FONT_FAMILIES)."""
+    return FONT_FAMILIES.get(lang or LANGUAGE, DEFAULT_FONT_FAMILY)
+
+
+def font_description(style="", lang=None):
+    """Pango description for a language, e.g. font_description("Bold 16").
+
+    The family is picked here rather than left to fontconfig's fallback,
+    which does not distinguish the CJK regional variants."""
+    return Pango.FontDescription(("%s %s" % (font_family(lang), style)).strip())
+
+
+def is_rtl(lang=None):
+    return (lang or LANGUAGE) in RTL_LANGUAGES
+
+
+def apply_direction(layout, lang=None):
+    """Set the base direction of a layout: RTL for ar/fa/he, auto otherwise.
+
+    The base direction lives on the layout's PangoContext, not on the layout:
+    Pango.Layout only exposes auto-dir. Auto-dir is switched off for RTL so a
+    line that happens to start with a Latin value ("Plane 57 ...") is still
+    laid out right to left instead of flipping the whole panel."""
+    context = layout.get_context()
+    if is_rtl(lang):
+        context.set_base_dir(Pango.Direction.RTL)
+        layout.set_auto_dir(False)
+        layout.set_alignment(Pango.Alignment.RIGHT)
+    else:
+        context.set_base_dir(Pango.Direction.LTR)
+        layout.set_auto_dir(True)
+        layout.set_alignment(Pango.Alignment.LEFT)
+
+
+def _missing_glyphs(text, lang=None):
+    """True when the language's font cannot draw `text`.
+
+    Measured on a throw-away 1x1 surface: the answer depends on the font and
+    the string only, not on the panel being drawn."""
+    if "surface" not in _MEASURE:
+        _MEASURE["surface"] = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        _MEASURE["layout"] = PangoCairo.create_layout(cairo.Context(_MEASURE["surface"]))
+    layout = _MEASURE["layout"]
+    layout.set_font_description(font_description("15", lang))
+    layout.set_text(text, -1)
+    return layout.get_unknown_glyphs_count() > 0
+
+
+def tr(key, **values):
+    """The string for `key` in the current language, formatted.
+
+    Two fallbacks, silent on screen and explicit in the log: a missing key
+    (partial translation) uses English, and a string the language's font
+    cannot draw is replaced by its English form instead of being shown as
+    boxes. The second one is the anti-tofu guarantee; it is measured, not
+    assumed, because a font package can be missing at runtime."""
+    template = _TABLES[LANGUAGE].get(key) or _TABLES["en"][key]
+    text = template.format(**values) if values else template
+    if LANGUAGE != "en" and (LANGUAGE, key) not in _FALLBACK_KEYS:
+        if _missing_glyphs(text):
+            _FALLBACK_KEYS.add((LANGUAGE, key))
+            log("i18n: %s missing glyphs, falling back to en (%s)" % (LANGUAGE, key))
+            template = _TABLES["en"][key]
+            text = template.format(**values) if values else template
+    return text
+
+
+# Container language tags -> our display-name keys. Matroska uses ISO 639-2
+# ("fre", "ger"), ffprobe sometimes reports the 639-1 form ("fr").
+LANGUAGE_KEYS = {
+    "fre": "lang.fr", "fra": "lang.fr", "fr": "lang.fr",
+    "eng": "lang.en", "en": "lang.en",
+    "spa": "lang.es", "es": "lang.es",
+    "ger": "lang.de", "deu": "lang.de", "de": "lang.de",
+    "ita": "lang.it", "it": "lang.it",
+    "jpn": "lang.ja", "ja": "lang.ja",
+    "chi": "lang.zh", "zho": "lang.zh", "zh": "lang.zh",
+    "kor": "lang.ko", "ko": "lang.ko",
+    "por": "lang.pt", "pt": "lang.pt",
+    "rus": "lang.ru", "ru": "lang.ru",
+    "ara": "lang.ar", "ar": "lang.ar",
+    "nld": "lang.nl", "dut": "lang.nl", "nl": "lang.nl",
+    "pol": "lang.pl", "pl": "lang.pl",
+    "swe": "lang.sv", "sv": "lang.sv",
+    "dan": "lang.da", "da": "lang.da",
+    "nor": "lang.nb", "nb": "lang.nb", "no": "lang.nb",
+    "fin": "lang.fi", "fi": "lang.fi",
+    "tur": "lang.tr", "tr": "lang.tr",
+    "hin": "lang.hi", "hi": "lang.hi",
+    "und": "lang.und",
 }
 
 
@@ -405,11 +1593,15 @@ def language_name(tags):
     """Return (display name, raw title) for a stream's tags.
 
     The name is localized for the screen; the title is passed through so the
-    caller can build "Français — VFF". Unknown language codes are shown as the
-    upper-cased tag rather than being hidden."""
+    caller can build "French — VFF" (the name is in the selected language).
+    Unknown language codes are shown as the upper-cased tag rather than being
+    hidden."""
     lang = (tags.get("language") or "").lower()
     title = tags.get("title") or ""
-    return LANGUAGE_NAMES.get(lang, lang.upper() if lang else "Inconnu"), title
+    key = LANGUAGE_KEYS.get(lang)
+    if key:
+        return tr(key), title
+    return (lang.upper() if lang else tr("lang.und")), title
 
 
 def short_title(title):
@@ -422,7 +1614,10 @@ def short_title(title):
 
 
 def track_label(name, title):
-    """Build the audio label: "Français — VFF" when a distinct title exists."""
+    """Build the audio label: "French — VFF" when a distinct title exists.
+
+    The language name comes from the table, so the same track reads
+    "Français — VFF" in French and "French — VFF" in English."""
     t = short_title(title)
     if t and t.lower() != name.lower():
         return "%s — %s" % (name, t)
@@ -440,15 +1635,86 @@ def hms(seconds):
 
 
 def format_step(delta):
-    """Format a seek step with its sign, French decimal comma on screen.
+    """Format a seek step with its sign, in the current language.
 
     The sign matters: "−0,5 s" and "+0,5 s" are different actions and the OSD
-    is the only feedback the user gets."""
+    is the only feedback the user gets. Only French is given a decimal comma:
+    the seek scale is whole seconds, so the fractional branch is a safety net
+    rather than something the viewer sees."""
     sign = "+" if delta >= 0 else "−"
     value = abs(delta)
     if value >= 1.0:
-        return "%s%d s" % (sign, int(value))
-    return ("%s%.1f s" % (sign, value)).replace(".", ",")
+        number = str(int(value))
+    else:
+        number = "%.1f" % value
+        if LANGUAGE == "fr":
+            number = number.replace(".", ",")
+    return tr("osd.seek_step", sign=sign, value=number)
+
+
+def format_panel_lines(values, filename=None):
+    """The information panel, localized, from already-resolved values.
+
+    A module function rather than a Player method so that src/test-i18n.py
+    renders the real composition: it feeds fixed values and gets exactly what
+    the player would draw, in every language.
+
+    Returns one entry per line, either a string or, for an RTL language, a
+    (label, technical) pair for the plane line. The pair exists because bidi
+    cannot be trusted to keep both orders inside one paragraph: Pango ignores
+    the explicit LRE/PDF embedding that would have isolated the values, so the
+    label is drawn right-aligned in its own RTL layout and the technical run
+    left-aligned in its own LTR layout. Measured: in a single RTL paragraph
+    "Plane 57 · NV15" came out as "57 ... NV15" with the number detached.
+
+    Every technical value is a kernel or caps fact (a fourcc, a plane id, a
+    connector name, a negotiated caps name). "values" keys:
+        hardware   bool   tier 1 with DMABuf caps
+        codec, profile, definition, rate   strings, may be empty
+        plane, fmt, caps_fmt               strings, "fmt" never empty
+        dmabuf     bool
+        zpos       int or None
+        connector, width, height, vrefresh
+    """
+    lines = [tr("panel.hardware") if values.get("hardware") else tr("panel.software")]
+
+    codec_name = " ".join(part for part in (values.get("codec"), values.get("profile")) if part)
+    codec_line = " · ".join(part for part in (codec_name, values.get("definition"),
+                                              values.get("rate")) if part)
+    lines.append(codec_line)
+
+    fmt = values.get("fmt") or "?"
+    # The plane scans out what kmssink accepted; the decoder output can be a
+    # different fourcc (I420 through videoconvert becomes NV12). Show both when
+    # they differ; skip DMA_DRM, which only says "a DRM buffer" and is not a
+    # layout.
+    caps_fmt = values.get("caps_fmt") or ""
+    if caps_fmt and caps_fmt != fmt and caps_fmt not in ("DMA_DRM", "?"):
+        fmt = "%s %s" % (fmt, tr("panel.negotiated", fmt=caps_fmt))
+    technical = [str(values.get("plane", "?")), fmt,
+                 tr("panel.mem_dmabuf") if values.get("dmabuf") else tr("panel.mem_system")]
+    if values.get("zpos") is not None:
+        technical.append(tr("panel.zpos", value=values["zpos"]))
+    tech = " · ".join(technical)
+    if is_rtl():
+        lines.append((tr("panel.plane"), tech))
+    else:
+        lines.append("%s %s" % (tr("panel.plane"), tech))
+
+    sline = tr("panel.screen", name=values.get("connector") or "screen",
+               width=values.get("width") or 0, height=values.get("height") or 0)
+    if values.get("vrefresh"):
+        sline += " " + tr("panel.refresh", hz=values["vrefresh"])
+    lines.append(sline)
+
+    if filename:
+        lines.append(filename)
+    return lines
+
+
+def panel_line_text(line):
+    """A panel line as one string, for the log (a line may be a pair)."""
+    return " ".join(line) if isinstance(line, tuple) else line
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +1959,7 @@ def extract_srt(media_path, stream_index):
         return srt_path
     try:
         subprocess.run(["notify-send", "-t", "4000", "kms-play",
-                        "Préparation des sous-titres…"], check=False, timeout=3)
+                        tr("osd.preparing_subtitles")], check=False, timeout=3)
     except Exception:
         pass
     tmp_path = srt_path + ".tmp"
@@ -808,7 +2074,9 @@ class OnScreenDisplay:
 
       - the bottom band (default 76 px), with an optional progress bar (seek
         position or volume level), a left label ("+10 s", "Pause",
-        "Sous-titres : Français") and an optional right label ("12:34 / 48:45");
+        "Subtitles: French" and its translation) and an optional right label
+        ("12:34 / 48:45"), both in the language selected by KMS_PLAY_LANG or
+        the locale (see LANGUAGE);
       - the information panel, a PANEL_WIDTH rectangle in the top left corner
         with four lines (decode tier, codec, plane, screen) or five when the
         file name is added. It is shown once for PANEL_SECONDS after playback
@@ -835,8 +2103,15 @@ removes its own timer and clears the plane.
         self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width, self.band_height)
         self.ctx = cairo.Context(self.surface)
         self.layout = PangoCairo.create_layout(self.ctx)
-        self.layout.set_font_description(Pango.FontDescription("Sans 14"))
+        self.layout.set_font_description(font_description("14"))
         self.layout.set_width(-1)
+        # The band is one short line of labels, never a paragraph: its base
+        # direction is LTR so a signed step keeps its sign ("+1") and a
+        # timecode keeps its order, while Arabic, Persian and Hebrew text still
+        # shapes correctly as a run. Measured: with an auto direction Pango
+        # guessed RTL from the trailing Arabic unit and drew "1+".
+        self.layout.set_auto_dir(False)
+        self.layout.get_context().set_base_dir(Pango.Direction.LTR)
         self.state = {}
         self.visible = False
         self.persistent = False
@@ -996,7 +2271,8 @@ removes its own timer and clears the plane.
         self.pending = False
         elapsed_ms = self._render_panel(1.0)
         log("panel: shown (%s) for %.1f s |" % (kind, duration),
-            " | ".join(lines), "| render %.1f ms" % elapsed_ms)
+            " | ".join(panel_line_text(line) for line in lines),
+            "| render %.1f ms" % elapsed_ms)
 
     def _fit_middle(self, text, max_width):
         """Shorten a line in the middle until it fits, keeping the extension.
@@ -1047,17 +2323,27 @@ removes its own timer and clears the plane.
             layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
 
     def _render_panel(self, alpha):
-        """Draw the panel at the given opacity and push it to the plane."""
+        """Draw the panel at the given opacity and push it to the plane.
+
+        Two layouts are kept, one per base direction. An RTL language draws
+        its translated label flush right in the RTL layout and the technical
+        values at the left margin in the LTR one, so no bidi reordering can
+        happen: Pango ignores the LRE/PDF embedding that would otherwise have
+        isolated them in a single paragraph (measured: the plane number ended
+        up detached from its label).
+
+        Lines without a translated label (codec, screen, file name) are pure
+        technical text and are drawn LTR, flush right under an RTL language so
+        the panel keeps one visual edge. A long file name is shortened in the
+        middle by _fit_middle(), which measures with the real font."""
         started = monotonic()
         height = panel_height(max(1, len(self.panel_lines)))
         if self.panel_surface is None or self.panel_surface.get_height() != height:
             self.panel_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
                                                     PANEL_WIDTH, height)
             self.panel_ctx = cairo.Context(self.panel_surface)
-            self.panel_layout = PangoCairo.create_layout(self.panel_ctx)
-            self.panel_layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
-            self.panel_layout.set_wrap(Pango.WrapMode.WORD_CHAR)
-            self.panel_layout.set_alignment(Pango.Alignment.LEFT)
+            self.panel_layout = self._new_panel_layout(rtl=False)
+            self.panel_rtl_layout = self._new_panel_layout(rtl=True)
         ctx = self.panel_ctx
         # Translucent black box: readable over any picture, and the video is
         # still visible behind it (the VOP blends the plane).
@@ -1065,14 +2351,49 @@ removes its own timer and clears the plane.
         ctx.set_source_rgba(0, 0, 0, 0.72 * alpha)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
+        ctx.set_source_rgba(1, 1, 1, alpha)
+
+        def draw_right(layout, right_edge, y):
+            """Draw a layout with its ink ending at right_edge, return its width.
+
+            The ink rect matters, not the layout box: Pango right-aligns an RTL
+            paragraph inside its box whatever the layout alignment is, so the
+            ink offset has to be part of the computation. Measured bug: without
+            it the Arabic headline was drawn past the right edge, invisible."""
+            ink = layout.get_pixel_extents()[1]
+            ctx.move_to(right_edge - ink.x - ink.width, y)
+            PangoCairo.show_layout(ctx, layout)
+            return ink.width
+
+        right_edge = PANEL_WIDTH - PANEL_MARGIN
         for index, line in enumerate(self.panel_lines):
             # First line is the decode tier: bold, it is the headline.
-            desc = Pango.FontDescription("Sans Bold 16" if index == 0 else "Sans 15")
+            desc = font_description("Bold 16" if index == 0 else "15")
+            y = PANEL_TOP + index * PANEL_LINE_HEIGHT
+            if isinstance(line, tuple):
+                # RTL plane line: "label · values" as one block, flush right.
+                # The label is drawn by the RTL layout and the values by the
+                # LTR one, so neither can reorder the other.
+                label, technical = line
+                label_layout = self.panel_rtl_layout
+                label_layout.set_font_description(desc)
+                label_layout.set_text(label, -1)
+                label_width = draw_right(label_layout, right_edge, y)
+                room = PANEL_WIDTH - 2 * PANEL_MARGIN - label_width - PANEL_LINE_HEIGHT
+                text = self._fit_middle(technical, room)
+                self.panel_layout.set_font_description(desc)
+                self.panel_layout.set_text(text, -1)
+                draw_right(self.panel_layout, right_edge - label_width - 24, y)
+                continue
             self.panel_layout.set_font_description(desc)
             text = self._fit_middle(line, PANEL_WIDTH - 2 * PANEL_MARGIN)
             self.panel_layout.set_text(text, -1)
-            ctx.set_source_rgba(1, 1, 1, alpha)
-            ctx.move_to(PANEL_MARGIN, PANEL_TOP + index * PANEL_LINE_HEIGHT)
+            if is_rtl():
+                # Technical lines have no label of their own: flush them right
+                # too, so the panel keeps a single visual edge.
+                draw_right(self.panel_layout, right_edge, y)
+                continue
+            ctx.move_to(PANEL_MARGIN, y)
             PangoCairo.show_layout(ctx, self.panel_layout)
         self.panel_surface.flush()
         write_surface(RAW_OSD, RAW_OSD_GEOM, self.panel_surface, PANEL_WIDTH, height)
@@ -1081,6 +2402,17 @@ removes its own timer and clears the plane.
         self.subdaemon.stdin.flush()
         self.last_render = monotonic()
         return (self.last_render - started) * 1000
+
+    def _new_panel_layout(self, rtl):
+        """A panel layout with the given base direction.
+
+        PangoCairo.create_layout() builds a fresh PangoContext from the cairo
+        context's font options, so the two directions cannot interfere."""
+        layout = PangoCairo.create_layout(self.panel_ctx)
+        layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        apply_direction(layout, "ar" if rtl else "en")
+        return layout
 
     def _reset_panel(self):
         """Forget the panel and cancel its fade timer, without touching the
@@ -1566,12 +2898,12 @@ class Player:
     # -- information panel -------------------------------------------------
 
     def _panel_base_lines(self):
-        """The four panel lines, in English, from the values just negotiated.
+        """The four panel lines, from the values just negotiated.
 
-        The panel is the one on-screen surface that is not French: it reports
-        technical facts (a codec name, a DRM fourcc, a connector name) and is
-        read as a diagnostic, so its labels stay in English. The other OSD
-        labels (Pause, Décodage logiciel, track names) are unchanged.
+        This method only resolves facts; the text itself comes from
+        format_panel_lines(), which is where the labels are localized and the
+        technical values isolated for RTL. Keeping the split means the test
+        script renders the same composition the player does.
 
         Every value has a single source, so the panel can be trusted as a
         report and not as a guess:
@@ -1580,22 +2912,9 @@ class Player:
           line 3  plane fmt/zpos  -> kms-planes, i.e. the kernel's plane state;
           line 4  screen          -> kms-planes connector + live CRTC mode.
         Missing fields are omitted rather than printed as "None"."""
-        if self.tier == 1 and self.video_memory == "DMABuf":
-            tier = "HARDWARE · zero-copy"
-        else:
-            tier = "SOFTWARE · CPU fallback"
-
         probe = self.probe_video or {}
-        codec = codec_label(self.codec_name or probe.get("codec_name"))
-        profile = profile_label(self.codec_profile or probe.get("profile"))
         width = self.video_width or probe.get("width") or 0
         height = self.video_height or probe.get("height") or 0
-        definition = "%dx%d" % (width, height) if width and height else ""
-        rate = framerate_label(self.video_framerate or probe.get("r_frame_rate"))
-        # Codec and profile read as one name ("H.265 Main 10"); the rest of the
-        # line is separated by a middle dot.
-        codec_name = " ".join(part for part in (codec, profile) if part)
-        codec_line = " · ".join(part for part in (codec_name, definition, rate) if part)
 
         state = plane_state(self.video_plane)
         plane_fmt = state.get("fmt") if state else None
@@ -1603,26 +2922,27 @@ class Player:
             # No framebuffer yet (or unreadable): the caps' drm-format is the
             # concrete fourcc negotiated with the decoder, so it is used next.
             plane_fmt = self.video_drm_format or self.video_format or "?"
-        pline = "Plane %s · %s" % (self.video_plane, plane_fmt)
-        # The plane scans out what kmssink accepted; the decoder output can be
-        # a different fourcc (I420 through videoconvert becomes NV12). Show
-        # both when they differ, and skip the DMA_DRM pseudo-format: it is
-        # only the caps-level name for "a DRM buffer", not a layout.
-        caps_fmt = self.video_format or ""
-        if (caps_fmt and caps_fmt != plane_fmt and caps_fmt not in ("DMA_DRM", "?")):
-            pline += " (%s negotiated)" % caps_fmt
-        pline += " · %s" % ("DMABuf" if self.video_memory == "DMABuf" else "system")
-        if state and "zpos" in state:
-            pline += " · zpos %d" % state["zpos"]
 
-        screen_width = self.display.get("width") or self.width
-        screen_height = self.display.get("height") or self.height
-        sline = "%s · %dx%d" % (self.display.get("name") or "screen",
-                                 screen_width, screen_height)
-        if self.display.get("vrefresh"):
-            sline += " @ %d Hz" % self.display["vrefresh"]
-
-        return [tier, codec_line, pline, sline]
+        return format_panel_lines({
+            "hardware": self.tier == 1 and self.video_memory == "DMABuf",
+            "codec": codec_label(self.codec_name or probe.get("codec_name")),
+            "profile": profile_label(self.codec_profile or probe.get("profile")),
+            "definition": ("%dx%d" % (width, height)) if width and height else "",
+            "rate": framerate_label(self.video_framerate or probe.get("r_frame_rate")),
+            "plane": self.video_plane,
+            "fmt": plane_fmt,
+            # The plane scans out what kmssink accepted; the decoder output can
+            # be a different fourcc (I420 through videoconvert becomes NV12).
+            # Show both when they differ; skip DMA_DRM, which only says "a DRM
+            # buffer" and is not a layout.
+            "caps_fmt": self.video_format or "",
+            "dmabuf": self.video_memory == "DMABuf",
+            "zpos": state.get("zpos") if state else None,
+            "connector": self.display.get("name"),
+            "width": self.display.get("width") or self.width,
+            "height": self.display.get("height") or self.height,
+            "vrefresh": self.display.get("vrefresh"),
+        })
 
     def _panel_lines(self):
         """The startup lines plus the file being played, for the I key.
@@ -1669,7 +2989,7 @@ class Player:
         if self.fallback_done:
             log("decode tier: none (software fallback failed)")
             if self.osd:
-                self.osd.show(label="Lecture impossible", right="", duration=5)
+                self.osd.show(label=tr("osd.playback_failed"), right="", duration=5)
             self.stop()
             return
         self.fallback_done = True
@@ -1721,7 +3041,7 @@ class Player:
             self.target_position = position
             self.target_set_at = monotonic()
         if self.osd:
-            self.osd.show(label="Décodage logiciel", right="", duration=3.0)
+            self.osd.show(label=tr("osd.software_decode"), right="", duration=3.0)
 
     def _watchdog(self):
         """Tier 1 must reach PLAYING within FALLBACK_START_TIMEOUT.
@@ -1844,12 +3164,13 @@ class Player:
         duration = self.duration_s() or 0
         fraction = (position / duration) if duration else 0.0
         if self.paused:
-            label = "Pause"
+            label = tr("osd.pause")
         else:
             label = format_step(step) if step else ""
         self.osd.show(label=label,
                       fraction=fraction,
-                      right=("%s / %s" % (hms(position), hms(duration))) if duration else hms(position),
+                      right=("%s / %s" % (hms(position), hms(duration)))
+                            if duration else hms(position),
                       duration=3600 if self.paused else 1.2,
                       persistent=self.paused)
 
@@ -1863,8 +3184,8 @@ class Player:
         self.volume_element.set_property("volume", self.gain)
         percent = int(round(self.gain * 100))
         log("software volume:", percent, "%")
-        self.osd.show(label="Volume (lecteur)", fraction=self.gain,
-                      right="%d %%" % percent)
+        self.osd.show(label=tr("osd.volume_player"), fraction=self.gain,
+                      right=tr("osd.percent", value=percent))
 
     def system_volume(self, delta_percent, mute=False):
         """Multimedia keys: PipeWire sink volume, shared with the rest of the
@@ -1883,15 +3204,17 @@ class Player:
         muted = "MUTED" in state
         log("system volume:", state or "?", "| code", result.returncode)
         if muted:
-            self.osd.show(label="Système", fraction=fraction, right="muet")
+            self.osd.show(label=tr("osd.volume_system"), fraction=fraction,
+                          right=tr("osd.muted"))
         else:
-            self.osd.show(label="Système", fraction=fraction, right="%d %%" % round(fraction * 100))
+            self.osd.show(label=tr("osd.volume_system"), fraction=fraction,
+                          right=tr("osd.percent", value=round(fraction * 100)))
 
     # -- tracks ------------------------------------------------------------
 
     def next_audio(self):
         if not self.audio:
-            self.osd.show(label="Aucune piste audio", right="")
+            self.osd.show(label=tr("osd.no_audio"), right="")
             return
         count = len(self.audio)
         try:
@@ -1908,7 +3231,7 @@ class Player:
             # Single track: playbin would still rebuild its audio branch for a
             # switch to itself, which is pure risk for no gain.
             log("audio track: only one, no switch")
-            self.osd.show(label="Audio : %s" % label, duration=1.5)
+            self.osd.show(label=tr("osd.audio", name=label), duration=1.5)
             return
         if monotonic() - self.audio_switch_at > 5.0:
             self.audio_recoveries = 0
@@ -1918,11 +3241,11 @@ class Player:
             self.pipeline.set_property("current-audio", following)
         except Exception as exc:
             log("audio switch refused:", exc)
-            self.osd.show(label="Piste audio indisponible", duration=2.0)
+            self.osd.show(label=tr("osd.audio_unavailable"), duration=2.0)
             self.audio_switch_at = 0.0
             return
         log("audio track ->", following, "/", count, label, "|", title)
-        self.osd.show(label="Audio : %s" % label, duration=1.5)
+        self.osd.show(label=tr("osd.audio", name=label), duration=1.5)
         if AUDIO_SWITCH_SELFTEST:
             log("self-test: pretending the switch failed")
             self.recover_audio_switch()
@@ -1967,13 +3290,13 @@ class Player:
             log("audio restore failed:", exc)
             return False
         self.audio_switch_at = monotonic()
-        self.osd.show(label="Piste audio indisponible", duration=2.5)
+        self.osd.show(label=tr("osd.audio_unavailable"), duration=2.5)
         return True
 
     def next_subtitle(self):
         """Cycle text tracks, then "off", then back to the first track."""
         if not self.subs:
-            self.osd.show(label="Aucun sous-titre", right="", duration=1.5)
+            self.osd.show(label=tr("osd.no_subtitles"), right="", duration=1.5)
             return
         if not self.subtitles_enabled:
             self.subtitles_enabled = True
@@ -1987,12 +3310,12 @@ class Player:
             self.subtitles.current = None
             self.subtitles._clear()
             log("subtitles -> off")
-            self.osd.show(label="Sous-titres : Désactivé", right="", duration=1.5)
+            self.osd.show(label=tr("osd.subtitles_off"), right="", duration=1.5)
             return
         stream = self.subs[self.sub_index]
         name, title = language_name(stream.get("tags") or {})
         log("subtitles -> stream", stream["index"], name, "|", title)
-        self.osd.show(label="Sous-titres : %s" % name, duration=1.5)
+        self.osd.show(label=tr("osd.subtitles", name=name), duration=1.5)
         # Extraction happens in a thread: the OSD must never wait for ffmpeg.
         import threading
         threading.Thread(target=self.load_subtitles, args=(stream,), daemon=True).start()
@@ -2021,7 +3344,7 @@ class Player:
             self.paused = False
             log("state: PLAYING")
             self.osd.persistent = False
-            self.osd.show(label="Lecture",
+            self.osd.show(label=tr("osd.play"),
                           fraction=(self.position() / (self.duration_s() or 1)),
                           right=hms(self.position()))
         else:
@@ -2031,7 +3354,8 @@ class Player:
             log("state: PAUSED")
             position = self.position()
             duration = self.duration_s() or 0
-            self.osd.show(label="Pause", fraction=(position / duration) if duration else 0.0,
+            self.osd.show(label=tr("osd.pause"),
+                          fraction=(position / duration) if duration else 0.0,
                           right=hms(position), duration=3600, persistent=True)
 
     # -- keyboard ----------------------------------------------------------
@@ -2196,7 +3520,7 @@ class Player:
                 return
             log("decode tier: none (software fallback failed)")
             if self.osd:
-                self.osd.show(label="Lecture impossible", right="", duration=5)
+                self.osd.show(label=tr("osd.playback_failed"), right="", duration=5)
             self.stop()
         elif message_type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
@@ -2307,6 +3631,7 @@ def single_instance_lock():
 
 
 def main():
+    set_language(detect_language())
     if len(sys.argv) < 2:
         print("usage: kms-play <file>", file=sys.stderr)
         sys.exit(2)

@@ -98,9 +98,9 @@ HDMI-A-1 · 2560x1440 @ 75 Hz             <- connector, live mode, vrefresh
 47.Ronin.2013.MULTI…x265-TAC.mkv         <- only on demand (key I)
 ```
 
-These strings are English: the panel reports technical facts and is read as a
-diagnostic, unlike the rest of the OSD (`Pause`, `Décodage logiciel`, track
-names), which stays French.
+Every label in that panel comes from the string table (see "Language" below);
+with `KMS_PLAY_LANG=en` it reads exactly as shown. The values never change with
+the language: a codec name, a DRM fourcc and a connector name are facts.
 
 Sources, all read at the moment the banner is drawn:
 
@@ -146,6 +146,63 @@ self-removing 67 ms timeout, and after the last render the plane is cleared and
 the OSD buffer is blanked, so `kms-shot` reports 0 non-transparent pixels rather
 than a stale image. Idle playback runs no timer for the OSD.
 
+### Language
+
+Every string the viewer can read — the panel, the bottom band
+(`Pause`, `Décodage logiciel`, `Audio : …`), the track language names and the
+displayed error messages — comes from `STRINGS` in `src/kms-play-py`: one
+positional table of 45 entries per language, validated at import (a short tuple
+or a changed placeholder stops the player with a message rather than shifting
+labels on screen). 30 entries ship: `en fr de es pt it nl sv pl ru uk cs ro el
+tr ar fa he hi bn ta vi id ms th ja ko` plus `zh-Hans` (CN/SG), `zh-Hant`
+(TW/MO) and `zh-HK`.
+
+Selection order: `KMS_PLAY_LANG`, then `LC_MESSAGES`, `LANG`, `LANGUAGE`, then
+English. Locale tags are normalised (`fr_FR.UTF-8` → `fr`, `ja_JP.utf8` → `ja`,
+`zh_TW` → `zh-Hant`, `zh_HK` → `zh-HK`, `zh_CN` → `zh-Hans`, `pt_BR` → `pt`), and
+an unknown language falls back to English:
+
+```
+KMS_PLAY_LANG=ko kms-play film.mkv     # Korean panel
+LANG=ja_JP.UTF-8 kms-play film.mkv     # Japanese, no explicit variable
+LANG=xx_YY kms-play film.mkv           # English
+```
+
+Two guards keep the screen honest, both measured rather than assumed:
+
+* a missing key (partial translation) falls back to its English form;
+* before a string is drawn, `tr()` counts its unknown glyphs with the
+  language's font (`Pango.Layout.get_unknown_glyphs_count()`); if any is
+  missing, the English form is used instead and the event is logged once as
+  `i18n: ko missing glyphs, falling back to en (osd.pause)`. A partially
+  installed font set therefore shows English, never tofu.
+
+The font family is chosen per language — `Noto Sans CJK KR/JP/SC/TC/HK`,
+`Noto Sans Thai`, `Devanagari`, `Bengali`, `Tamil`, `Arabic` — because
+fontconfig's fallback does not honour the regional CJK variants: measured on
+this image, `fc-match :charset=9F8D` (龍) answers `Noto Sans CJK JP`, i.e. a
+Traditional character would be drawn with Japanese glyph shapes.
+
+Arabic, Persian and Hebrew read right to left: their panel is flush right, and
+the plane line is drawn as one right-aligned block — its translated label by an
+RTL layout, its technical values (`57 · NV15 · DMABuf · zpos 4`) by a separate
+LTR layout placed to the left of the label. The split is not decoration: Pango
+ignores the LRE/PDF embedding marks that would have isolated the values inside
+one paragraph, and a single RTL paragraph put the plane number on the far side
+of the line (measured with `index_to_pos`). Lines with no label of their own
+(codec, screen, file name) are drawn LTR and flush right, so the panel keeps a
+single visual edge.
+
+`src/test-i18n.py` renders the panel for all 30 entries offline (cairo surface,
+no DRM, no screen) through the player's own `OnScreenDisplay`, reports the
+unknown-glyph count per language and writes a PNG for each non-Latin script; it
+also checks the detection order. Run it on the target:
+
+```
+python3 src/test-i18n.py --out /tmp/i18n-panels
+30 languages, 0 failure(s); PNGs in /tmp/i18n-panels
+```
+
 ---
 
 ## Behaviour
@@ -155,7 +212,7 @@ than a stale image. Idle playback runs no timer for the OSD.
 | `ESC` / `Q` | Quit, restore the previous VT |
 | `Space` / `PLAYPAUSE` | Play / pause (pause keeps the last frame) |
 | `A` | Next audio track (cyclic), OSD `Audio : Français — VFF` |
-| `S` | Next subtitle track (cyclic, includes `Désactivé`), OSD shows the language |
+| `S` | Next subtitle track (cyclic, includes "off"), OSD shows the track language |
 | `I` | Information panel (four lines + file name); a second `I` hides it, other keys leave it up |
 | `←` / `→` | Cumulative seek, see below |
 | `↑` / `↓` | Software gain ±2 % (starts at 100 %, ceiling 100 %; `KMS_PLAY_VOLUME_STEP` overrides) |
