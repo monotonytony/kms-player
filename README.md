@@ -122,11 +122,46 @@ conversion — exactly the cost this project exists to avoid.
 
 ---
 
+## Codecs: hardware first, software as a fallback
+
+Every file is first played on the hardware path: `playbin` → decoder → `kmssink`, with
+the decoder's DMA-BUFs scanned out without a single copy. If that fails — an error, or
+no `PLAYING` state within 12 s — the player rebuilds the pipeline once with software
+decoders (`videoconvert ! kmssink`, hardware decoders demoted to rank `NONE`), seeks back
+to the current position, shows « Décodage logiciel » and keeps going. One attempt only:
+a second failure stops cleanly with a clear message.
+
+What that means in practice, measured on the board at 1080p unless stated:
+
+| Codec | Tier | CPU |
+|---|---|---|
+| H.265 10-bit, 4K | hardware, zero copy | 0.19 core |
+| AV1 | hardware, zero copy | ~0.06 core |
+| MPEG-2 | hardware, zero copy | ~0.09 core |
+| VP8 | `v4l2slvp8dec` present, not tested | — |
+| H.264 8-bit | software | ~0.57 core |
+| H.264 High 10 | software | ~0.85 core |
+| VP9 | software (720p) | ~0.31 core |
+
+**VP9 has no hardware decoder on this kernel** — the `rkvdec` instance does not register
+(`missing multi-core support`), so the only V4L2 nodes are `rk3328-vpu-dec`, `vepu121`
+and `rk3588-av1-vpu-dec`. That is a kernel limitation, not a GStreamer one: there is no
+VP9 decoder element to plug. Playback uses `avdec_vp9` automatically.
+
+**H.264 hardware decoding is blocked by a plugin limitation.** `v4l2slh264dec` refuses to
+negotiate its DMABuf caps with `kmssink` (`DMABuf caps negotiated without the mandatory
+support of VideoMeta`), and forcing system memory is not supported by that decoder. The
+software tier is the answer; details and the failed workarounds are in
+[`src/README.md`](src/README.md#decode-tiers).
+
+---
+
 ## Requirements
 
 * RK3588 board with KMS planes supporting `NV15`/`NV12` plus at least two `AR24` overlay planes
 * Armbian (or any distro with a recent kernel exposing the VOP planes)
 * GStreamer 1.20+ with `kmssink`, `v4l2` Rockchip decoders
+* `gst-libav` for the software tier (`avdec_h264`, `avdec_h265`, `avdec_vp9`, `avdec_mpeg2video`) — already installed, nothing to add
 * Python 3 with `python3-gi`, `gir1.2-gst-1.0`, Pango, PangoCairo, Cairo
 * `libdrm` development headers to build the C helpers
 * Permission to use `/dev/dri/card0` and `/dev/input/event*` as a normal user
@@ -213,6 +248,8 @@ Verified from the hardware, not from impressions:
 | Keypress → visible change | 64-131 ms, typical 65-85 ms |
 | CPU, 4K 10-bit, subtitles + OSD active | 0.19 core |
 | CPU, 1080p 10-bit | 0.08 core |
+| CPU, H.264 8-bit (software tier) | 0.57 core |
+| CPU, H.264 High 10 (software tier) | 0.85 core |
 | ESC → original VT | 352 ms (dominated by `chvt`) |
 
 The cumulative seek scale is checked by `src/test-seek-scale.py`, which injects real

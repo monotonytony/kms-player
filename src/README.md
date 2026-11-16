@@ -122,6 +122,73 @@ second one is the system level.
 
 ---
 
+## Decode tiers
+
+The player decodes in two passes, and only the first one is zero copy.
+
+**Tier 1 — hardware, unchanged.** `playbin` picks the highest-ranked decoder and
+`kmssink` takes its DMA-BUFs directly (`video caps: … format=DMA_DRM
+memory=DMABuf`). Nothing is converted, nothing goes through system memory. This is
+the path for everything the kernel really decodes.
+
+**Tier 2 — software, on demand.** If tier 1 posts an error (the common one is
+`not-negotiated (-4)`, because a hardware decoder cannot negotiate DMABuf caps with
+`kmssink`) or never reaches `PLAYING` within `FALLBACK_START_TIMEOUT` (12 s), the
+player rebuilds a `playbin` with software decoders and restarts at the position it
+had reached:
+
+* `video-sink="videoconvert ! kmssink plane-id=57"`, so system-memory frames still
+  scan out on the video plane;
+* `GST_PLAY_FLAG_FORCE_SW_DECODERS` and `force-sw-decoders` on `uridecodebin`;
+* every decoder whose class contains `Hardware` demoted to rank `NONE` — on this
+  GStreamer the first two were not enough, `v4l2slh264dec` (rank 257) was still
+  selected inside `decodebin`, and rank is what auto-plugging obeys;
+* a `FLUSH | KEY_UNIT` seek to the previous position, and the OSD label
+  « Décodage logiciel ».
+
+There is exactly one fallback attempt: a second failure stops playback with
+« Lecture impossible » and `decode tier: none (software fallback failed)`. No loop.
+
+The log states which tier was retained, on the first caps event:
+
+```
+decode tier: hardware (zero copy, DMA_DRM -> kmssink)
+decode tier: software (reason: not-negotiated)
+decode tier: software (confirmed, I420 in system memory)
+```
+
+### What lands where on this board (measured)
+
+| Codec | Decoder | Tier | Caps at the sink | CPU, 1080p |
+|---|---|---|---|---|
+| H.265 10-bit (4K) | `v4l2slh265dec` | hardware | `DMA_DRM` / DMABuf | 0.19 core |
+| AV1 | `v4l2slav1dec` | hardware | `DMA_DRM` / DMABuf | ~0.06 core |
+| MPEG-2 | `v4l2slmpeg2dec` | hardware | `DMA_DRM` / DMABuf | ~0.09 core |
+| VP8 | `v4l2slvp8dec` (present, not tested) | expected hardware | — | — |
+| H.264 8-bit | `avdec_h264` | software | `I420` / system | ~0.57 core |
+| H.264 High 10 | `avdec_h264` | software | `I420_10LE` / system | ~0.85 core |
+| VP9 | `avdec_vp9` | software | `NV12` / system | ~0.31 core (720p) |
+
+**VP9 has no hardware decoder on this kernel, and that is a kernel problem, not a
+GStreamer one.** The rkvdec instance does not register (`missing multi-core support,
+ignoring this instance`), so neither `v4l2slvp9dec` nor a mainline VP9 node exists:
+`/dev/video2` is `rk3328-vpu-dec`, `/dev/video4` is `rk3588-av1-vpu-dec`. No VP9
+decoder can be plugged because there is nothing to plug. Tier 1 already selects
+`avdec_vp9` by itself in that case (there is no hardware decoder to outrank it), so the
+log says `decode tier: software (reason: no hardware decoder selected, system memory)`
+without any fallback.
+
+**Why H.264 hardware does not work (measured, not guessed).** `v4l2slh264dec` fails in
+`decide_allocation`: `DMABuf caps negotiated without the mandatory support of
+VideoMeta`, then `Failed to negotiate with downstream`. Forcing system-memory caps
+fails earlier (`No support for 1920x1080 format UNKNOWN`), and inserting `v4l2convert`
+— which does fix the chain as far as `fakesink` — still fails once `kmssink` is the
+sink. Making H.264 hardware work would need a `kmssink` that advertises
+`GstVideoMeta` on its `DMA_DRM` pad, i.e. a change in the plugin, not in the player.
+Hence the software tier.
+
+---
+
 ## Build
 
 Dependencies (Debian/Ubuntu naming):
@@ -231,6 +298,8 @@ visual claim can be checked from an SSH session.
   rights are needed or granted.
 * H.265 10-bit decoding through the vendor GStreamer plugin; the player never
   converts to force a format.
+* `gst-libav` (`avdec_h264`, `avdec_h265`, `avdec_vp9`, `avdec_mpeg2video`) for the
+  software tier. No package is installed by the player; it only uses what is there.
 
 ## Known pitfalls
 

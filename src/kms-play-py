@@ -11,7 +11,10 @@ The display is composed by the Rockchip VOP from three DRM planes, bottom to
 top:
 
     video plane   NV15 (10-bit) or NV12 (8-bit), fed by kmssink directly from
-                  the decoder's DMA-BUFs: zero copy, no CPU conversion.
+                  the decoder's DMA-BUFs: zero copy, no CPU conversion. When no
+                  hardware decoder can negotiate with kmssink (H.264 here), a
+                  second tier replays the file with software decoders through
+                  videoconvert, one attempt only (see DECODE TIERS).
     "sub" plane   ARGB8888 subtitles, pre-multiplied alpha, blended by the VOP.
     "osd" plane   ARGB8888 OSD (progress bar, volume, track labels).
 
@@ -31,6 +34,16 @@ kms-play wrapper) intercepts its open("/dev/dri/card*") and hands it a copy of
 kms-subd's fd. That is also why the VT switch must happen BEFORE drmSetMaster
 (see switch_vt): the VT that currently owns the console keeps the master
 locked, and the ioctl fails with EACCES.
+
+============================================================================
+DECODE TIERS
+============================================================================
+Tier 1 is playbin's own choice: the best-ranked decoder, its DMABufs going
+straight to kmssink. If that errors (typically not-negotiated, a hardware
+decoder that cannot hand its buffers to kmssink) or never reaches PLAYING,
+tier 2 rebuilds a playbin with force-sw-decoders, hardware decoders demoted
+to rank NONE and "videoconvert ! kmssink", then seeks back to the position
+reached. One attempt: a second failure stops with a clear message.
 
 ============================================================================
 KEYBOARD MODEL
@@ -123,6 +136,23 @@ AUDIO_SWITCH_GRACE = 3.0
 # Self-test hook: pretend a switch failed as soon as it succeeded, to exercise
 # recover_audio_switch() against the real pipeline. Never set in normal use.
 AUDIO_SWITCH_SELFTEST = os.environ.get("KMS_PLAY_AUDIO_SELFTEST") == "1"
+
+# ---------------------------------------------------------------------------
+# Decode tiers
+# ---------------------------------------------------------------------------
+# Tier 1 (default) lets playbin pick the highest-ranked decoder and feeds
+# kmssink straight from its DMA-BUFs: zero copy, no CPU conversion. On this
+# board that is the HEVC/AV1/MPEG-2/VP8 path.
+#
+# Tier 2 is built only if tier 1 fails: the same file is reopened with
+# force-sw-decoders on uridecodebin and a videoconvert in front of kmssink.
+# The hardware H.264 decoder (v4l2codecs) cannot negotiate DMABuf caps with
+# kmssink on this kernel, so H.264 lands here and is decoded on the CPU.
+#
+# A tier 1 that never reaches PLAYING is treated as a failure too: some broken
+# decoders stall instead of posting an error. The watchdog below gives tier 1
+# this many seconds to start before falling back.
+FALLBACK_START_TIMEOUT = 12.0
 
 # ---------------------------------------------------------------------------
 # Software gain
@@ -755,6 +785,14 @@ class Player:
         self.subtitles = None
         self.osd = None
         self.pipeline = None
+        # Decode tier state: 1 = playbin's own choice (hardware when possible),
+        # 2 = forced software decoders. fallback_done makes the fallback
+        # single-shot: a second failure stops cleanly instead of looping.
+        self.tier = 1
+        self.fallback_done = False
+        self.tier_logged = False
+        self.video_caps_seen = False
+        self.play_requested_at = 0.0
         self.main_loop = GLib.MainLoop()
         self.finished = False
         self.inhibit_cookie = None
@@ -863,7 +901,7 @@ class Player:
 
     # -- pipeline ----------------------------------------------------------
 
-    def build_pipeline(self):
+    def build_pipeline(self, software=False):
         """Build playbin with kmssink on the video plane and a gain element.
 
         flags: VIDEO | AUDIO only. TEXT is deliberately cleared because
@@ -871,15 +909,37 @@ class Player:
         player draws them on its own plane instead.
 
         audio-sink: the "volume" element exposes a software gain (0..10 in
-        GStreamer units) in front of the real sink; we drive it 0..1."""
+        GStreamer units) in front of the real sink; we drive it 0..1.
+
+        software=False is tier 1, unchanged: playbin -> kmssink, and the
+        decoder's DMABufs go to the plane untouched.
+        software=True is tier 2: uridecodebin is told force-sw-decoders and a
+        videoconvert bridges the system-memory frames to kmssink. Slower, but
+        it plays every codec GStreamer can decode."""
         pipeline = Gst.ElementFactory.make("playbin", "player")
         if not pipeline:
             die("playbin unavailable")
         pipeline.set_property("uri", Gst.filename_to_uri(self.media_path))
-        # GST_PLAY_FLAG_VIDEO = 1, GST_PLAY_FLAG_AUDIO = 2, GST_PLAY_FLAG_TEXT = 4
-        pipeline.set_property("flags", 0x1 | 0x2)
-        video_sink = Gst.parse_bin_from_description(
-            "kmssink plane-id=%d" % self.video_plane, True)
+        # GST_PLAY_FLAG_VIDEO = 1, GST_PLAY_FLAG_AUDIO = 2, GST_PLAY_FLAG_TEXT = 4,
+        # GST_PLAY_FLAG_FORCE_SW_DECODERS = 0x1000.
+        flags = 0x1 | 0x2
+        if software:
+            # Tier 2 has three defences, because auto-plugging is stubborn:
+            # the playbin flag, the uridecodebin property, and a rank demotion
+            # of every hardware decoder (see _demote_hardware_decoders).
+            flags |= 0x1000
+            self._demote_hardware_decoders()
+        pipeline.set_property("flags", flags)
+        if software:
+            # playbin owns its uridecodebin child: the child-added hook is the
+            # only point where the property is set before the decoder is
+            # chosen (decodebin reads it while auto-plugging).
+            pipeline.connect("child-added", self._force_software_decoders)
+            video_description = ("videoconvert ! kmssink plane-id=%d"
+                                 % self.video_plane)
+        else:
+            video_description = "kmssink plane-id=%d" % self.video_plane
+        video_sink = Gst.parse_bin_from_description(video_description, True)
         pipeline.set_property("video-sink", video_sink)
         audio_description = "volume name=gain ! audioconvert ! audioresample ! autoaudiosink"
         audio_bin = Gst.parse_bin_from_description(audio_description, True)
@@ -889,15 +949,47 @@ class Player:
         log("software gain at start: %d %%" % round(self.gain * 100))
 
         # Caps probes: this is the only reliable proof that the decoder output
-        # reaches kmssink as DMABuf memory (zero copy) and in which format.
+        # reaches the sink as DMABuf memory (zero copy) and in which format.
+        # In tier 2 the bin's own sink pad is videoconvert's, i.e. the frames
+        # as the software decoder produced them, in system memory.
         pad = video_sink.get_static_pad("sink")
         pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_caps)
         audio_pad = audio_bin.get_static_pad("sink")
         audio_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_audio_caps)
 
-        log("pipeline: playbin uri=%s flags=video+audio video-sink=kmssink plane-id=%d audio=%s"
-            % (self.media_path, self.video_plane, audio_description))
+        log("pipeline: playbin uri=%s flags=video+audio video-sink='%s' audio=%s"
+            % (self.media_path, video_description, audio_description))
         self.pipeline = pipeline
+
+    def _demote_hardware_decoders(self):
+        """Drop every Hardware decoder to rank NONE for the software tier.
+
+        force-sw-decoders is set on uridecodebin too, but playbin creates its
+        decodebin before that property can propagate, so on this GStreamer the
+        hardware decoder was still picked. Rank is what auto-plugging really
+        obeys; the change lives in this process only."""
+        demoted = []
+        registry = Gst.Registry.get()
+        for factory in registry.get_feature_list(Gst.ElementFactory):
+            klass = factory.get_metadata(Gst.ELEMENT_METADATA_KLASS) or ""
+            if "Decoder" in klass and "Hardware" in klass:
+                demoted.append("%s(%d)" % (factory.get_name(), factory.get_rank()))
+                factory.set_rank(Gst.Rank.NONE)
+        log("software tier: hardware decoders demoted:", ", ".join(demoted) or "none")
+
+    def _force_software_decoders(self, _proxy, obj, name=None):
+        """child-added hook: force software decoding inside uridecodebin.
+
+        GStreamer 1.24 passes the child name as a third argument; older
+        versions pass two, hence the optional parameter."""
+        factory = obj.get_factory()
+        factory_name = factory.get_name() if factory else ""
+        if factory_name.startswith("uridecodebin"):
+            try:
+                obj.set_property("force-sw-decoders", True)
+                log("software tier: force-sw-decoders on", obj.get_name())
+            except Exception as exc:
+                log("software tier: cannot force software decoders:", exc)
 
     def _on_video_caps(self, pad, info):
         event = info.get_event()
@@ -909,8 +1001,23 @@ class Player:
                 memory = "DMABuf" if "memory:DMABuf" in caps.to_string() else "system"
                 if getattr(self, "_last_video_caps", None) != (fmt, memory):
                     self._last_video_caps = (fmt, memory)
+                    self.video_caps_seen = True
                     log("video caps:", structure.get_name(), "format=" + str(fmt),
                         "memory=" + memory)
+                    if not self.tier_logged:
+                        self.tier_logged = True
+                        if self.tier == 1 and memory == "DMABuf":
+                            log("decode tier: hardware (zero copy, %s -> kmssink)"
+                                % str(fmt))
+                        elif self.tier == 1:
+                            # playbin already picked a software decoder by
+                            # itself (no usable hardware decoder for this
+                            # codec); the frames travel through system memory.
+                            log("decode tier: software (reason: no hardware decoder "
+                                "selected, system memory)")
+                        else:
+                            log("decode tier: software (confirmed, %s in system memory)"
+                                % str(fmt))
         return Gst.PadProbeReturn.OK
 
     def _on_audio_caps(self, pad, info):
@@ -923,6 +1030,95 @@ class Player:
                     "rate=" + str(structure.get_value("rate")
                                   if structure.has_field("rate") else "?"))
         return Gst.PadProbeReturn.OK
+
+    # -- decode tier fallback ---------------------------------------------
+
+    def _attach_bus(self, pipeline):
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_message)
+
+    def degrade_to_software(self, reason):
+        """Tier 1 failed: replay the file with software decoders.
+
+        Single shot by construction (fallback_done). The new playbin restarts
+        at the position the failed pipeline had reached, so a negotiation
+        error two seconds in does not send the viewer back to the menu.
+        Nothing here loops: a second failure ends playback with a clear OSD
+        message and a 'decode tier: none' line in the log."""
+        if self.finished:
+            return
+        if self.fallback_done:
+            log("decode tier: none (software fallback failed)")
+            if self.osd:
+                self.osd.show(label="Lecture impossible", right="", duration=5)
+            self.stop()
+            return
+        self.fallback_done = True
+        self.tier = 2
+        position = 0.0
+        try:
+            position = max(0.0, self.position())
+        except Exception:
+            pass
+        log("decode tier: software (reason: %s)" % reason)
+        log("fallback: rebuilding playbin with software decoders at %s"
+            % hms(position))
+
+        old = self.pipeline
+        if old is not None:
+            try:
+                bus = old.get_bus()
+                if bus:
+                    bus.remove_signal_watch()
+            except Exception:
+                pass
+            try:
+                old.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        self.pipeline = None
+        self.volume_element = None
+        self._last_video_caps = None
+        self.video_caps_seen = False
+        self.tier_logged = False
+
+        self.build_pipeline(software=True)
+        self._attach_bus(self.pipeline)
+        self.play_requested_at = monotonic()
+        self.pipeline.set_state(Gst.State.PAUSED if self.paused else Gst.State.PLAYING)
+        self.pipeline.get_state(2 * Gst.SECOND)
+        if position > 1.0:
+            ok = self.pipeline.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                int(position * Gst.SECOND))
+            log("fallback: seek to", hms(position), "->", "ok" if ok else "refused")
+            self.target_position = position
+            self.target_set_at = monotonic()
+        if self.osd:
+            self.osd.show(label="Décodage logiciel", right="", duration=3.0)
+
+    def _watchdog(self):
+        """Tier 1 must reach PLAYING within FALLBACK_START_TIMEOUT.
+
+        A broken hardware decoder can stall instead of posting an error, so
+        the absence of PLAYING is a failure signal too. The watchdog is a
+        one-shot: it removes itself once the tier has been decided."""
+        if self.finished or self.tier != 1 or self.fallback_done:
+            return False
+        if monotonic() - self.play_requested_at < FALLBACK_START_TIMEOUT:
+            return True
+        ok, state, pending = self.pipeline.get_state(0)
+        if ok and state == Gst.State.PLAYING:
+            if not self.tier_logged:
+                self.tier_logged = True
+                log("decode tier: hardware (state PLAYING, no video caps yet)")
+            return False
+        self.degrade_to_software(
+            "tier 1 did not reach PLAYING in %.0f s (state %s, pending %s)"
+            % (FALLBACK_START_TIMEOUT, state.value_nick, pending.value_nick))
+        return False
 
     # -- seek / volume -----------------------------------------------------
 
@@ -1341,6 +1537,18 @@ class Player:
             log("PIPELINE ERROR:", error.message, "|", debug)
             if self.recover_audio_switch():
                 return
+            if self.tier == 1:
+                # Any tier 1 error is worth one software attempt: the common
+                # case is a hardware decoder that cannot negotiate DMABuf caps
+                # with kmssink (not-negotiated -4), and force-sw-decoders
+                # sidesteps it completely.
+                reason = "not-negotiated" if "not-negotiated" in (error.message + debug) \
+                    else error.message
+                self.degrade_to_software(reason)
+                return
+            log("decode tier: none (software fallback failed)")
+            if self.osd:
+                self.osd.show(label="Lecture impossible", right="", duration=5)
             self.stop()
         elif message_type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
@@ -1374,18 +1582,18 @@ class Player:
         self.build_pipeline()
         self.start_keyboard()
 
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self.on_message)
+        self._attach_bus(self.pipeline)
 
         # 12.5 Hz for subtitles is enough for human dialogue and cheap; 10 Hz
         # for the OSD matches its rate limit.
         GLib.timeout_add(80, self._tick_subtitles)
         GLib.timeout_add(100, self._tick_osd)
+        GLib.timeout_add(1000, self._watchdog)
 
         signal.signal(signal.SIGTERM, lambda *a: self.stop())
         signal.signal(signal.SIGINT, lambda *a: self.stop())
 
+        self.play_requested_at = monotonic()
         self.pipeline.set_state(Gst.State.PLAYING)
         self.pipeline.get_state(2 * Gst.SECOND)
 
