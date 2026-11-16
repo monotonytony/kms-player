@@ -238,10 +238,22 @@ plane[69]: Esmart2-win0    crtc=(null)  fb=0  crtc-pos=0x0+0+0          (subtitl
 plane[75]: Esmart3-win0    crtc=(null)  fb=0  crtc-pos=0x0+0+0          (OSD)
 ```
 
-The console left behind is cleared and carries one line, `playback finished:
-<file>` or `playback stopped: <file>`, so an empty screen cannot be mistaken for
-a crash. That line is ASCII English on purpose: the kernel console font has no
-non-Latin glyphs.
+The player then **returns to the desktop**: the VT of the active graphical
+session on `seat0` (from logind), else the VT that was active before playback,
+else `1`; the switch only happens if the player still owns the screen, so a VT
+change made during playback is never stolen. `KMS_PLAY_RETURN_VT=2` pins the
+target, and `KMS_PLAY_RETURN_VT=none` keeps the player on its own VT for a
+machine without a desktop. What it lands on is verified, not assumed:
+
+```
+VT: previous tty2, returning to 2 (desktop)
+exit, VT 2 (desktop)
+```
+
+The player's VT itself is left with one line, `playback finished: <file>` or
+`playback stopped: <file>` (invisible once the desktop is back, but readable in
+`/dev/vcsa<player VT>` and in the log). That line is ASCII English on purpose:
+the kernel console font has no non-Latin glyphs.
 
 ---
 

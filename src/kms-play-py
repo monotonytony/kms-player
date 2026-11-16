@@ -125,6 +125,10 @@ PLANES_TOOL = os.environ.get("KMS_PLAY_PLANES", "/usr/local/bin/kms-planes")
 # login prompt sitting in the letterbox next to the picture is unacceptable.
 PLAYER_VT = os.environ.get("KMS_PLAY_VT", "4")
 VT_HELPER = os.environ.get("KMS_PLAY_VT_HELPER", "/usr/local/sbin/kms-vt")
+# VT to go back to when playback ends: unset means "the desktop". "none" keeps
+# the historical behaviour (stay on the player's VT) for machines without one.
+RETURN_VT_SETTING = os.environ.get("KMS_PLAY_RETURN_VT", "").strip()
+ACTIVE_VT_PATH = "/sys/class/tty/tty0/active"
 
 SOCK_PATH = "/tmp/kms-subd-%d.sock" % UID
 RAW_SUB = "/dev/shm/kms-sub-%d.raw" % UID      # tmpfs: no eMMC wear, no disk I/O
@@ -288,25 +292,122 @@ def vt_command(action, vt, text=None):
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def restore_vt(vt, status=""):
-    """Leave the console readable: clear the player's VT, put the status line
-    on the VT the viewer lands on, show the cursor, then switch back.
+def active_vt():
+    """Number of the VT currently displayed, or None.
 
-    Clearing the destination matters as much as the status line: a text VT
-    keeps whatever was last written to it, so coming back to it with the film
-    gone used to leave either leftover text or an empty black screen that is
-    indistinguishable from a crash."""
-    if not vt:
-        return
-    vt_command("show", PLAYER_VT)
-    vt_command("show", vt, status)
-    vt_command("switch", vt)
+    /sys/class/tty/tty0/active is the kernel's own answer ("tty2"), so it is
+    also what the exit path verifies against instead of trusting chvt."""
+    try:
+        with open(ACTIVE_VT_PATH) as handle:
+            name = handle.read().strip()
+    except OSError:
+        return None
+    match = re.match(r"tty(\d+)$", name)
+    return int(match.group(1)) if match else None
+
+
+def session_vt():
+    """VT of the active graphical session on seat0, or None.
+
+    This is the VT the viewer wants back: the one carrying GNOME. It is asked
+    from logind rather than guessed, and a non-numeric or empty answer is
+    ignored so a text-only machine simply has no answer here."""
+    try:
+        seat = subprocess.run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession",
+                               "--value"], capture_output=True, text=True, timeout=3)
+        session = seat.stdout.strip()
+        if not session:
+            return None
+        show = subprocess.run(["loginctl", "show-session", session, "-p", "VTNr",
+                               "--value"], capture_output=True, text=True, timeout=3)
+        value = show.stdout.strip()
+    except Exception:
+        return None
+    return int(value) if value.isdigit() else None
+
+
+def return_vt(previous):
+    """The VT to restore: KMS_PLAY_RETURN_VT, else the desktop, else the VT
+    that was active before the player took the screen, else 1.
+
+    Returns None when returning is disabled ("none"): the player then stays on
+    its own VT, which is the old behaviour and the right one on a machine with
+    no desktop. Numeric values win over everything so a test can pin the
+    target."""
+    setting = RETURN_VT_SETTING.lower()
+    if setting == "none":
+        return None
+    if setting.isdigit():
+        return int(setting)
+    desktop = session_vt()
+    if desktop:
+        return desktop
+    if previous and str(previous).isdigit():
+        return int(previous)
+    return 1
+
+
+def show_status_line(status):
+    """Put the exit line on the player's VT and show the cursor there.
+
+    The viewer no longer lands on that VT (the desktop is), so the line is
+    invisible on purpose - but it stays readable in /dev/vcsa<player VT> and in
+    the log, which is the proof that playback ended cleanly."""
+    vt_command("show", PLAYER_VT, status)
+
+
+SWITCHED_TO_PLAYER_VT = [False]
+
+
+def exit_to_vt(target, kind, status=""):
+    """Leave the viewer on the desktop, never on a console prompt.
+
+    Three rules, in this order: the player only switches back if it still owns
+    the screen (a VT change made during playback belongs to whoever made it);
+    the target has to exist and differ from the player's VT; and the result is
+    verified against /sys/class/tty/tty0/active, then logged as
+    `exit, VT 2 (desktop)` or `exit, VT 1 (console)`.
+
+    The status line is written on the player's VT in every case, so a clean
+    exit can be proven afterwards even though the viewer never sees it."""
+    active = active_vt()
+    show_status_line(status)
+    if not SWITCHED_TO_PLAYER_VT[0]:
+        log("exit: player never took a VT, nothing to restore")
+        return active
+    player_vt = int(PLAYER_VT) if str(PLAYER_VT).isdigit() else 4
+    if active is None or active != player_vt:
+        log("exit, VT untouched: user switched to tty%s"
+            % (active if active is not None else "?"))
+        return active
+    if target is None:
+        log("exit, VT %d (console, return disabled)" % player_vt)
+        return active
+    if target == player_vt:
+        log("exit, VT %d (console, already there)" % target)
+        return active
+    if not os.path.exists("/dev/tty%d" % target):
+        log("exit: /dev/tty%d missing, staying on tty%d" % (target, player_vt))
+        return active
+    vt_command("switch", target)
+    landed = active_vt()
+    if landed == target:
+        log("exit, VT %d (%s)" % (target, kind))
+    else:
+        log("exit, VT %d (%s) not confirmed, active tty%s"
+            % (target, kind, landed if landed is not None else "?"))
+    return landed
 
 
 def die(message, code=1):
     log("ERROR:", message)
     if ORIGINAL_VT[0]:
-        restore_vt(ORIGINAL_VT[0])
+        # Same rule as a normal exit: a fatal error must not leave the viewer
+        # on a console prompt either.
+        target = return_vt(ORIGINAL_VT[0])
+        desktop = session_vt()
+        exit_to_vt(target, "desktop" if target is not None and target == desktop
+                   else "console", console_text("playback failed: " + message))
     sys.exit(code)
 
 
@@ -2685,6 +2786,9 @@ class Player:
         self.planes_released = False
         self.inhibit_cookie = None
         self.previous_vt = None
+        # VT resolved at startup (see switch_vt) and its label for the log.
+        self.return_vt = None
+        self.return_kind = "console"
         self.gain = SOFTWARE_GAIN_START
         self.volume_element = None
         self.duration = None
@@ -2719,19 +2823,32 @@ class Player:
         letterbox it showed up above and below the film. kms-vt (the only
         sudo command allowed here, see /etc/sudoers.d/kms-play) switches,
         clears the screen and hides the cursor in one call."""
-        active = subprocess.run(["cat", "/sys/class/tty/tty0/active"],
-                                capture_output=True, text=True).stdout.strip()
-        self.previous_vt = active.replace("tty", "") or "1"
+        active = active_vt()
+        self.previous_vt = str(active) if active else "1"
         ORIGINAL_VT[0] = self.previous_vt
+        # Resolved here, at startup, not at exit: this is the state the viewer
+        # left behind, and logind could answer differently once the player owns
+        # the console. The label says what the target actually is, which
+        # matters when KMS_PLAY_RETURN_VT pins a VT.
+        self.return_vt = return_vt(self.previous_vt)
+        desktop = session_vt()
+        self.return_kind = "desktop" if self.return_vt is not None \
+            and self.return_vt == desktop else "console"
+        log("VT: previous tty%s, returning to %s (%s)"
+            % (self.previous_vt, self.return_vt if self.return_vt is not None
+               else "none", self.return_kind))
         result = vt_command("prepare", PLAYER_VT)
         if result.returncode != 0:
             log("kms-vt prepare failed:", (result.stderr or "").strip(),
                 "- is the sudoers rule installed?")
         for _ in range(25):
-            if open("/sys/class/tty/tty0/active").read().strip() == "tty" + PLAYER_VT:
+            if open(ACTIVE_VT_PATH).read().strip() == "tty" + PLAYER_VT:
                 break
             time.sleep(0.2)
         time.sleep(0.3)
+        # From here the player owns the console, so the exit path may switch it
+        # back (exit_to_vt refuses to if the user moved to another VT).
+        SWITCHED_TO_PLAYER_VT[0] = True
         log("active VT:", open("/sys/class/tty/tty0/active").read().strip())
 
     def start_subdaemon(self):
@@ -3797,14 +3914,9 @@ class Player:
             except Exception:
                 self.subdaemon.kill()
         self.release_inhibit()
-        if self.previous_vt:
-            # Never come back to the player's VT: it has no getty, so the user
-            # would land on a blank screen with no way to log in.
-            back = self.previous_vt
-            if back == PLAYER_VT:
-                back = "1"
-            restore_vt(back, self.console_status())
-        log("exit, VT", self.previous_vt, "| planes released:", self.planes_released)
+        exit_to_vt(self.return_vt, self.return_kind, self.console_status())
+        log("exit: previous tty%s | planes released: %s"
+            % (self.previous_vt, self.planes_released))
 
 
 LOCK_HANDLE = [None]

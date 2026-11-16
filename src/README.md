@@ -244,15 +244,58 @@ plane[69]: Esmart2-win0       crtc=(null)        fb=0   crtc-pos=0x0+0+0   <- su
 plane[75]: Esmart3-win0       crtc=(null)        fb=0   crtc-pos=0x0+0+0   <- OSD
 ```
 
-The console then gets a status line, because a cleared VT is indistinguishable
-from a crash: `kms-vt show VT TEXT` clears, shows the cursor and prints one
-line, and the player passes `playback finished: <file>` (EOS) or
+The player's own VT gets a status line, because a cleared VT is
+indistinguishable from a crash: `kms-vt show VT TEXT` clears, shows the cursor
+and prints one line, and the player passes `playback finished: <file>` (EOS) or
 `playback stopped: <file>` (a key, a signal, an error). That line is
 **ASCII English whatever the language**: the kernel console font has no
-non-Latin coverage, so a translated line would come back as question marks and
-the "readable screen" requirement would fail. The two strings live in the
-language table like everything else, filled for `en` only, which makes `tr()`
-fall back to English for the other 29 entries.
+non-Latin coverage, so a translated line would come back as question marks.
+The two strings live in the language table like everything else, filled for
+`en` only, which makes `tr()` fall back to English for the other 29 entries.
+The viewer does not see that line: they are sent back to the desktop, and the
+line stays readable in `/dev/vcsa<player VT>` and in the log as the proof that
+playback ended cleanly.
+
+#### Where the viewer lands
+
+A console prompt after a film is alarming - it looks like something crashed.
+So the player returns to the desktop VT (GNOME runs on `tty2` here), resolved
+**once at startup**, in this order:
+
+1. `KMS_PLAY_RETURN_VT=N` when the variable holds a number (pin the target,
+   e.g. in a test). `KMS_PLAY_RETURN_VT=none` disables the return entirely and
+   keeps the historical behaviour: stay on the player's VT, which is the right
+   answer on a machine with no desktop;
+2. the VT of the active graphical session of `seat0`, asked from logind
+   (`loginctl show-seat seat0 -p ActiveSession`, then
+   `loginctl show-session … -p VTNr`), ignored when empty or non-numeric;
+3. the VT that was active before the player took the screen
+   (`/sys/class/tty/tty0/active` read at startup);
+4. `1`.
+
+At exit, after the planes are released, three guards apply before any
+`chvt`:
+
+* the player must still own the screen: if `/sys/class/tty/tty0/active` is no
+  longer its own VT, the user changed VT during playback and that choice is
+  respected - `exit, VT untouched: user switched to tty1`, no switch;
+* the target must exist (`/dev/ttyN`) and must not be the player's VT;
+* the result is read back, then logged as `exit, VT 2 (desktop)` or
+  `exit, VT 1 (console)`, or `exit, VT 2 (desktop) not confirmed, active ttyN`
+  when the switch did not take.
+
+A normal run therefore ends with:
+
+```
+[91110.835] VT: previous tty2, returning to 2 (desktop)
+[91119.848] pipeline: NULL in 122 ms
+[91119.851] planes: released, no framebuffer left on any plane
+[91120.081] exit, VT 2 (desktop)
+[91120.081] exit: previous tty2 | planes released: True
+```
+
+and the console is left with `tty2` active, `gnome-shell` still running, and no
+plane programmed.
 
 ---
 
@@ -501,6 +544,21 @@ visual claim can be checked from an SSH session.
    `exit, VT … | planes released: True`, and the VT the viewer lands on must
    carry one ASCII status line (`playback finished: …` or
    `playback stopped: …`) instead of an empty screen.
+9. **Return to the desktop**: after the same three endings (and once with
+   `SIGTERM`), check what the viewer is left with:
+
+   ```sh
+   cat /sys/class/tty/tty0/active      # tty2 here (the GNOME VT), not tty4
+   pgrep -a gnome-shell                # still alive
+   kms-planes --short | grep -E '^plane (57|69|75)'   # fb=0, pos=+0+0
+   grep -E '^\[[0-9.]+\] (VT:|exit)' ~/.cache/kms-play/last.log
+   ```
+
+   `exit, VT 2 (desktop)` must be logged. Then two counter-tests:
+   `sudo -n kms-vt switch 1` **during** playback, then quit -> the log must say
+   `exit, VT untouched: user switched to tty1` and `tty0/active` must still be
+   `tty1`; and `KMS_PLAY_RETURN_VT=none` -> `exit, VT 4 (console, return
+   disabled)` with the console left on the player's VT.
 
 ## Hardware and software prerequisites
 
