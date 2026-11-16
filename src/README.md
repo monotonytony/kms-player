@@ -91,11 +91,16 @@ and shows it for 8 s, then fades it over 0.8 s (12 renders at 67 ms) and clears
 the plane:
 
 ```
-MATÉRIEL · zéro copie          <- tier: MATÉRIEL·zero copy / LOGICIEL·CPU fallback
-H.265 · Main 10 · 3840x1600 · 23.976 i/s   <- codec+profile, size+rate
-Plan 57 · NV15 · DMABuf · zpos 4           <- plane id, fourcc, memory, zpos
-HDMI-A-1 · 2560x1440 @ 75 Hz               <- connector, live mode, vrefresh
+HARDWARE · zero-copy        <- tier: HARDWARE·zero-copy / SOFTWARE·CPU fallback
+H.265 Main 10 · 3840x1600 · 23.976 fps   <- codec+profile, size+rate
+Plane 57 · NV15 · DMABuf · zpos 4        <- plane id, fourcc, memory, zpos
+HDMI-A-1 · 2560x1440 @ 75 Hz             <- connector, live mode, vrefresh
+47.Ronin.2013.MULTI…x265-TAC.mkv         <- only on demand (key I)
 ```
+
+These strings are English: the panel reports technical facts and is read as a
+diagnostic, unlike the rest of the OSD (`Pause`, `Décodage logiciel`, track
+names), which stays French.
 
 Sources, all read at the moment the banner is drawn:
 
@@ -107,7 +112,7 @@ Sources, all read at the moment the banner is drawn:
 * plane format and zpos: `kms-planes --short` for the video plane — the DRM
   fourcc (`NV15`) and the kernel's zpos, not our own bookkeeping. When the caps
   format differs from what the plane scans out (software tier: `I420` through
-  videoconvert becomes `NV12`), both are shown: `NV12 (négocié I420)`;
+  videoconvert becomes `NV12`), both are shown: `NV12 (I420 negotiated)`;
 * connector, mode, refresh: `kms-planes`, one call at startup. The sysfs `modes`
   file lists supported modes, not the live one, and has no refresh rate, so the
   connector's routed CRTC and `drmModeModeInfo.vrefresh` are used. If no mode is

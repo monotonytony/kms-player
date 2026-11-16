@@ -158,13 +158,13 @@ software tier is the answer; details and the failed workarounds are in
 ## Startup banner and information panel
 
 When playback is confirmed — the decode tier is decided and the video caps are
-negotiated — the OSD plane shows a four-line banner in the top left corner, in
-French, for 8 seconds, then fades out over 0.8 s and disappears:
+negotiated — the OSD plane shows a four-line panel in the top left corner, in
+English, for 8 seconds, then fades out over 0.8 s and disappears:
 
 ```
-MATÉRIEL · zéro copie
-H.265 · Main 10 · 3840x1600 · 23.976 i/s
-Plan 57 · NV15 · DMABuf · zpos 4
+HARDWARE · zero-copy
+H.265 Main 10 · 3840x1600 · 23.976 fps
+Plane 57 · NV15 · DMABuf · zpos 4
 HDMI-A-1 · 2560x1440 @ 75 Hz
 ```
 
@@ -183,11 +183,15 @@ panel at once; otherwise it fades after the same 8 s. Other keys do **not** clos
 it — seeking, pausing, changing tracks and reading it at the same time is the point
 — so the bottom band stays suppressed while the panel is up.
 
-In the software tier the first line says « LOGICIEL · repli CPU », and the plane line
-also shows the negotiated format when it differs from what the plane scans out, e.g.
-`Plan 57 · NV12 (négocié I420) · system · zpos 4`. The startup panel is cancelled by
-the first key, before that key is interpreted, so the usual band appears immediately;
-the I panel ignores every key except I.
+In the software tier the first line says `SOFTWARE · CPU fallback`, and the plane
+line also shows the negotiated format when it differs from what the plane scans out,
+e.g. `Plane 57 · NV12 (I420 negotiated) · system · zpos 4`. The startup panel is
+cancelled by the first key, before that key is interpreted, so the usual band appears
+immediately; the I panel ignores every key except I.
+
+The panel is the one English surface in the player: it reports technical facts and is
+read as a diagnostic. The other OSD labels (« Pause », « Décodage logiciel », track
+names) stay in French and are handled separately.
 
 The fade is the only animation in the player: 12 bounded renders, then the plane is
 cleared and the buffer blanked. The panel and the bottom band are two different

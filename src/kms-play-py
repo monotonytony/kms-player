@@ -574,7 +574,7 @@ def profile_label(profile):
 
 
 def framerate_label(text):
-    """'24000/1001' -> '23.976 i/s', '25/1' -> '25 i/s'."""
+    """'24000/1001' -> '23.976 fps', '25/1' -> '25 fps'."""
     try:
         if "/" in str(text):
             num, den = str(text).split("/")[:2]
@@ -586,8 +586,8 @@ def framerate_label(text):
     if rate <= 0:
         return ""
     if abs(rate - round(rate)) < 0.01:
-        return "%d i/s" % round(rate)
-    return "%.3f i/s" % rate
+        return "%d fps" % round(rate)
+    return "%.3f fps" % rate
 
 
 def screen_size():
@@ -1566,9 +1566,14 @@ class Player:
     # -- information panel -------------------------------------------------
 
     def _panel_base_lines(self):
-        """The four banner lines, in French, from the values just negotiated.
+        """The four panel lines, in English, from the values just negotiated.
 
-        Every value has a single source, so the banner can be trusted as a
+        The panel is the one on-screen surface that is not French: it reports
+        technical facts (a codec name, a DRM fourcc, a connector name) and is
+        read as a diagnostic, so its labels stay in English. The other OSD
+        labels (Pause, Décodage logiciel, track names) are unchanged.
+
+        Every value has a single source, so the panel can be trusted as a
         report and not as a guess:
           line 1  decode tier     -> the tier the caps probe confirmed;
           line 2  codec/profile   -> decoder input caps, size/rate -> raw caps;
@@ -1576,9 +1581,9 @@ class Player:
           line 4  screen          -> kms-planes connector + live CRTC mode.
         Missing fields are omitted rather than printed as "None"."""
         if self.tier == 1 and self.video_memory == "DMABuf":
-            tier = "MATÉRIEL · zéro copie"
+            tier = "HARDWARE · zero-copy"
         else:
-            tier = "LOGICIEL · repli CPU"
+            tier = "SOFTWARE · CPU fallback"
 
         probe = self.probe_video or {}
         codec = codec_label(self.codec_name or probe.get("codec_name"))
@@ -1587,7 +1592,10 @@ class Player:
         height = self.video_height or probe.get("height") or 0
         definition = "%dx%d" % (width, height) if width and height else ""
         rate = framerate_label(self.video_framerate or probe.get("r_frame_rate"))
-        codec_line = " · ".join(part for part in (codec, profile, definition, rate) if part)
+        # Codec and profile read as one name ("H.265 Main 10"); the rest of the
+        # line is separated by a middle dot.
+        codec_name = " ".join(part for part in (codec, profile) if part)
+        codec_line = " · ".join(part for part in (codec_name, definition, rate) if part)
 
         state = plane_state(self.video_plane)
         plane_fmt = state.get("fmt") if state else None
@@ -1595,21 +1603,21 @@ class Player:
             # No framebuffer yet (or unreadable): the caps' drm-format is the
             # concrete fourcc negotiated with the decoder, so it is used next.
             plane_fmt = self.video_drm_format or self.video_format or "?"
-        pline = "Plan %s · %s" % (self.video_plane, plane_fmt)
+        pline = "Plane %s · %s" % (self.video_plane, plane_fmt)
         # The plane scans out what kmssink accepted; the decoder output can be
         # a different fourcc (I420 through videoconvert becomes NV12). Show
         # both when they differ, and skip the DMA_DRM pseudo-format: it is
         # only the caps-level name for "a DRM buffer", not a layout.
         caps_fmt = self.video_format or ""
         if (caps_fmt and caps_fmt != plane_fmt and caps_fmt not in ("DMA_DRM", "?")):
-            pline += " (négocié %s)" % caps_fmt
+            pline += " (%s negotiated)" % caps_fmt
         pline += " · %s" % ("DMABuf" if self.video_memory == "DMABuf" else "system")
         if state and "zpos" in state:
             pline += " · zpos %d" % state["zpos"]
 
         screen_width = self.display.get("width") or self.width
         screen_height = self.display.get("height") or self.height
-        sline = "%s · %dx%d" % (self.display.get("name") or "écran",
+        sline = "%s · %dx%d" % (self.display.get("name") or "screen",
                                  screen_width, screen_height)
         if self.display.get("vrefresh"):
             sline += " @ %d Hz" % self.display["vrefresh"]
