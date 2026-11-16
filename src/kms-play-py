@@ -198,6 +198,12 @@ PANEL_MAX_LINES = 5
 # box at all, just white text over the picture.
 PANEL_BG_ALPHA = 0.72
 
+# Plane verification: kmssink only attaches a framebuffer once the first
+# frame reaches it, which on 4K HEVC can take seconds. Four checks, 1.5 s
+# apart, bound the wait to 6 s before the alternate plane is considered.
+PLANE_VERIFY_INTERVAL_MS = 1500
+PLANE_VERIFY_CHECKS = 4
+
 
 def panel_bg_alpha():
     """Background opacity of the information panel.
@@ -2823,16 +2829,24 @@ removes its own timer and clears the plane.
         self.fade_source = GLib.timeout_add(PANEL_FADE_STEP_MS, self._fade_step)
 
     def _fade_step(self):
-        if not self.panel_visible or not self.panel_fading:
+        # A timeout callback that raises would kill the player, so a drawing
+        # error ends the fade cleanly instead.
+        try:
+            if not self.panel_visible or not self.panel_fading:
+                self.fade_source = 0
+                return False
+            alpha = 1.0 - (monotonic() - self.fade_started) / PANEL_FADE
+            if alpha <= 0:
+                self.fade_source = 0
+                self._clear_panel("timer")
+                return False
+            self._render_panel(alpha)
+            return True
+        except Exception as exc:
+            log("panel: fade error:", exc)
             self.fade_source = 0
+            self.panel_fading = False
             return False
-        alpha = 1.0 - (monotonic() - self.fade_started) / PANEL_FADE
-        if alpha <= 0:
-            self.fade_source = 0
-            self._clear_panel("timer")
-            return False
-        self._render_panel(alpha)
-        return True
 
     def toggle(self):
         self.enabled = not self.enabled
@@ -2911,8 +2925,11 @@ class Player:
             log("planes: no OSD plane available, on-screen display disabled")
         # Post-configuration verification state (see _verify_video_plane).
         self.plane_attempts = 0
+        self.plane_checks = 0
         self.plane_verified = False
         self.plane_check_scheduled = False
+        self.video_sink_bin = None
+        self.kmssink_element = None
 
         # Default subtitle track: the first one whose title does not contain
         # "forced" (forced tracks only carry signs and foreign dialogue).
@@ -3128,6 +3145,24 @@ class Player:
                                  % self.video_plane)
         video_sink = Gst.parse_bin_from_description(video_description, True)
         pipeline.set_property("video-sink", video_sink)
+        # Keep a direct reference to the sink and to the kmssink element:
+        # iterating a playbin is not possible (GstPlayBin is a GstBin without
+        # GstPipeline.iterate()), and the verification callback must never
+        # depend on the pipeline type to find its own sink.
+        self.video_sink_bin = video_sink
+        self.kmssink_element = self._find_kmssink(video_sink)
+        if self.kmssink_element is not None:
+            # fbcon switches the CRTC mode when the player moves to its VT;
+            # the sink must not mode-set on top of that. false is the default
+            # of this build, set explicitly so the intent is recorded and a
+            # future default cannot silently change the picture.
+            try:
+                self.kmssink_element.set_property("force-modesetting", False)
+                log("kmssink: force-modesetting=false (keep the active CRTC mode)")
+            except Exception as exc:
+                log("kmssink: cannot set force-modesetting:", exc)
+        else:
+            log("kmssink: element not found in the video sink bin")
         audio_description = "volume name=gain ! audioconvert ! audioresample ! autoaudiosink"
         audio_bin = Gst.parse_bin_from_description(audio_description, True)
         pipeline.set_property("audio-sink", audio_bin)
@@ -3217,36 +3252,102 @@ class Player:
                     # kmssink really took the plane we selected.
                     if not self.plane_check_scheduled:
                         self.plane_check_scheduled = True
-                        GLib.timeout_add(1500, self._verify_video_plane)
+                        GLib.timeout_add(PLANE_VERIFY_INTERVAL_MS,
+                                         self._verify_video_plane)
                     if not self.startup_panel_shown:
                         self.startup_panel_shown = True
                         GLib.idle_add(self._show_startup_panel)
         return Gst.PadProbeReturn.OK
 
-    def _kmssink(self):
-        """The kmssink element, wherever playbin put it."""
-        if not self.pipeline:
+    def _find_kmssink(self, element, depth=0):
+        """Depth-first search for the kmssink element below `element`.
+
+        GstPlayBin has no GstPipeline.iterate(), so walking the tree has to go
+        through Gst.Bin.iterate_elements()/iterate_recurse(). Every call is
+        guarded: a missing iterator, an unexpected object or a finished
+        iterator returns None instead of raising inside a GLib callback."""
+        if element is None or depth > 6:
             return None
-        iterator = self.pipeline.iterate()
-        while True:
-            result, elem = iterator.next()
-            if result == Gst.IteratorResult.DONE:
-                return None
-            if result != Gst.IteratorResult.OK:
-                continue
-            factory = elem.get_factory()
+        try:
+            factory = element.get_factory()
             if factory and factory.get_name() == "kmssink":
-                return elem
+                return element
+            if not isinstance(element, Gst.Bin):
+                return None
+            iterator = None
+            for method in ("iterate_recurse", "iterate_elements"):
+                build = getattr(element, method, None)
+                if build is None:
+                    continue
+                try:
+                    iterator = build()
+                except Exception:
+                    iterator = None
+                if iterator is not None:
+                    break
+            if iterator is None:
+                return None
+            while True:
+                try:
+                    result, child = iterator.next()
+                except Exception:
+                    return None
+                if result == Gst.IteratorResult.DONE:
+                    return None
+                if result != Gst.IteratorResult.OK:
+                    continue
+                found = self._find_kmssink(child, depth + 1)
+                if found is not None:
+                    return found
+        except Exception:
+            return None
+        return None
+
+    def _kmssink(self):
+        """The kmssink element, from the reference kept at build time.
+
+        The direct reference is the normal path; the tree walk is only a
+        fallback for a pipeline rebuilt elsewhere. Never raises: an exception
+        here would escape from a GLib timeout and kill the player."""
+        try:
+            if self.kmssink_element is not None:
+                return self.kmssink_element
+            if self.video_sink_bin is not None:
+                found = self._find_kmssink(self.video_sink_bin)
+                if found is not None:
+                    self.kmssink_element = found
+                    return found
+            if self.pipeline is not None:
+                return self._find_kmssink(self.pipeline)
+        except Exception as exc:
+            log("plane verify: kmssink lookup failed:", exc)
+        return None
 
     def _verify_video_plane(self):
-        """Read back the video plane once the first frames are on screen.
+        """GLib timeout entry point: never let an exception escape.
 
-        fb!=0 and a size covering the screen are the proof that kmssink took
-        the plane this player selected. On failure the next kms-planes
-        --list-video candidate is tried exactly once (two attempts total), and
-        a second failure is logged instead of looping."""
-        if self.plane_verified:
+        A raising timeout_add callback kills the process (that is what an
+        AttributeError on GstPlayBin.iterate() did), so the whole check is
+        guarded and the playback carries on whatever happens."""
+        try:
+            return self._verify_video_plane_step()
+        except Exception as exc:
+            log("plane verify: unexpected error:", exc)
+            self.plane_verified = True
             return False
+
+    def _verify_video_plane_step(self):
+        """Read back the video plane, waiting for the first buffer if needed.
+
+        kmssink only attaches a framebuffer when the first frame actually
+        reaches it; on 4K HEVC that can take several seconds (decoder startup,
+        file cache). The check therefore polls every 1.5 s for up to 6 s and
+        logs how long the first buffer took. Only if the plane is still empty
+        after that wait does it move to the next kms-planes --list-video
+        candidate — once, with the same bounded wait, never a loop."""
+        if self.plane_verified or self.finished:
+            return False
+        elapsed = monotonic() - self.play_requested_at
         state = plane_state(self.video_plane)
         fb = state.get("fb", 0)
         fw = state.get("frame_width", 0)
@@ -3257,21 +3358,29 @@ class Player:
         # plane; kmssink programmes it over the whole CRTC by construction.
         if fb and fw and fh:
             self.plane_verified = True
-            log("plane verify: video %d fb=%d frame=%dx%d at +%d+%d, screen %dx%d"
+            log("plane verify: video %d fb=%d frame=%dx%d at +%d+%d, "
+                "screen %dx%d, first buffer after %.2f s"
                 % (self.video_plane, fb, fw, fh, state.get("x", 0),
-                   state.get("y", 0), self.width, self.height))
+                   state.get("y", 0), self.width, self.height, elapsed))
             if state.get("zpos") != self.planes["video"]["zpos"]:
                 # zpos is read, never forced: an immutable property (or a
                 # driver reordering) shows up here as a different value.
                 log("plane verify: zpos read back %s, selected %s"
                     % (state.get("zpos"), self.planes["video"]["zpos"]))
             return False
-        self.plane_attempts += 1
-        log("plane verify: video %d NOT scanning out (fb=%d frame=%dx%d, "
-            "screen %dx%d)"
-            % (self.video_plane, fb, fw, fh, self.width, self.height))
-        if self.plane_attempts >= 2:
-            log("plane verify: giving up after 2 attempts, video may be black")
+        self.plane_checks += 1
+        log("plane verify: video %d no buffer yet (fb=%d frame=%dx%d), %.1f s"
+            % (self.video_plane, fb, fw, fh, elapsed))
+        if self.plane_checks < PLANE_VERIFY_CHECKS:
+            GLib.timeout_add(PLANE_VERIFY_INTERVAL_MS, self._verify_video_plane)
+            return False
+        # The plane really stayed empty for the whole bounded wait.
+        log("plane verify: video %d still empty after %.1f s"
+            % (self.video_plane, elapsed))
+        if self.plane_attempts >= 1:
+            # One alternate plane already failed to take the buffers: stop
+            # here rather than walking the whole candidate list.
+            log("plane verify: giving up after 2 planes, video may be black")
             self.plane_verified = True
             return False
         if os.environ.get("KMS_PLAY_PLANES"):
@@ -3286,7 +3395,10 @@ class Player:
             self.plane_verified = True
             return False
         self.video_plane = candidates[0]
-        log("plane verify: retrying with video plane", self.video_plane)
+        self.plane_attempts += 1
+        self.plane_checks = 0
+        log("plane verify: retrying with video plane", self.video_plane,
+            "(attempt %d of 2)" % (self.plane_attempts + 1))
         try:
             sink.set_property("plane-id", self.video_plane)
             if self.subdaemon:
@@ -3297,7 +3409,7 @@ class Player:
             log("plane verify: retry failed:", exc)
             self.plane_verified = True
             return False
-        GLib.timeout_add(1500, self._verify_video_plane)
+        GLib.timeout_add(PLANE_VERIFY_INTERVAL_MS, self._verify_video_plane)
         return False
 
     def _record_video_caps(self, structure, fmt, memory, caps_text=""):
@@ -3407,6 +3519,14 @@ class Player:
           line 3  plane fmt/zpos  -> kms-planes, i.e. the kernel's plane state;
           line 4  screen          -> kms-planes connector + live CRTC mode.
         Missing fields are omitted rather than printed as "None"."""
+        # Re-read the display: the mode seen at startup can be stale. The VT
+        # switch makes fbcon reconfigure the CRTC (measured: 75 Hz on the
+        # desktop, 60 Hz once tty4 is active), and that happens before
+        # kmssink runs, so the banner must report the live value, not the
+        # one read before the switch.
+        live = display_info()
+        if live.get("name"):
+            self.display = live
         probe = self.probe_video or {}
         width = self.video_width or probe.get("width") or 0
         height = self.video_height or probe.get("height") or 0

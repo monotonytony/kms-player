@@ -55,7 +55,7 @@ the original VT on exit.
 | `kms-play-py` | The player: probes the container, picks the video plane, starts the helpers, builds the GStreamer pipeline, renders subtitles and OSD with Pango/Cairo, handles the keyboard. |
 | `kms-subd.c` | Long-lived daemon holding the DRM master. Drives the two ARGB planes; protocol on stdin (`sub cue …`, `osd cue …`, `sub clear`, `osd clear`, `off`, `quit`). `off` detaches the video, subtitle and OSD planes; it is what the exit path uses. |
 | `kms-keys.c` | Reads every `/dev/input/event*` with one `poll()` loop and prints `key <NAME> <1\|0\|2>` lines on stdout (the table includes `I` for the information panel). **Owns autorepeat**: it drops kernel `value=2` events and synthesises its own (300 ms delay, 60 ms interval), so the behaviour does not depend on the keyboard's `EV_REP` capability or on the desktop's repeat settings. |
-| `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position) and every connector's DRM name with the mode and vertical refresh actually scanned out on its CRTC. `--short` is machine-parsable and is what the player uses to find the NV15 plane and to report the plane format in the banner. This is the only way to prove "the OSD is visible" without a screen. |
+| `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position) and every connector's DRM name with the mode and vertical refresh actually scanned out on its CRTC. `--select` prints the three planes the player must use (see "Plane selection"), `--short` is machine-parsable read-back for the banner and the verification, `--check` dumps the topology. This is the only way to prove "the OSD is visible" without a screen. |
 | `kms-inject.c` | uinput virtual keyboard for tests. Emits one key press with a monotonic timestamp so latency can be measured. |
 | `measure-latency.py` | Measures keyboard → visible-effect latency by watching the OSD plane in `/sys/kernel/debug/dri/0/state`. |
 | `measure-cpu.py` | CPU usage of the player process tree over N seconds. |
@@ -209,6 +209,24 @@ by the fade alpha. `KMS_PLAY_PANEL_BG` (0..1) overrides it at run time; `0`
 paints no background at all, leaving white text over the picture, and an
 invalid value is ignored with a log line. The bottom band is independent and
 keeps its 0.55 background and its full width.
+
+The connector mode line is re-read (`display_info()`) every time the panel is
+drawn, so it shows the live CRTC mode instead of the one seen before the VT
+switch. Measured: the desktop's 75 Hz becomes 60 Hz as soon as the console VT is
+activated, because the kernel's fbdev emulation reprograms the CRTC; `kmssink`
+then keeps that mode (`force-modesetting=false`, its default, set explicitly).
+The 75 Hz returns on exit. Nothing in the player programs a CRTC mode.
+
+The video plane is verified after the first frames. kmssink only attaches a
+framebuffer when a real buffer reaches it, which on 4K HEVC can take several
+seconds, so the check polls `kms-planes --short` every 1.5 s for up to 6 s and
+logs `first buffer after N s`. Only after that bounded wait, if the plane is
+still empty, does it switch to the next `--list-video` candidate (once) and wait
+again; a second empty plane is logged and playback continues. The kmssink
+element is kept as a direct reference at pipeline build time, because a
+`GstPlayBin` has no `GstPipeline.iterate()`; the tree walk is only a fallback.
+The timeout callback is guarded, so no exception can escape from it and kill
+the player.
 
 The fade is the only animation in the player: `_start_fade()` schedules a
 self-removing 67 ms timeout, and after the last render the plane is cleared and

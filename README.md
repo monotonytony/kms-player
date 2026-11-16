@@ -282,6 +282,15 @@ KMS_PLAY_PANEL_BG=1 kms-play film.mkv    # fully opaque box
 the default is used. The subtitle band is not affected: it keeps its own width and
 its 0.55 background.
 
+The refresh rate in the panel is re-read when the panel is drawn, so it reports the
+live CRTC value. Measured on this board: the desktop runs 2560x1440 at 75 Hz, but
+switching to the player's VT makes the kernel console (fbdev emulation) reprogram
+the CRTC at 60 Hz, before `kmssink` runs. `kmssink` is told
+`force-modesetting=false` (its default, set explicitly) and does not touch the
+mode; the panel therefore shows `@ 60 Hz` during playback, and the desktop's 75 Hz
+returns on exit. Keeping 75 Hz would mean programming the CRTC from the player,
+which this project does not do.
+
 In the software tier the first line says `SOFTWARE · CPU fallback`, and the plane
 line also shows the negotiated format when it differs from what the plane scans out,
 e.g. `Plane 57 · NV12 (I420 negotiated) · system · zpos 4`. The startup panel is
