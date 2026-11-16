@@ -146,6 +146,11 @@ def main():
         # write the PNG.
         osd = mod.OnScreenDisplay(FakeSubdaemon(), 2560, 1440)
         osd.show_panel(lines, kind="startup", duration=1.0)
+        # The panel is content-sized now: check the measured box stays within
+        # the documented bounds and report it, since it differs per language.
+        box = "%dx%d" % (osd.panel_width, osd.panel_surface.get_height())
+        if not (mod.PANEL_MIN_WIDTH <= osd.panel_width <= mod.PANEL_MAX_WIDTH):
+            bad.append("panel width %d out of bounds" % osd.panel_width)
         png = "-"
         if code in NON_LATIN:
             png = os.path.join(out_dir, "panel-%s.png" % code)
@@ -154,8 +159,8 @@ def main():
         status = "ok" if not bad else "FAIL"
         if bad:
             failures += 1
-        report.append("%-8s %-4s strings %d  panel %d lines  %s  %s"
-                      % (code, status, len(mod.KEYS), len(lines),
+        report.append("%-8s %-4s strings %d  panel %d lines %s  %s  %s"
+                      % (code, status, len(mod.KEYS), len(lines), box,
                          os.path.basename(png) if png != "-" else "-",
                          ", ".join(bad)))
         if not quiet:

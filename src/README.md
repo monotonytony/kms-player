@@ -81,8 +81,9 @@ Cairo surfaces are written to `/dev/shm/kms-{sub,osd}-<uid>.raw` (tmpfs, no eMMC
 wear) and `kms-subd` copies them row by row — the kernel pitch can be larger than
 `width * 4`. A `WxH` string is written next to each raw file
 (`/dev/shm/kms-{sub,osd}-<uid>.geom`) because the OSD surface changes size: the
-bottom band is `screen × 76`, the startup panel is `880 × 202` and the on-demand
-panel with the file name is `880 × 242`.
+bottom band is `screen × 76`, the startup panel is `content × 202` and the
+on-demand panel with the file name is `content × 242` (see "Startup banner and
+information panel" for how the content width is measured).
 
 ### Plane selection
 
@@ -140,9 +141,13 @@ a usable `type` property is treated as `unknown`; and on a single-CRTC board the
 ### Startup banner and information panel
 
 Once the decode tier and the video caps are known, `OnScreenDisplay` draws a
-four-line panel in the top left corner (`880x202+40+40` on a 2560x1440 screen)
-and shows it for 8 s, then fades it over 0.8 s (12 renders at 67 ms) and clears
-the plane:
+four-line panel at `+40+40`, for 8 s, then fades it over 0.8 s (12 renders at
+67 ms) and clears the plane. The box is as wide as its content: the widest
+line's ink (`get_pixel_extents()[1].width`, `ink.x` included for RTL) plus
+`2 * PANEL_MARGIN` (22 px each side), clamped to
+`[PANEL_MIN_WIDTH, PANEL_MAX_WIDTH]` = `[240, 880]`. On this board the four
+startup lines measure 354 px of ink, so the box is `398x202`; only a line that
+had to be shortened reaches the 880 cap (a long file name in the I panel).
 
 ```
 HARDWARE · zero-copy        <- tier: HARDWARE·zero-copy / SOFTWARE·CPU fallback
@@ -193,7 +198,17 @@ so the tail keeps whole release tokens and the extension
 
 The box height follows the line count (`PANEL_TOP + lines*40 + PANEL_BOTTOM`):
 202 px for the startup panel, 242 px with the file name, so neither has a stray
-black band under the text.
+black band under the text. The width does not change during the fade: the text
+and the box are measured once by `_measure_panel()` and every one of the twelve
+renders reuses them, so the box cannot tremble while it fades. The surface
+cache is keyed on `(width, height)` and is recreated, never resized in place,
+when a panel with a different content size is shown.
+
+The background is a translucent black box at `PANEL_BG_ALPHA` (0.72) multiplied
+by the fade alpha. `KMS_PLAY_PANEL_BG` (0..1) overrides it at run time; `0`
+paints no background at all, leaving white text over the picture, and an
+invalid value is ignored with a log line. The bottom band is independent and
+keeps its 0.55 background and its full width.
 
 The fade is the only animation in the player: `_start_fade()` schedules a
 self-removing 67 ms timeout, and after the last render the plane is cleared and
@@ -575,13 +590,16 @@ visual claim can be checked from an SSH session.
 6. **CPU**: `python3 measure-cpu.py 30` while a 4K file plays. Must stay under one
    core.
 7. **Startup banner and I panel**: wait for `/dev/shm/kms-osd-<uid>.geom` to read
-   `880x202` (the startup panel is up), then `kms-shot osd /tmp/banner.png`. It
-   must show four text lines. Ten seconds later the geom is back to `Wx76` and
-   `kms-shot osd` prints `0 non-transparent pixels`. Pressing a key while the
-   startup panel is up must log `panel: hidden (startup, key …)` and show the
-   bottom band instead. Pressing `I` must log `panel: shown (manual)` and produce
-   a `880x242` capture with a fifth line (the file name); a second `I` must give
-   `0 non-transparent pixels`, and arrows, `A`, `S`, `Q` must leave it up.
+   a content-sized `Wx202` (398x202 for the English startup lines; the log line
+   `panel: shown (startup) …, box WxH (ink N)` gives both numbers), then
+   `kms-shot osd /tmp/banner.png`. It must show four text lines. Ten seconds later
+   the geom is back to `Wx76` and `kms-shot osd` prints `0 non-transparent
+   pixels`. Pressing a key while the startup panel is up must log `panel: hidden
+   (startup, key …)` and show the bottom band instead. Pressing `I` must log
+   `panel: shown (manual)` and produce a `Wx242` capture with a fifth line (the
+   file name) — 880 wide when the name had to be shortened, less otherwise; a
+   second `I` must give `0 non-transparent pixels`, and arrows, `A`, `S`, `Q`
+   must leave it up.
 8. **Exit and plane release** (the black-screen regression): end one playback
    with `ESC`, one with `Q`, one with a short clip that reaches EOS (all three,
    plus a `SIGTERM`), then check the kernel's own plane state:
@@ -752,8 +770,8 @@ under an AZERTY layout.
 
 Nobody in this pipeline sits in front of the screen, but the overlays do not need an
 eye: the player renders them itself into a cairo ARGB surface and writes that surface
-to `/dev/shm/kms-osd-<uid>.raw` (bottom band 2560x76, or information panel 880x202 /
-880x242) and
+to `/dev/shm/kms-osd-<uid>.raw` (bottom band 2560x76, or information panel: content
+width up to 880, 202 or 242 high) and
 `/dev/shm/kms-sub-<uid>.raw` (band 2560x220) before handing the file name to
 `kms-subd`. The matching `.geom` file holds `WxH`, which is how `kms-shot` knows
 which rectangle a dump contains.
@@ -761,7 +779,7 @@ which rectangle a dump contains.
 ```sh
 kms-shot osd /tmp/osd.png      # progress bar, volume bar, track label, info panel
 kms-shot sub /tmp/sub.png      # current subtitle cue
-kms-shot osd /tmp/x.png --size 880x242   # manual override if the geom file is gone
+kms-shot osd /tmp/x.png --size 640x242   # manual override if the geom file is gone
 ```
 
 It prints `WxH, N non-transparent pixels, size from geom|--size|inferred`; `N = 0`

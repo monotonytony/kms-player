@@ -179,7 +179,13 @@ SEEK_RESET_AFTER = 1.0
 PANEL_SECONDS = 8.0
 PANEL_FADE = 0.8
 PANEL_FADE_STEP_MS = 67
-PANEL_WIDTH = 880
+# The information panel is as wide as its content: PANEL_MAX_WIDTH is a cap,
+# not a fixed width, and PANEL_MIN_WIDTH is the floor below which a very short
+# panel would look like a strip. Measured: the widest startup line (bold 16,
+# "H.265 Main 10 · 3840x1600 · 23.976 fps") is 401 px, so a real panel lands
+# around 445 px and only a long file name reaches the 880 cap.
+PANEL_MAX_WIDTH = 880
+PANEL_MIN_WIDTH = 240
 PANEL_X = 40
 PANEL_Y = 40
 PANEL_MARGIN = 22
@@ -187,6 +193,32 @@ PANEL_TOP = 18
 PANEL_LINE_HEIGHT = 40
 PANEL_BOTTOM = 24
 PANEL_MAX_LINES = 5
+# Opacity of the black box behind the panel text, multiplied by the fade
+# alpha. Overridable at run time with KMS_PLAY_PANEL_BG (0..1); 0 means no
+# box at all, just white text over the picture.
+PANEL_BG_ALPHA = 0.72
+
+
+def panel_bg_alpha():
+    """Background opacity of the information panel.
+
+    Read from KMS_PLAY_PANEL_BG so the viewer can try the text-only look
+    without recompiling. Unset, empty or invalid keeps PANEL_BG_ALPHA and logs
+    the reason; a value outside 0..1 is invalid too, not clamped silently."""
+    raw = os.environ.get("KMS_PLAY_PANEL_BG")
+    if raw is None or not raw.strip():
+        return PANEL_BG_ALPHA
+    try:
+        value = float(raw)
+    except ValueError:
+        log("panel: invalid KMS_PLAY_PANEL_BG=%r, using %.2f"
+            % (raw, PANEL_BG_ALPHA))
+        return PANEL_BG_ALPHA
+    if value < 0.0 or value > 1.0:
+        log("panel: KMS_PLAY_PANEL_BG=%r outside 0..1, using %.2f"
+            % (raw, PANEL_BG_ALPHA))
+        return PANEL_BG_ALPHA
+    return value
 
 
 def panel_height(line_count):
@@ -2321,10 +2353,12 @@ class OnScreenDisplay:
         "Subtitles: French" and its translation) and an optional right label
         ("12:34 / 48:45"), both in the language selected by KMS_PLAY_LANG or
         the locale (see LANGUAGE);
-      - the information panel, a PANEL_WIDTH rectangle in the top left corner
+      - the information panel, a content-sized box in the top left corner
         with four lines (decode tier, codec, plane, screen) or five when the
-        file name is added. It is shown once for PANEL_SECONDS after playback
-        is confirmed, and on demand with the I key.
+        file name is added. Its width is the widest line plus the margins,
+        capped at PANEL_MAX_WIDTH; its height follows the line count. It is
+        shown once for PANEL_SECONDS after playback is confirmed, and on
+        demand with the I key.
 
 The plane is the OSD plane either way: the board has only two ARGB planes in
 total (subtitles + OSD), so the panel reuses the OSD one with its own
@@ -2373,9 +2407,16 @@ removes its own timer and clears the plane.
         self.panel_kind = None
         self.panel_hide_at = 0.0
         self.panel_lines = []
+        self.panel_lines_fitted = []
+        self.panel_width = PANEL_MAX_WIDTH
+        self.panel_ink = 0
+        self._last_panel_width = 0
         self.panel_surface = None
         self.panel_ctx = None
         self.panel_layout = None
+        self.bg_alpha = panel_bg_alpha()
+        if "KMS_PLAY_PANEL_BG" in os.environ:
+            log("panel: background alpha %.2f" % self.bg_alpha)
         self.fade_started = 0.0
         self.fade_source = 0        # GLib timeout id while fading
 
@@ -2506,6 +2547,10 @@ removes its own timer and clears the plane.
             return
         self._reset_panel()
         self.panel_lines = lines
+        # Measure once, at the opaque render: the fade reuses the same width
+        # and the same fitted text, so the box cannot tremble while it fades.
+        self.panel_width, self.panel_lines_fitted, self.panel_ink = \
+            self._measure_panel(lines)
         self.panel_kind = kind
         self.panel_visible = True
         self.panel_hide_at = monotonic() + duration
@@ -2514,11 +2559,73 @@ removes its own timer and clears the plane.
         self.visible = False
         self.pending = False
         elapsed_ms = self._render_panel(1.0)
-        log("panel: shown (%s) for %.1f s |" % (kind, duration),
+        log("panel: shown (%s) for %.1f s, box %dx%d (ink %d) |"
+            % (kind, duration, self.panel_width,
+               panel_height(len(self.panel_lines_fitted)), self.panel_ink),
             " | ".join(panel_line_text(line) for line in lines),
             "| render %.1f ms" % elapsed_ms)
 
-    def _fit_middle(self, text, max_width):
+    def _measure_panel(self, lines):
+        """Box width that hugs the content, plus the text that fits in it.
+
+        Ink width, not layout box width: a Pango layout spans its declared
+        width, so only get_pixel_extents()[1].width says how many pixels the
+        glyphs really occupy. The widest line plus one margin on each side is
+        the box width, clamped to [PANEL_MIN_WIDTH, PANEL_MAX_WIDTH].
+
+        Long lines are shortened first, against the widest width the box can
+        ever have (the cap). If nothing had to be cut the box hugs the ink;
+        if a line was cut, it wanted more than the cap and the box sits
+        exactly on PANEL_MAX_WIDTH, so "long name" and "880" always mean the
+        same thing. The fitted strings are kept and drawn as-is by every
+        render: re-fitting during the fade would change the truncation and
+        make the box jump."""
+        scratch = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        ctx = cairo.Context(scratch)
+        ltr = PangoCairo.create_layout(ctx)
+        ltr.set_width(-1)
+        rtl = PangoCairo.create_layout(ctx)
+        rtl.set_width(-1)
+        apply_direction(ltr, "en")
+        apply_direction(rtl, "ar")
+
+        max_content = PANEL_MAX_WIDTH - 2 * PANEL_MARGIN
+        fitted, widths = [], []
+        truncated = False
+        for index, line in enumerate(lines):
+            desc = font_description("Bold 16" if index == 0 else "15")
+            if isinstance(line, tuple):
+                # RTL: label and values are two runs; the box must hold both.
+                label, technical = line
+                rtl.set_font_description(desc)
+                rtl.set_text(label, -1)
+                label_width = rtl.get_pixel_extents()[1].width
+                room = max(80, max_content - label_width - PANEL_LINE_HEIGHT)
+                text = self._fit_middle(technical, room, layout=ltr)
+                ltr.set_font_description(desc)
+                ltr.set_text(text, -1)
+                if text != technical:
+                    truncated = True
+                widths.append(label_width + 24
+                              + ltr.get_pixel_extents()[1].width)
+                fitted.append((label, text))
+                continue
+            ltr.set_font_description(desc)
+            text = self._fit_middle(line, max_content, layout=ltr)
+            ltr.set_text(text, -1)
+            if text != line:
+                truncated = True
+            widths.append(ltr.get_pixel_extents()[1].width)
+            fitted.append(text)
+
+        ink = max(widths) if widths else 0
+        # A line that had to be cut wanted more room than the box can ever
+        # have: the box sits exactly on the cap. Otherwise it hugs the ink.
+        width = PANEL_MAX_WIDTH if truncated else ink + 2 * PANEL_MARGIN
+        width = max(PANEL_MIN_WIDTH, min(PANEL_MAX_WIDTH, width))
+        return width, fitted, ink
+
+    def _fit_middle(self, text, max_width, layout=None):
         """Shorten a line in the middle until it fits, keeping the extension.
 
         Filenames are the reason this exists: the end of the name carries the
@@ -2530,7 +2637,7 @@ removes its own timer and clears the plane.
         set, Pango would report the wrapped block width instead of the natural
         line width, every long name would look like it fits and would silently
         wrap onto a second line outside the box."""
-        layout = self.panel_layout
+        layout = layout or self.panel_layout
         layout.set_width(-1)
         try:
             layout.set_text(text, -1)
@@ -2552,10 +2659,9 @@ removes its own timer and clears the plane.
                 candidate = (head + "…" + tail) if head else ("…" + tail)
                 layout.set_text(candidate, -1)
                 if layout.get_pixel_extents()[1].width <= max_width:
-                    if not self.panel_fading:
-                        # Logged once, on the opaque render: the fade redraws
-                        # the same line eleven more times and would add noise.
-                        log("panel: shortened:", text, "->", candidate)
+                    # Measured once per panel, never during the fade: the
+                    # fitted text is what every render draws.
+                    log("panel: shortened:", text, "->", candidate)
                     return candidate
                 if len(head) > 1:
                     head = head[:-1]
@@ -2564,7 +2670,7 @@ removes its own timer and clears the plane.
                 else:
                     return candidate
         finally:
-            layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
+            layout.set_width(-1)
 
     def _render_panel(self, alpha):
         """Draw the panel at the given opacity and push it to the plane.
@@ -2578,24 +2684,36 @@ removes its own timer and clears the plane.
 
         Lines without a translated label (codec, screen, file name) are pure
         technical text and are drawn LTR, flush right under an RTL language so
-        the panel keeps one visual edge. A long file name is shortened in the
-        middle by _fit_middle(), which measures with the real font."""
+        the panel keeps one visual edge. The text and the box width were
+        measured once by _measure_panel() and are reused verbatim here, which
+        is what keeps the width identical across the twelve fade renders."""
         started = monotonic()
-        height = panel_height(max(1, len(self.panel_lines)))
-        if self.panel_surface is None or self.panel_surface.get_height() != height:
+        width = self.panel_width
+        height = panel_height(max(1, len(self.panel_lines_fitted)))
+        # The surface is cached on (width, height): a different content size
+        # gets a new surface, never a resized reuse of the old one.
+        if (self.panel_surface is None
+                or self.panel_surface.get_width() != width
+                or self.panel_surface.get_height() != height):
             self.panel_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
-                                                    PANEL_WIDTH, height)
+                                                    width, height)
             self.panel_ctx = cairo.Context(self.panel_surface)
             self.panel_layout = self._new_panel_layout(rtl=False)
             self.panel_rtl_layout = self._new_panel_layout(rtl=True)
         ctx = self.panel_ctx
         # Translucent black box: readable over any picture, and the video is
-        # still visible behind it (the VOP blends the plane).
+        # still visible behind it (the VOP blends the plane). At alpha 0 the
+        # surface is cleared instead of painted, so the text sits directly on
+        # the picture with no rectangle at all.
         ctx.set_operator(cairo.OPERATOR_SOURCE)
-        ctx.set_source_rgba(0, 0, 0, 0.72 * alpha)
+        ctx.set_source_rgba(0, 0, 0, self.bg_alpha * alpha)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
         ctx.set_source_rgba(1, 1, 1, alpha)
+        if width != self._last_panel_width:
+            log("panel: width %d (ink %d, %d lines)"
+                % (width, self.panel_ink, len(self.panel_lines_fitted)))
+            self._last_panel_width = width
 
         def draw_right(layout, right_edge, y):
             """Draw a layout with its ink ending at right_edge, return its width.
@@ -2609,8 +2727,8 @@ removes its own timer and clears the plane.
             PangoCairo.show_layout(ctx, layout)
             return ink.width
 
-        right_edge = PANEL_WIDTH - PANEL_MARGIN
-        for index, line in enumerate(self.panel_lines):
+        right_edge = width - PANEL_MARGIN
+        for index, line in enumerate(self.panel_lines_fitted):
             # First line is the decode tier: bold, it is the headline.
             desc = font_description("Bold 16" if index == 0 else "15")
             y = PANEL_TOP + index * PANEL_LINE_HEIGHT
@@ -2623,15 +2741,12 @@ removes its own timer and clears the plane.
                 label_layout.set_font_description(desc)
                 label_layout.set_text(label, -1)
                 label_width = draw_right(label_layout, right_edge, y)
-                room = PANEL_WIDTH - 2 * PANEL_MARGIN - label_width - PANEL_LINE_HEIGHT
-                text = self._fit_middle(technical, room)
                 self.panel_layout.set_font_description(desc)
-                self.panel_layout.set_text(text, -1)
+                self.panel_layout.set_text(technical, -1)
                 draw_right(self.panel_layout, right_edge - label_width - 24, y)
                 continue
             self.panel_layout.set_font_description(desc)
-            text = self._fit_middle(line, PANEL_WIDTH - 2 * PANEL_MARGIN)
-            self.panel_layout.set_text(text, -1)
+            self.panel_layout.set_text(line, -1)
             if is_rtl():
                 # Technical lines have no label of their own: flush them right
                 # too, so the panel keeps a single visual edge.
@@ -2640,9 +2755,9 @@ removes its own timer and clears the plane.
             ctx.move_to(PANEL_MARGIN, y)
             PangoCairo.show_layout(ctx, self.panel_layout)
         self.panel_surface.flush()
-        write_surface(RAW_OSD, RAW_OSD_GEOM, self.panel_surface, PANEL_WIDTH, height)
+        write_surface(RAW_OSD, RAW_OSD_GEOM, self.panel_surface, width, height)
         self.subdaemon.stdin.write("osd cue %d %d %d %d %s\n"
-                                   % (PANEL_X, PANEL_Y, PANEL_WIDTH, height, RAW_OSD))
+                                   % (PANEL_X, PANEL_Y, width, height, RAW_OSD))
         self.subdaemon.stdin.flush()
         self.last_render = monotonic()
         return (self.last_render - started) * 1000
@@ -2653,8 +2768,9 @@ removes its own timer and clears the plane.
         PangoCairo.create_layout() builds a fresh PangoContext from the cairo
         context's font options, so the two directions cannot interfere."""
         layout = PangoCairo.create_layout(self.panel_ctx)
-        layout.set_width((PANEL_WIDTH - 2 * PANEL_MARGIN) * Pango.SCALE)
-        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        # No wrapping width: every line was measured and fitted to fit the
+        # box, and a wrap would add a row the height does not account for.
+        layout.set_width(-1)
         apply_direction(layout, "ar" if rtl else "en")
         return layout
 
@@ -2665,6 +2781,7 @@ removes its own timer and clears the plane.
         self.panel_fading = False
         self.panel_kind = None
         self.panel_lines = []
+        self.panel_lines_fitted = []
         if self.fade_source:
             GLib.source_remove(self.fade_source)
             self.fade_source = 0

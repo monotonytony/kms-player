@@ -267,6 +267,21 @@ panel at once; otherwise it fades after the same 8 s. Other keys do **not** clos
 it — seeking, pausing, changing tracks and reading it at the same time is the point
 — so the bottom band stays suppressed while the panel is up.
 
+The box hugs its content: its width is the widest line's real ink plus 22 px of
+margin on each side, capped at 880 px (`PANEL_MAX_WIDTH`). A short panel is around
+400 px wide, and only a line that had to be shortened reaches the 880 cap. The
+height still follows the line count (202 px for the four startup lines, 242 px with
+the file name). The black background is translucent (0.72) and configurable:
+
+```bash
+KMS_PLAY_PANEL_BG=0 kms-play film.mkv    # no box at all, white text on the picture
+KMS_PLAY_PANEL_BG=1 kms-play film.mkv    # fully opaque box
+```
+
+`KMS_PLAY_PANEL_BG` accepts 0..1; an invalid value is ignored with a log line and
+the default is used. The subtitle band is not affected: it keeps its own width and
+its 0.55 background.
+
 In the software tier the first line says `SOFTWARE · CPU fallback`, and the plane
 line also shows the negotiated format when it differs from what the plane scans out,
 e.g. `Plane 57 · NV12 (I420 negotiated) · system · zpos 4`. The startup panel is
@@ -290,8 +305,9 @@ The fade is the only animation in the player: 12 bounded renders, then the plane
 cleared and the buffer blanked. The panel and the bottom band are two different
 rectangles on the same OSD plane (there are only two ARGB planes in total), so the
 player writes the surface geometry next to the buffer (`/dev/shm/kms-osd-<uid>.geom`,
-`WxH`) for `kms-shot`, and the box height follows the number of lines (202 px for the
-startup panel, 242 px with the file name).
+`WxH`) for `kms-shot`. Both dimensions follow the content: width = widest ink + 44 px
+(capped at 880), height = 202 px for the four startup lines, 242 px with the file
+name.
 
 ---
 
@@ -446,15 +462,15 @@ bands as plain cairo ARGB buffers in `/dev/shm` before handing them to `kms-subd
 ```sh
 kms-shot osd /tmp/osd.png     # progress bar, volume, track label, or the info panel
 kms-shot sub /tmp/sub.png     # the current subtitle cue
-kms-shot osd /tmp/osd.png --size 880x242   # override the recorded geometry
+kms-shot osd /tmp/osd.png --size 640x242   # override the recorded geometry
 ```
 
 It prints the surface size (and where that size came from), plus the number of
 non-transparent pixels, which distinguishes "drawn" from "not showing at the time of
 the dump". That is how the subtitle rendering was checked rather than guessed: white
 bold glyphs with a black outline, laid out at the real position of the pipeline. The
-OSD is no longer always the same band (the information panel is a 880-wide rectangle in
-the top left corner), so the player writes `WxH` to `/dev/shm/kms-osd-<uid>.geom`
+OSD is no longer always the same band (the information panel is a content-sized box in
+the top left corner, up to 880 px wide), so the player writes `WxH` to `/dev/shm/kms-osd-<uid>.geom`
 alongside the buffer and `kms-shot` reads it back; `--size` is the manual override.
 
 **What still needs a human**: the picture itself. The video plane scans out an `NV15`
