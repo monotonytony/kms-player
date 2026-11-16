@@ -53,7 +53,7 @@ the original VT on exit.
 | File | Role |
 |---|---|
 | `kms-play-py` | The player: probes the container, picks the video plane, starts the helpers, builds the GStreamer pipeline, renders subtitles and OSD with Pango/Cairo, handles the keyboard. |
-| `kms-subd.c` | Long-lived daemon holding the DRM master. Drives the two ARGB planes; protocol on stdin (`sub cue …`, `osd cue …`, `sub clear`, `osd clear`, `quit`). |
+| `kms-subd.c` | Long-lived daemon holding the DRM master. Drives the two ARGB planes; protocol on stdin (`sub cue …`, `osd cue …`, `sub clear`, `osd clear`, `off`, `quit`). `off` detaches the video, subtitle and OSD planes; it is what the exit path uses. |
 | `kms-keys.c` | Reads every `/dev/input/event*` with one `poll()` loop and prints `key <NAME> <1\|0\|2>` lines on stdout (the table includes `I` for the information panel). **Owns autorepeat**: it drops kernel `value=2` events and synthesises its own (300 ms delay, 60 ms interval), so the behaviour does not depend on the keyboard's `EV_REP` capability or on the desktop's repeat settings. |
 | `kms-planes.c` | Dumps the live DRM plane state (zpos, formats, attached framebuffer, position) and every connector's DRM name with the mode and vertical refresh actually scanned out on its CRTC. `--short` is machine-parsable and is what the player uses to find the NV15 plane and to report the plane format in the banner. This is the only way to prove "the OSD is visible" without a screen. |
 | `kms-inject.c` | uinput virtual keyboard for tests. Emits one key press with a monotonic timestamp so latency can be measured. |
@@ -63,6 +63,7 @@ the original VT on exit.
 | `kmsshare.c` | `LD_PRELOAD` shim that hands the DRM master to `kmssink` over a Unix socket (`SCM_RIGHTS`) and neutralises `drmSetMaster`/`drmDropMaster`. Without it, only one process could program planes. |
 | `kms-keywait.c` | Legacy watcher kept for compatibility: blocks until ESC or Q. The current player does not use it, but older installations and scripts still reference it. |
 | `drm-plane-formats.c` | Minimal diagnostic that prints the fourcc codes each plane accepts. |
+| `kms-vt` | Root helper (`sudo -n`, the single NOPASSWD rule): switches/clears a VT and, for `show`, optionally prints a status line after the clear. |
 | `kms-play` | Launcher: sets `LD_PRELOAD` and `KMS_SHARE_SOCK` and runs the installed player. |
 | `kms-play-next` | Same, but runs everything from this source directory (used for testing before installing). |
 | `install.sh` | Copies the compiled binaries and scripts to `/usr/local/bin` after a backup. |
@@ -202,6 +203,56 @@ also checks the detection order. Run it on the target:
 python3 src/test-i18n.py --out /tmp/i18n-panels
 30 languages, 0 failure(s); PNGs in /tmp/i18n-panels
 ```
+
+### Exit, and why the screen comes back
+
+A plane outlives the process that programmed it. The video plane is a
+full-screen overlay: if it is still attached when the player exits, it covers
+fbcon and the viewer gets a black screen on the television with no process left
+to blame. Nothing in the GStreamer teardown guarantees otherwise, and
+`kmssink`'s `restore-crtc` (default **true**, set explicitly in the pipeline
+description so a changed default cannot reintroduce the bug) restores the CRTC
+mode, not the plane.
+
+So every exit path — `Q`, `ESC`, end of stream, error, `SIGTERM`/`SIGINT` —
+runs the same three steps, in this order:
+
+1. `_teardown_pipeline()`: `set_state(NULL)` then `get_state(2 s)`, i.e. the
+   transition is **awaited**, not assumed. `kmssink` frees its plane while
+   handling it, so releasing the plane earlier races with the sink and can
+   re-enable it. The result is logged: `pipeline: NULL in 121 ms`, or
+   `pipeline: teardown slow, state=…` when it does not finish in time;
+2. `_release_planes()`: `kms-subd` (the DRM master) receives `off` and calls
+   `drmModeSetPlane(…, fb_id=0, …)` on the video plane, the subtitle plane and
+   the OSD plane. Its teardown does the same again if the player dies abruptly;
+3. read-back: `kms-planes --short` is parsed and the release is only considered
+   done when no plane has a framebuffer any more (`fb=0`, `pos=+0+0`). Three
+   attempts, 200 ms apart, then a logged `planes: WARNING still programmed`.
+
+`run()` repeats steps 1–2 if the main loop ever ends without `stop()`, so a path
+that quits the loop directly cannot leave a plane on. A run ends with
+`exit, VT 5 | planes released: True`.
+
+What the viewer sees is checked the same way, from the kernel's own state:
+
+```
+# player stopped, after ESC, Q, and EOS respectively
+grep -E "^plane\[(33|57|75|69)\]" -A4 /sys/kernel/debug/dri/0/state
+plane[33]: Cluster0-win0      crtc=video_port0   fb=86            <- fbcon, never touched
+plane[57]: Esmart0-win0       crtc=(null)        fb=0   crtc-pos=0x0+0+0   <- video
+plane[69]: Esmart2-win0       crtc=(null)        fb=0   crtc-pos=0x0+0+0   <- subtitles
+plane[75]: Esmart3-win0       crtc=(null)        fb=0   crtc-pos=0x0+0+0   <- OSD
+```
+
+The console then gets a status line, because a cleared VT is indistinguishable
+from a crash: `kms-vt show VT TEXT` clears, shows the cursor and prints one
+line, and the player passes `playback finished: <file>` (EOS) or
+`playback stopped: <file>` (a key, a signal, an error). That line is
+**ASCII English whatever the language**: the kernel console font has no
+non-Latin coverage, so a translated line would come back as question marks and
+the "readable screen" requirement would fail. The two strings live in the
+language table like everything else, filled for `en` only, which makes `tr()`
+fall back to English for the other 29 entries.
 
 ---
 
@@ -435,6 +486,21 @@ visual claim can be checked from an SSH session.
    bottom band instead. Pressing `I` must log `panel: shown (manual)` and produce
    a `880x242` capture with a fifth line (the file name); a second `I` must give
    `0 non-transparent pixels`, and arrows, `A`, `S`, `Q` must leave it up.
+8. **Exit and plane release** (the black-screen regression): end one playback
+   with `ESC`, one with `Q`, one with a short clip that reaches EOS (all three,
+   plus a `SIGTERM`), then check the kernel's own plane state:
+
+   ```sh
+   sudo grep -E "^plane\[(33|57|75|69)\]" -A4 /sys/kernel/debug/dri/0/state
+   ```
+
+   Planes 57 (video), 69 (subtitles) and 75 (OSD) must read `crtc=(null)`,
+   `fb=0`, `crtc-pos=0x0+0+0`; only plane 33 (fbcon) keeps
+   `crtc=video_port0`. The log must show `pipeline: NULL in … ms`, then
+   `planes: released, no framebuffer left on any plane`, then
+   `exit, VT … | planes released: True`, and the VT the viewer lands on must
+   carry one ASCII status line (`playback finished: …` or
+   `playback stopped: …`) instead of an empty screen.
 
 ## Hardware and software prerequisites
 

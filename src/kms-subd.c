@@ -37,6 +37,9 @@
  *   osd cue <x> <y> <w> <h> <path>   show a raw BGRA, pre-multiplied buffer
  *   osd clear                        hide the OSD plane
  *   cue ... / clear                  shortcut for "sub ..." (compatibility)
+ *   off                              disable the video, subtitle and OSD
+ *                                    planes (exit path: no frame is left
+ *                                    scanning out over the console)
  *   show                             re-attach the last buffer of the plane
  *   quit                             clear both planes and exit
  *
@@ -250,6 +253,32 @@ static int commit_clear(struct plane *pl)
     if (pl->active) TLOG("kms-subd: %s clear\n", pl->name);
     pl->active = 0;
     return 0;
+}
+
+/* Turn the video plane off. The sink programmed it, not this process, but
+ * this process is the DRM master: passing fb_id 0 detaches the framebuffer and
+ * the CRTC shows its own content again (the console), which is exactly what is
+ * missing when the player leaves a full-screen video plane over fbcon. */
+static int disable_video_plane(void)
+{
+    if (!g_vplane) return -1;
+    uint32_t crtc = find_crtc();
+    if (!crtc) { TLOG("kms-subd: video off: unknown crtc\n"); return -1; }
+    int r = drmModeSetPlane(g_fd, (uint32_t)g_vplane, crtc, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0);
+    if (r) { TLOG("kms-subd: SetPlane video off: %s\n", strerror(errno)); return -1; }
+    return 0;
+}
+
+/* Every plane this player owns, off, and the result logged. Called by the
+ * "off" command and again on teardown, so an abrupt end still leaves the
+ * console visible. */
+static void disable_all_planes(void)
+{
+    int v = disable_video_plane();
+    int s = commit_clear(&g_pl[P_SUB]);
+    int o = commit_clear(&g_pl[P_OSD]);
+    TLOG("kms-subd: planes off (video=%d sub=%d osd=%d)\n", v, s, o);
 }
 
 /* --- plane properties (alpha, blend mode) -------------------------------- */
@@ -470,6 +499,7 @@ int main(int argc, char **argv)
         len = 0;
 
         if (strncmp(line, "quit", 4) == 0) { done = 1; break; }
+        if (strcmp(line, "off") == 0) { disable_all_planes(); continue; }
 
         struct plane *pl = NULL;
         const char *cmd = line;
@@ -501,10 +531,10 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Teardown: clear the planes first (so the last frame is not left on
-     * screen over the desktop), then release every buffer and drop master. */
-    commit_clear(&g_pl[P_SUB]);
-    commit_clear(&g_pl[P_OSD]);
+    /* Teardown: take every plane down first (so neither the last video frame
+     * nor the OSD stays on screen over the console), then release buffers and
+     * drop master. */
+    disable_all_planes();
     close(lfd);
     unlink(sockpath);
     for (int p = 0; p < NPLANS; p++)

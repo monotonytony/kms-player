@@ -11,8 +11,13 @@
 # rule in /etc/sudoers.d/kms-play.
 #
 #   prepare VT   switch to VT, clear it, hide the cursor
-#   show VT      clear VT and show the cursor again (exit path)
+#   show VT [TEXT]   clear VT, show the cursor, optionally print a status line
 #   switch VT    switch to VT, leave its contents alone
+#
+# The optional status line is what the viewer sees after a playback: an empty
+# cleared VT is indistinguishable from a crash, so the player passes something
+# like "playback finished: film.mkv". It is deliberately ASCII English: the
+# kernel console font has no non-Latin glyphs.
 #
 # Clearing matters because a VT keeps whatever was last written to it: the
 # console that was active before the film still holds its text, and the VT the
@@ -21,11 +26,12 @@ set -eu
 
 action=${1:-}
 vt=${2:-}
+status=${3:-}
 
 case "$action" in
     prepare|show|switch) ;;
     *)
-        echo "usage: kms-vt prepare|show|switch VT" >&2
+        echo "usage: kms-vt prepare|show|switch VT [STATUS]" >&2
         exit 2
         ;;
 esac
@@ -53,6 +59,10 @@ case "$action" in
         ;;
     show)
         printf '\033[2J\033[H\033[?25h' > "/dev/tty$vt"
+        if [ -n "$status" ]; then
+            # \r\n: a bare newline only moves down on a VT, which staircases.
+            printf '%s\r\n' "$status" > "/dev/tty$vt"
+        fi
         ;;
     switch)
         switch_to "$vt"

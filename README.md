@@ -213,6 +213,38 @@ startup panel, 242 px with the file name).
 
 ---
 
+## After playback: the screen comes back
+
+A DRM plane outlives the process that programmed it, so a player that simply
+exits can leave its full-screen video plane scanning out over the console —
+which is exactly what a black television screen with no process running looks
+like. On every exit path (`Q`, `ESC`, end of stream, error, `SIGTERM`) the
+player therefore brings the pipeline to `NULL` and **waits** for it, asks
+`kms-subd` (the DRM master) to detach the video, subtitle and OSD planes, and
+then reads the result back with `kms-planes`:
+
+```
+pipeline: NULL in 121 ms
+planes: released, no framebuffer left on any plane
+exit, VT 5 | planes released: True
+```
+
+The kernel's own view, after a stop:
+
+```
+plane[33]: Cluster0-win0   crtc=video_port0   fb=86                     (fbcon)
+plane[57]: Esmart0-win0    crtc=(null)  fb=0  crtc-pos=0x0+0+0          (video)
+plane[69]: Esmart2-win0    crtc=(null)  fb=0  crtc-pos=0x0+0+0          (subtitles)
+plane[75]: Esmart3-win0    crtc=(null)  fb=0  crtc-pos=0x0+0+0          (OSD)
+```
+
+The console left behind is cleared and carries one line, `playback finished:
+<file>` or `playback stopped: <file>`, so an empty screen cannot be mistaken for
+a crash. That line is ASCII English on purpose: the kernel console font has no
+non-Latin glyphs.
+
+---
+
 ## Requirements
 
 * RK3588 board with KMS planes supporting `NV15`/`NV12` plus at least two `AR24` overlay planes

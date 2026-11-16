@@ -275,20 +275,31 @@ def log(*args):
 ORIGINAL_VT = [None]
 
 
-def vt_command(action, vt):
+def vt_command(action, vt, text=None):
     """Run kms-vt through the single NOPASSWD rule of /etc/sudoers.d/kms-play.
 
     Non-interactive only: if sudo would need a password we give up silently
-    rather than hang on a prompt nobody can see."""
-    return subprocess.run(["sudo", "-n", VT_HELPER, action, str(vt)],
-                          capture_output=True, text=True, check=False)
+    rather than hang on a prompt nobody can see. `text` is the optional status
+    line `kms-vt show` prints after clearing; the rule accepts extra arguments
+    (verified: a third argument runs without a password)."""
+    command = ["sudo", "-n", VT_HELPER, action, str(vt)]
+    if text:
+        command.append(text)
+    return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def restore_vt(vt):
-    """Leave the console usable: show the cursor again, then switch back."""
+def restore_vt(vt, status=""):
+    """Leave the console readable: clear the player's VT, put the status line
+    on the VT the viewer lands on, show the cursor, then switch back.
+
+    Clearing the destination matters as much as the status line: a text VT
+    keeps whatever was last written to it, so coming back to it with the film
+    gone used to leave either leftover text or an empty black screen that is
+    indistinguishable from a crash."""
     if not vt:
         return
     vt_command("show", PLAYER_VT)
+    vt_command("show", vt, status)
     vt_command("switch", vt)
 
 
@@ -451,9 +462,14 @@ KEYS = (
     "lang.zh", "lang.ko", "lang.pt", "lang.ru", "lang.ar", "lang.nl",
     "lang.pl", "lang.sv", "lang.da", "lang.nb", "lang.fi", "lang.tr",
     "lang.hi", "lang.und",
+    "console.finished",          # status line on the console VT after exit
+    "console.stopped",           # ASCII English on purpose, see console_status
 )
 
 # The 28 requested languages, with Chinese as three variants: 30 entries.
+# An empty entry means "no translation": tr() falls back to English for it.
+# The two console.* entries are only filled in English on purpose - that line
+# is written on the kernel console, whose font has no non-Latin coverage.
 STRINGS = {
     "en": (
         "HARDWARE · zero-copy",
@@ -485,6 +501,8 @@ STRINGS = {
         "Chinese", "Korean", "Portuguese", "Russian", "Arabic", "Dutch",
         "Polish", "Swedish", "Danish", "Norwegian", "Finnish", "Turkish",
         "Hindi", "Unknown",
+        "playback finished: {name}",
+        "playback stopped: {name}",
     ),
     "fr": (
         "MATÉRIEL · zéro copie",
@@ -516,6 +534,8 @@ STRINGS = {
         "Chinois", "Coréen", "Portugais", "Russe", "Arabe", "Néerlandais",
         "Polonais", "Suédois", "Danois", "Norvégien", "Finnois", "Turc",
         "Hindi", "Indéterminé",
+        "",
+        "",
     ),
     "de": (
         "HARDWARE · Zero-Copy",
@@ -547,6 +567,8 @@ STRINGS = {
         "Japanisch", "Chinesisch", "Koreanisch", "Portugiesisch", "Russisch",
         "Arabisch", "Niederländisch", "Polnisch", "Schwedisch", "Dänisch",
         "Norwegisch", "Finnisch", "Türkisch", "Hindi", "Unbekannt",
+        "",
+        "",
     ),
     "es": (
         "HARDWARE · sin copia",
@@ -578,6 +600,8 @@ STRINGS = {
         "Chino", "Coreano", "Portugués", "Ruso", "Árabe", "Neerlandés",
         "Polaco", "Sueco", "Danés", "Noruego", "Finés", "Turco",
         "Hindi", "Indeterminado",
+        "",
+        "",
     ),
     "pt": (
         "HARDWARE · sem cópia",
@@ -609,6 +633,8 @@ STRINGS = {
         "Chinês", "Coreano", "Português", "Russo", "Árabe", "Neerlandês",
         "Polaco", "Sueco", "Dinamarquês", "Norueguês", "Finlandês", "Turco",
         "Hindi", "Indeterminado",
+        "",
+        "",
     ),
     "it": (
         "HARDWARE · zero-copy",
@@ -640,6 +666,8 @@ STRINGS = {
         "Giapponese", "Cinese", "Coreano", "Portoghese", "Russo",
         "Arabo", "Olandese", "Polacco", "Svedese", "Danese",
         "Norvegese", "Finlandese", "Turco", "Hindi", "Indeterminato",
+        "",
+        "",
     ),
     "nl": (
         "HARDWARE · zero-copy",
@@ -671,6 +699,8 @@ STRINGS = {
         "Chinees", "Koreaans", "Portugees", "Russisch", "Arabisch",
         "Nederlands", "Pools", "Zweeds", "Deens", "Noors", "Fins",
         "Turks", "Hindi", "Onbekend",
+        "",
+        "",
     ),
     "sv": (
         "HÅRDVARA · zero-copy",
@@ -702,6 +732,8 @@ STRINGS = {
         "Kinesiska", "Koreanska", "Portugisiska", "Ryska", "Arabiska",
         "Nederländska", "Polska", "Svenska", "Danska", "Norska", "Finska",
         "Turkiska", "Hindi", "Okänt",
+        "",
+        "",
     ),
     "pl": (
         "SPRZĘT · zero-copy",
@@ -733,6 +765,8 @@ STRINGS = {
         "Japoński", "Chiński", "Koreański", "Portugalski", "Rosyjski",
         "Arabski", "Niderlandzki", "Polski", "Szwedzki", "Duński",
         "Norweski", "Fiński", "Turecki", "Hindi", "Nieokreślony",
+        "",
+        "",
     ),
     "ru": (
         "АППАРАТНО · без копирования",
@@ -764,6 +798,8 @@ STRINGS = {
         "Японский", "Китайский", "Корейский", "Португальский", "Русский",
         "Арабский", "Нидерландский", "Польский", "Шведский", "Датский",
         "Норвежский", "Финский", "Турецкий", "Хинди", "Не определён",
+        "",
+        "",
     ),
     "uk": (
         "АПАРАТНО · без копіювання",
@@ -795,6 +831,8 @@ STRINGS = {
         "Японська", "Китайська", "Корейська", "Португальська", "Російська",
         "Арабська", "Нідерландська", "Польська", "Шведська", "Данська",
         "Норвезька", "Фінська", "Турецька", "Гінді", "Не визначено",
+        "",
+        "",
     ),
     "cs": (
         "HARDWARE · zero-copy",
@@ -826,6 +864,8 @@ STRINGS = {
         "Japonština", "Čínština", "Korejština", "Portugalština", "Ruština",
         "Arabština", "Nizozemština", "Polština", "Švédština", "Dánština",
         "Norština", "Finština", "Turečtina", "Hindština", "Neurčeno",
+        "",
+        "",
     ),
     "ro": (
         "HARDWARE · fără copiere",
@@ -857,6 +897,8 @@ STRINGS = {
         "Japoneză", "Chineză", "Coreeană", "Portugheză", "Rusă",
         "Arabă", "Neerlandeză", "Poloneză", "Suedeză", "Daneză",
         "Norvegiană", "Finlandeză", "Turcă", "Hindi", "Nedeterminată",
+        "",
+        "",
     ),
     "el": (
         "ΥΛΙΚΟ · χωρίς αντιγραφή",
@@ -888,6 +930,8 @@ STRINGS = {
         "Ιαπωνικά", "Κινεζικά", "Κορεατικά", "Πορτογαλικά", "Ρωσικά",
         "Αραβικά", "Ολλανδικά", "Πολωνικά", "Σουηδικά", "Δανικά",
         "Νορβηγικά", "Φινλανδικά", "Τουρκικά", "Χίντι", "Απροσδιόριστο",
+        "",
+        "",
     ),
     "tr": (
         "DONANIM · kopyasız",
@@ -919,6 +963,8 @@ STRINGS = {
         "Japonca", "Çince", "Korece", "Portekizce", "Rusça",
         "Arapça", "Felemenkçe", "Lehçe", "İsveççe", "Danca",
         "Norveççe", "Fince", "Türkçe", "Hintçe", "Belirsiz",
+        "",
+        "",
     ),
     "ar": (
         "عتاد · بدون نسخ",
@@ -950,6 +996,8 @@ STRINGS = {
         "اليابانية", "الصينية", "الكورية", "البرتغالية", "الروسية",
         "العربية", "الهولندية", "البولندية", "السويدية", "الدنماركية",
         "النرويجية", "الفنلندية", "التركية", "الهندية", "غير محدد",
+        "",
+        "",
     ),
     "fa": (
         "سخت‌افزار · بدون کپی",
@@ -981,6 +1029,8 @@ STRINGS = {
         "ژاپنی", "چینی", "کره‌ای", "پرتغالی", "روسی",
         "عربی", "هلندی", "لهستانی", "سوئدی", "دانمارکی",
         "نروژی", "فنلاندی", "ترکی", "هندی", "نامشخص",
+        "",
+        "",
     ),
     "he": (
         "חומרה · ללא העתקה",
@@ -1012,6 +1062,8 @@ STRINGS = {
         "יפנית", "סינית", "קוריאנית", "פורטוגזית", "רוסית",
         "ערבית", "הולנדית", "פולנית", "שוודית", "דנית",
         "נורווגית", "פינית", "טורקית", "הינדי", "לא ידוע",
+        "",
+        "",
     ),
     "hi": (
         "हार्डवेयर · शून्य-प्रतिलिपि",
@@ -1043,6 +1095,8 @@ STRINGS = {
         "जापानी", "चीनी", "कोरियाई", "पुर्तगाली", "रूसी",
         "अरबी", "डच", "पोलिश", "स्वीडिश", "डेनिश",
         "नॉर्वेजियन", "फ़िनिश", "तुर्की", "हिन्दी", "अज्ञात",
+        "",
+        "",
     ),
     "bn": (
         "হার্ডওয়্যার · কপি ছাড়া",
@@ -1074,6 +1128,8 @@ STRINGS = {
         "জাপানি", "চীনা", "কোরীয়", "পর্তুগিজ", "রুশ",
         "আরবি", "ওলন্দাজ", "পোলিশ", "সুইডিশ", "ডেনিশ",
         "নরওয়েজিয়ান", "ফিনিশ", "তুর্কি", "হিন্দি", "অজানা",
+        "",
+        "",
     ),
     "ta": (
         "வன்பொருள் · நகலெடுக்காமல்",
@@ -1105,6 +1161,8 @@ STRINGS = {
         "ஜப்பானியம்", "சீனம்", "கொரியன்", "போர்த்துகீசியம்", "உருசியம்",
         "அரபு", "டச்சு", "போலிஷ்", "சுவீடிஷ்", "டேனிஷ்",
         "நார்வேஜியன்", "பின்னிஷ்", "துருக்கியம்", "இந்தி", "தெரியவில்லை",
+        "",
+        "",
     ),
     "vi": (
         "PHẦN CỨNG · không sao chép",
@@ -1138,6 +1196,8 @@ STRINGS = {
         "Tiếng Ba Lan", "Tiếng Thụy Điển", "Tiếng Đan Mạch",
         "Tiếng Na Uy", "Tiếng Phần Lan", "Tiếng Thổ Nhĩ Kỳ",
         "Tiếng Hindi", "Không xác định",
+        "",
+        "",
     ),
     "id": (
         "PERANGKAT KERAS · tanpa salin",
@@ -1169,6 +1229,8 @@ STRINGS = {
         "Jepang", "Tionghoa", "Korea", "Portugis", "Rusia",
         "Arab", "Belanda", "Polandia", "Swedia", "Denmark",
         "Norwegia", "Finlandia", "Turki", "Hindi", "Tidak diketahui",
+        "",
+        "",
     ),
     "ms": (
         "KERASINGAN · tanpa salin",
@@ -1200,6 +1262,8 @@ STRINGS = {
         "Jepun", "Cina", "Korea", "Portugis", "Rusia",
         "Arab", "Belanda", "Poland", "Sweden", "Denmark",
         "Norway", "Finland", "Turki", "Hindi", "Tidak diketahui",
+        "",
+        "",
     ),
     "th": (
         "ฮาร์ดแวร์ · ไม่คัดลอก",
@@ -1231,6 +1295,8 @@ STRINGS = {
         "ญี่ปุ่น", "จีน", "เกาหลี", "โปรตุเกส", "รัสเซีย",
         "อาหรับ", "ดัตช์", "โปแลนด์", "สวีเดน", "เดนมาร์ก",
         "นอร์เวย์", "ฟินแลนด์", "ตุรกี", "ฮินดี", "ไม่ระบุ",
+        "",
+        "",
     ),
     "ja": (
         "ハードウェア · ゼロコピー",
@@ -1263,6 +1329,8 @@ STRINGS = {
         "アラビア語", "オランダ語", "ポーランド語", "スウェーデン語",
         "デンマーク語", "ノルウェー語", "フィンランド語", "トルコ語",
         "ヒンディー語", "不明",
+        "",
+        "",
     ),
     "ko": (
         "하드웨어 · 복사 없음",
@@ -1294,6 +1362,8 @@ STRINGS = {
         "일본어", "중국어", "한국어", "포르투갈어", "러시아어",
         "아랍어", "네덜란드어", "폴란드어", "스웨덴어", "덴마크어",
         "노르웨이어", "핀란드어", "터키어", "힌디어", "알 수 없음",
+        "",
+        "",
     ),
     "zh-Hans": (
         "硬件 · 零拷贝",
@@ -1325,6 +1395,8 @@ STRINGS = {
         "日语", "中文", "韩语", "葡萄牙语", "俄语",
         "阿拉伯语", "荷兰语", "波兰语", "瑞典语", "丹麦语",
         "挪威语", "芬兰语", "土耳其语", "印地语", "未确定",
+        "",
+        "",
     ),
     "zh-Hant": (
         "硬體 · 零複製",
@@ -1356,6 +1428,8 @@ STRINGS = {
         "日語", "中文", "韓語", "葡萄牙語", "俄語",
         "阿拉伯語", "荷蘭語", "波蘭語", "瑞典語", "丹麥語",
         "挪威語", "芬蘭語", "土耳其語", "印地語", "未確定",
+        "",
+        "",
     ),
     "zh-HK": (
         "硬件 · 零複製",
@@ -1387,6 +1461,8 @@ STRINGS = {
         "日文", "中文", "韓文", "葡萄牙文", "俄文",
         "阿拉伯文", "荷蘭文", "波蘭文", "瑞典文", "丹麥文",
         "挪威文", "芬蘭文", "土耳其文", "印地文", "未確定",
+        "",
+        "",
     ),
 }
 
@@ -1425,7 +1501,8 @@ for _code, _values in STRINGS.items():
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
 for _code, _table in _TABLES.items():
     for _key, _text in _table.items():
-        if sorted(_PLACEHOLDER.findall(_text)) != sorted(_PLACEHOLDER.findall(_TABLES["en"][_key])):
+        if _text and sorted(_PLACEHOLDER.findall(_text)) != \
+                sorted(_PLACEHOLDER.findall(_TABLES["en"][_key])):
             raise SystemExit("i18n: %s/%s has different placeholders" % (_code, _key))
 
 
@@ -1793,6 +1870,38 @@ def display_info():
         if info["name"] is None:
             info = candidate           # keep as a fallback, keep looking
     return info
+
+
+def planes_in_use():
+    """Ids of the DRM planes that still scan out a framebuffer.
+
+    Read back from kms-planes --short rather than assumed from the teardown:
+    fb=0 with position 0+0 is the kernel's way of saying "this plane is off",
+    and that is what the exit path has to achieve on all three planes."""
+    try:
+        out = subprocess.run([PLANES_TOOL, "--short"], capture_output=True,
+                             text=True, timeout=5, env=CHILD_ENV).stdout
+    except Exception:
+        return []
+    busy = []
+    for line in out.splitlines():
+        match = re.match(r"plane (\d+) .*fb=(\d+) .*pos=\+(\d+)\+(\d+)", line)
+        if not match:
+            continue
+        if match.group(2) != "0" or match.group(3) != "0" or match.group(4) != "0":
+            busy.append(int(match.group(1)))
+    return busy
+
+
+def console_text(text, limit=120):
+    """Flatten a string for the VT: no control characters, no newlines.
+
+    The file name reaches the console through the root helper, so it is
+    stripped of anything that could act as an escape sequence and bounded in
+    length rather than trusted."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
 
 
 def plane_state(plane_id):
@@ -2570,6 +2679,10 @@ class Player:
         self.startup_panel_shown = False
         self.main_loop = GLib.MainLoop()
         self.finished = False
+        # Exit bookkeeping: why playback ended (for the console line) and
+        # whether the planes were confirmed off (see _release_planes).
+        self.stop_reason = "requested"
+        self.planes_released = False
         self.inhibit_cookie = None
         self.previous_vt = None
         self.gain = SOFTWARE_GAIN_START
@@ -2710,10 +2823,16 @@ class Player:
             # only point where the property is set before the decoder is
             # chosen (decodebin reads it while auto-plugging).
             pipeline.connect("child-added", self._force_software_decoders)
-            video_description = ("videoconvert ! kmssink plane-id=%d"
+            video_description = ("videoconvert ! kmssink plane-id=%d restore-crtc=true"
                                  % self.video_plane)
         else:
-            video_description = "kmssink plane-id=%d" % self.video_plane
+            # restore-crtc is true by default; it is set explicitly because it
+            # is the sink side of the exit path, and a version changing that
+            # default would silently reintroduce the black screen. It restores
+            # the CRTC mode when going to NULL, which is not enough on its own:
+            # the plane stays programmed, hence the explicit release below.
+            video_description = ("kmssink plane-id=%d restore-crtc=true"
+                                 % self.video_plane)
         video_sink = Gst.parse_bin_from_description(video_description, True)
         pipeline.set_property("video-sink", video_sink)
         audio_description = "volume name=gain ! audioconvert ! audioresample ! autoaudiosink"
@@ -2990,7 +3109,7 @@ class Player:
             log("decode tier: none (software fallback failed)")
             if self.osd:
                 self.osd.show(label=tr("osd.playback_failed"), right="", duration=5)
-            self.stop()
+            self.stop("error")
             return
         self.fallback_done = True
         self.tier = 2
@@ -3377,7 +3496,7 @@ class Player:
             return False
         if self._keyboard_dead or self.keyboard.poll() is not None:
             log("kms-keys exited, stopping")
-            self.stop()
+            self.stop("keyboard gone")
             return False
         return True
 
@@ -3445,7 +3564,7 @@ class Player:
             return
         if name in ("ESC", "Q"):
             if press:
-                self.stop()
+                self.stop("key %s" % name)
             return
         if name in ("LEFT", "RIGHT"):
             # Both press and autorepeat advance the cumulative scale; the
@@ -3503,7 +3622,7 @@ class Player:
             if self.recover_audio_switch(eos=True):
                 return
             log("end of stream (EOS)")
-            self.stop()
+            self.stop("end of stream")
         elif message_type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             log("PIPELINE ERROR:", error.message, "|", debug)
@@ -3521,18 +3640,25 @@ class Player:
             log("decode tier: none (software fallback failed)")
             if self.osd:
                 self.osd.show(label=tr("osd.playback_failed"), right="", duration=5)
-            self.stop()
+            self.stop("error")
         elif message_type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
             if new in (Gst.State.PLAYING, Gst.State.PAUSED):
                 log("pipeline state:", new.value_nick)
 
-    def stop(self):
-        """Tear everything down in an order that leaves the console usable."""
+    def stop(self, reason="requested"):
+        """Tear everything down in an order that leaves the console usable.
+
+        The order is the fix for the black screen reported after a playback:
+        the pipeline is brought to NULL and awaited (kmssink frees its plane
+        during that transition), then kms-subd is asked to detach all three
+        planes, then the result is read back. Relying on the GStreamer teardown
+        alone leaves the video plane scanning out over the console."""
         if self.finished:
             return
         self.finished = True
-        log("stop requested")
+        self.stop_reason = reason
+        log("stop requested (%s)" % reason)
         try:
             if self.osd is not None:
                 self.osd.cancel_panel("stop")
@@ -3544,11 +3670,72 @@ class Player:
                 self.subtitles._clear()
         except Exception:
             pass
+        self._teardown_pipeline()
+        self._release_planes()
+        self.main_loop.quit()
+
+    def _teardown_pipeline(self):
+        """Bring the pipeline to NULL and wait for it, bounded and logged.
+
+        set_state(NULL) only queues the transition; kmssink detaches its plane
+        while handling it. Releasing the plane before that happened races with
+        the sink, which can re-enable it."""
+        if self.pipeline is None:
+            return
+        started = monotonic()
         try:
             self.pipeline.set_state(Gst.State.NULL)
-        except Exception:
-            pass
-        self.main_loop.quit()
+            _result, state, _pending = self.pipeline.get_state(2 * Gst.SECOND)
+        except Exception as exc:
+            log("pipeline: teardown failed:", exc)
+            return
+        elapsed = (monotonic() - started) * 1000
+        if state == Gst.State.NULL:
+            log("pipeline: NULL in %.0f ms" % elapsed)
+        else:
+            log("pipeline: teardown slow, state=%s after %.0f ms"
+                % (state.value_nick, elapsed))
+
+    def _release_planes(self):
+        """Detach the video, subtitle and OSD planes, then check the result.
+
+        kms-subd holds the DRM master, so it is the one that can set fb_id 0 on
+        all three planes; the state is then read back with kms-planes instead
+        of being assumed, and a plane still programmed is logged as a warning
+        (never silently)."""
+        self.planes_released = False
+        subdaemon = getattr(self, "subdaemon", None)
+        if subdaemon is None:
+            return False
+        try:
+            subdaemon.stdin.write("off\n")
+            subdaemon.stdin.flush()
+        except Exception as exc:
+            log("planes: cannot ask kms-subd to release them:", exc)
+            return False
+        for attempt in (1, 2, 3):
+            busy = planes_in_use()
+            if not busy:
+                log("planes: released, no framebuffer left on any plane")
+                self.planes_released = True
+                return True
+            log("planes: still programmed:", busy, "| attempt", attempt)
+            time.sleep(0.2)
+        log("planes: WARNING still programmed after 3 attempts:", planes_in_use())
+        return False
+
+    def console_status(self):
+        """The one line written to the console VT after playback ends.
+
+        ASCII English on purpose, whatever the language: the kernel console
+        font has no non-Latin coverage, so a translated line would come out as
+        question marks and the screen would look broken again. The strings live
+        in the table like every other label; only `en` is filled, which makes
+        `tr()` fall back to English for the other 29 entries."""
+        name = console_text(os.path.basename(self.media_path))
+        key = "console.finished" if self.stop_reason == "end of stream" \
+            else "console.stopped"
+        return tr(key, name=name)
 
     def run(self):
         if not os.path.isfile(self.media_path):
@@ -3568,8 +3755,8 @@ class Player:
         GLib.timeout_add(100, self._tick_osd)
         GLib.timeout_add(1000, self._watchdog)
 
-        signal.signal(signal.SIGTERM, lambda *a: self.stop())
-        signal.signal(signal.SIGINT, lambda *a: self.stop())
+        signal.signal(signal.SIGTERM, lambda *a: self.stop("signal"))
+        signal.signal(signal.SIGINT, lambda *a: self.stop("signal"))
 
         self.play_requested_at = monotonic()
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -3583,7 +3770,13 @@ class Player:
 
         self.main_loop.run()
 
-        # Shutdown sequence.
+        # Shutdown sequence. A path that ended the loop without stop() must not
+        # leave a plane programming the screen, so the teardown is idempotent
+        # and runs again here when the first pass did not record success.
+        if not self.planes_released:
+            log("exit: planes not confirmed released, repeating teardown")
+            self._teardown_pipeline()
+            self._release_planes()
         try:
             self.keyboard.terminate()
             self.keyboard.wait(timeout=1.5)
@@ -3610,8 +3803,8 @@ class Player:
             back = self.previous_vt
             if back == PLAYER_VT:
                 back = "1"
-            restore_vt(back)
-        log("exit, VT", self.previous_vt)
+            restore_vt(back, self.console_status())
+        log("exit, VT", self.previous_vt, "| planes released:", self.planes_released)
 
 
 LOCK_HANDLE = [None]
