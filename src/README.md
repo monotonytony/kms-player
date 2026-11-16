@@ -91,7 +91,7 @@ wear) and `kms-subd` copies them row by row — the kernel pitch can be larger t
 | `A` | Next audio track (cyclic), OSD `Audio : Français — VFF` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`), OSD shows the language |
 | `←` / `→` | Cumulative seek, see below |
-| `↑` / `↓` | Software gain ±5 % (starts at 100 %, ceiling 100 %) |
+| `↑` / `↓` | Software gain ±2 % (starts at 100 %, ceiling 100 %; `KMS_PLAY_VOLUME_STEP` overrides) |
 | `VOLUMEUP` / `VOLUMEDOWN` / `MUTE` | PipeWire sink volume (`wpctl`), OSD |
 | `Enter` | Toggle the OSD |
 | `NEXTSONG` / `PREVIOUSSONG` | Fixed ±60 s jump |

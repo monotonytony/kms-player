@@ -91,7 +91,7 @@ Result: one master, three writers, no tearing, no extra copies.
 | `A` | Next audio track (cyclic) — OSD shows `Language — track title` |
 | `S` | Next subtitle track (cyclic, includes `Désactivé`) — OSD shows the language |
 | `←` / `→` | Seek backwards / forwards, **cumulative ladder**: 1st press 1 s, then 10 s, 30 s, 60 s, 120 s, then 240 s (max). Resets after 1 s without a press or when the direction changes. |
-| `↑` / `↓` | Software volume ±5 % (player gain, 0-100 %, starts at 100 %), with a discrete bar |
+| `↑` / `↓` | Software volume ±2 % (player gain, 0-100 %, starts at 100 %; `KMS_PLAY_VOLUME_STEP=1` for 1 %), with a discrete bar |
 | Media keys | System volume through PipeWire (`wpctl`), with the same bar |
 | `Enter` | Toggle the OSD |
 

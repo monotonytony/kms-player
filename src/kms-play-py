@@ -123,7 +123,10 @@ SEEK_RESET_AFTER = 1.0
 # immediately.
 SOFTWARE_GAIN_START = 1.0
 SOFTWARE_GAIN_MAX = 1.0
-SOFTWARE_GAIN_STEP = 0.05       # 5 % per press
+# 2 % per press: 50 presses cover the whole range, which is fine enough for a
+# film without making the arrows useless. Override with KMS_PLAY_VOLUME_STEP=1
+# for 1 % steps (100 presses).
+SOFTWARE_GAIN_STEP = max(1.0, min(25.0, float(os.environ.get("KMS_PLAY_VOLUME_STEP", "2"))))
 
 # Truncate then reopen in append mode: kms-subd also writes to this descriptor
 # (stderr), and append avoids NUL holes if the file is truncated mid-flight.
@@ -1088,9 +1091,9 @@ class Player:
         elif name == "ENTER" and press:
             log("osd toggled ->", self.osd.toggle())
         elif name == "UP" and press:
-            self.software_volume(+5)
+            self.software_volume(SOFTWARE_GAIN_STEP)
         elif name == "DOWN" and press:
-            self.software_volume(-5)
+            self.software_volume(-SOFTWARE_GAIN_STEP)
         elif name == "VOLUMEUP" and press:
             self.system_volume(+5)
         elif name == "VOLUMEDOWN" and press:
