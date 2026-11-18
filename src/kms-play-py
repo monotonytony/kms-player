@@ -102,6 +102,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import gi
@@ -157,6 +158,38 @@ RAW_OSD = "/dev/shm/kms-osd-%d.raw" % UID
 # its size from the file length and needs this file.
 RAW_SUB_GEOM = "/dev/shm/kms-sub-%d.geom" % UID
 RAW_OSD_GEOM = "/dev/shm/kms-osd-%d.geom" % UID
+
+# ---------------------------------------------------------------------------
+# Control socket (the UPnP bridge)
+# ---------------------------------------------------------------------------
+# kms-renderd drives one playback through this socket: one JSON request per
+# line, one JSON reply per line. The default lives in the runtime directory
+# (/run/user/<uid>, mode 0600, owned by the user), not in world-writable /tmp,
+# so another local account cannot steer the player. KMS_PLAY_CTL_SOCK overrides
+# the path for tests and for a caller that wants a predictable name.
+def control_socket_path():
+    explicit = os.environ.get("KMS_PLAY_CTL_SOCK", "").strip()
+    if explicit:
+        return explicit
+    runtime = (os.environ.get("XDG_RUNTIME_DIR", "").strip()
+               or "/run/user/%d" % UID)
+    if os.path.isdir(runtime):
+        return os.path.join(runtime, "kms-play.sock")
+    return "/tmp/kms-play-%d.sock" % UID
+
+
+CONTROL_SOCK = control_socket_path()
+# One request line, bounded: a client that sends more is a bug or an attack.
+CONTROL_MAX_LINE = 4096
+# How long a control request waits for the GLib main loop to answer it. The
+# loop is where GStreamer lives, so every pipeline query is marshalled there.
+CONTROL_TIMEOUT = 3.0
+
+# A media argument that carries a scheme is a URI and must reach GStreamer
+# untouched (UPnP hands out http:// and upnp:// URLs). Anything else is a local
+# path and is resolved, then converted by Gst.filename_to_uri.
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+REMOTE_PROBE_TIMEOUT = float(os.environ.get("KMS_PLAY_PROBE_TIMEOUT", "25"))
 
 # Children must NOT inherit LD_PRELOAD/KMS_SHARE_SOCK: libkmsshare would make
 # them try to steal the master fd, and kms-subd is the legitimate owner.
@@ -1995,23 +2028,45 @@ def panel_line_text(line):
 # Container probing
 # ---------------------------------------------------------------------------
 
-def probe_media(path):
+def probe_media(path, remote=False):
     """List audio and text subtitle streams of the container.
 
     Only text codecs are kept: image-based subtitles (PGS/DVD) cannot be
     rendered by Pango and would need a bitmap path we do not implement.
     Returns (audio_streams, subtitle_streams, video_stream), the last one being
     the first video stream (or {}) used as a fallback by the startup banner
-    when the negotiated caps do not carry every field."""
-    proc = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                           "stream=index,codec_type,codec_name,profile,width,height,"
-                           "r_frame_rate:stream_tags=language,title",
-                           "-of", "json", path], capture_output=True, text=True)
+    when the negotiated caps do not carry every field.
+
+    A remote URI is probed over the network with a bounded read timeout; the
+    probe is an optimisation here, not a requirement, so any failure returns
+    empty lists and playback still starts. That is what a UPnP renderer needs:
+    a server that will not answer ffprobe must not prevent the film."""
+    command = ["ffprobe", "-v", "error", "-show_entries",
+               "stream=index,codec_type,codec_name,profile,width,height,"
+               "r_frame_rate:stream_tags=language,title",
+               "-of", "json"]
+    if remote:
+        # ffprobe's protocol read timeout is in microseconds.
+        command += ["-rw_timeout", "%d" % int(REMOTE_PROBE_TIMEOUT * 1000000)]
+    command.append(path)
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True,
+                              timeout=REMOTE_PROBE_TIMEOUT if remote else None)
+    except subprocess.TimeoutExpired:
+        log("ffprobe: timed out after %.0f s on %s" % (REMOTE_PROBE_TIMEOUT, path))
+        return [], [], {}
+    except Exception as exc:
+        log("ffprobe: cannot run:", exc)
+        return [], [], {}
     try:
         streams = json.loads(proc.stdout or "{}").get("streams", [])
     except Exception as exc:
         log("ffprobe output unreadable:", exc)
         return [], [], {}
+    if remote and proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        log("ffprobe: remote probe failed (code %d)%s"
+            % (proc.returncode, (": " + detail[-1][:160]) if detail else ""))
     audio, subs, video = [], [], {}
     for stream in streams:
         if stream.get("codec_type") == "audio":
@@ -3055,8 +3110,12 @@ removes its own timer and clears the plane.
 # ---------------------------------------------------------------------------
 
 class Player:
-    def __init__(self, media_path):
+    def __init__(self, media_path, remote=False):
+        # media_path is the URI for a remote stream and an absolute path for a
+        # local file; self.uri is what GStreamer is given either way.
         self.media_path = media_path
+        self.remote = remote
+        self.uri = media_path if remote else Gst.filename_to_uri(media_path)
         self.width, self.height = screen_size()
         log("screen:", self.width, "x", self.height)
 
@@ -3077,7 +3136,11 @@ class Player:
         self.stats = None
         self.stats_total = None
 
-        self.audio, self.subs, self.probe_video = probe_media(media_path)
+        if remote:
+            log("remote stream:", media_path)
+
+        self.audio, self.subs, self.probe_video = probe_media(media_path,
+                                                              remote=remote)
         log("audio streams:", [(s["index"], language_name(s.get("tags") or {})[0])
                                for s in self.audio])
         log("subtitle streams:", [(s["index"], (s.get("tags") or {}).get("title", ""),
@@ -3119,6 +3182,13 @@ class Player:
             if "forced" not in title:
                 self.sub_index = index
                 break
+        # Embedded subtitles of a remote stream are not extracted: ffmpeg would
+        # re-download the whole container for a side file, and a slow server
+        # would stall the film. Say it in the log and play without them.
+        if remote and self.subs:
+            log("subtitles: %d embedded track(s) ignored for a remote stream"
+                % len(self.subs))
+            self.subs = []
         self.subtitles_enabled = bool(self.subs) and self.planes["sub"] is not None
 
         self.subdaemon = None
@@ -3188,6 +3258,11 @@ class Player:
         self.audio_recoveries = 0
         self.keylayout = KeyLayout()
         self.keyboard = None
+        # Set once the pipeline has been asked to play: the control socket
+        # reports "starting" before that and "playing" after it.
+        self.play_started = False
+        self.control_server = None
+        self.control_stop_event = None
 
     # -- infrastructure ----------------------------------------------------
 
@@ -3442,7 +3517,7 @@ class Player:
         # the first audio stream is the default selection again.
         self.stream_ids = {"video": [], "audio": [], "text": []}
         self.audio_active = 0
-        pipeline.set_property("uri", Gst.filename_to_uri(self.media_path))
+        pipeline.set_property("uri", self.uri)
         # GST_PLAY_FLAG_VIDEO = 1, GST_PLAY_FLAG_AUDIO = 2, GST_PLAY_FLAG_TEXT = 4,
         # GST_PLAY_FLAG_SOFT_VOLUME = 0x10, GST_PLAY_FLAG_NATIVE_VIDEO = 0x40,
         # GST_PLAY_FLAG_FORCE_SW_DECODERS = 0x1000.
@@ -3530,7 +3605,7 @@ class Player:
         audio_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_audio_buffer)
 
         log("pipeline: %s uri=%s flags=0x%x video-sink='%s' audio=%s"
-            % (strategy, self.media_path, flags, video_description,
+            % (strategy, self.uri, flags, video_description,
                audio_description))
         self.pipeline = pipeline
 
@@ -4293,6 +4368,29 @@ class Player:
                                                     (monotonic() - started) * 1000,
                                                     "ok" if ok else "refused"))
 
+    def seek_absolute(self, position, origin="upnp"):
+        """Seek to an absolute position in seconds (UPnP Seek/REL_TIME).
+
+        Same clamping as seek(): never to the very end, never before zero.
+        Kept separate because the OSD has to show the jump, which is the
+        difference between the current position and the target."""
+        target = max(0.0, float(position))
+        duration = self.duration_s()
+        if duration:
+            target = min(target, max(0.0, duration - 0.25))
+        delta = target - self.position()
+        self.target_position = target
+        self.target_set_at = monotonic()
+        self.show_seek_osd(delta)
+        started = monotonic()
+        ok = self.pipeline.seek_simple(Gst.Format.TIME,
+                                       Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                                       int(target * Gst.SECOND))
+        log("seek %s absolute %.1fs -> %s (%.1f ms, %s)"
+            % (origin, target, hms(target), (monotonic() - started) * 1000,
+               "ok" if ok else "refused"))
+        return bool(ok)
+
     def show_seek_osd(self, step=None):
         """Draw the progress bar plus the signed step (or the pause state)."""
         position = self.position()
@@ -4321,6 +4419,58 @@ class Player:
         log("software volume:", percent, "%")
         self.osd.show(label=tr("osd.volume_player"), fraction=self.gain,
                       right=tr("osd.percent", value=percent))
+
+    def set_volume_percent(self, percent):
+        """Absolute software gain, for the control socket (UPnP SetVolume).
+
+        The same element the arrow keys drive: a software gain in the audio
+        branch, independent from the PipeWire sink volume. 0 is silence.
+        Returns the gain actually applied, in percent."""
+        percent = max(0.0, min(100.0, float(percent)))
+        self.gain = percent / 100.0 * SOFTWARE_GAIN_MAX
+        if self.volume_element is not None:
+            try:
+                self.volume_element.set_property("volume", self.gain)
+            except Exception as exc:
+                log("volume: cannot set gain:", exc)
+        if self.osd is not None:
+            self.osd.show(label=tr("osd.volume_player"), fraction=self.gain,
+                          right=tr("osd.percent", value=int(round(percent))))
+        log("volume: %d %% (control socket)" % int(round(percent)))
+        return int(round(percent))
+
+    def set_audio_track(self, index):
+        """Select an audio track by index (UPnP SetAudioTrack equivalent).
+
+        Validated against the STREAM_COLLECTION when it exists, because that
+        is what select-streams accepts; ffprobe's count is the fallback for a
+        stream whose collection never arrived. Returns (ok, error or None)."""
+        try:
+            index = int(index)
+        except Exception:
+            return False, "track index must be an integer"
+        count = len(self.stream_ids.get("audio") or []) or len(self.audio)
+        if index < 0 or index >= count:
+            return False, "no audio track %d (have %d)" % (index, count)
+        if index == self.audio_active:
+            return True, None
+        if self.strategy == "playbin3":
+            if not self._select_audio_stream(index):
+                return False, "the pipeline refused the switch"
+        else:
+            try:
+                self.pipeline.set_property("current-audio", index)
+            except Exception as exc:
+                return False, str(exc)
+        self.audio_active = index
+        log("audio track -> %d/%d (control socket)" % (index, count))
+        if self.osd is not None:
+            label = "#%d" % (index + 1)
+            if index < len(self.audio):
+                name, title = language_name(self.audio[index].get("tags") or {})
+                label = track_label(name, title)
+            self.osd.show(label=tr("osd.audio", name=label), duration=1.5)
+        return True, None
 
     def system_volume(self, delta_percent, mute=False):
         """Multimedia keys: PipeWire sink volume, shared with the rest of the
@@ -4890,8 +5040,257 @@ class Player:
             else "console.stopped"
         return tr(key, name=name)
 
+    # -- control socket (kms-renderd) --------------------------------------
+
+    def transport_state(self):
+        """One word for the control socket, mapped to UPnP by the caller."""
+        if self.finished:
+            return "stopped"
+        if self.pipeline is None or not self.play_started:
+            return "starting"
+        if self.paused:
+            return "paused"
+        return "playing"
+
+    def audio_track_list(self):
+        tracks = []
+        for index, stream in enumerate(self.audio):
+            tags = stream.get("tags") or {}
+            name, title = language_name(tags)
+            tracks.append({"index": index, "label": track_label(name, title),
+                           "language": tags.get("language", "")})
+        # The stream collection may know tracks ffprobe did not describe (a
+        # remote probe that failed, for instance): list them by number so the
+        # count still matches what select-streams accepts.
+        known = len(tracks)
+        for index in range(known, len(self.stream_ids.get("audio") or [])):
+            tracks.append({"index": index, "label": "#%d" % (index + 1),
+                           "language": ""})
+        return tracks
+
+    def control_status(self):
+        """Everything the renderer needs for GetTransportInfo/GetPositionInfo."""
+        try:
+            position = self.position()
+        except Exception:
+            position = 0.0
+        try:
+            duration = self.duration_s() or 0.0
+        except Exception:
+            duration = 0.0
+        return {
+            "state": self.transport_state(),
+            "position": round(max(0.0, position), 3),
+            "duration": round(max(0.0, duration), 3),
+            "volume": int(round(self.gain * 100)),
+            "muted": self.gain <= 0.0,
+            "audio_tracks": self.audio_track_list(),
+            "current_audio": self.audio_active,
+            "uri": self.uri,
+            "tier": self.tier,
+            "remote": self.remote,
+            "video": {"width": self.video_width, "height": self.video_height,
+                      "drm_format": self.video_drm_format,
+                      "memory": self.video_memory},
+            "osd": bool(self.osd is not None and self.osd.enabled),
+        }
+
+    def start_control(self):
+        """Listen on the unix socket the renderer talks to.
+
+        Unix socket, mode 0600, in the user's runtime directory: the kernel
+        checks the credentials, so only this user can steer the player. The
+        socket is a plain file that is unlinked and recreated at every start
+        (the single-instance lock guarantees no other player owns it)."""
+        path = CONTROL_SOCK
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as exc:
+                log("control: cannot create %s: %s" % (directory, exc))
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log("control: cannot remove stale %s: %s" % (path, exc))
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(path)
+            os.chmod(path, 0o600)
+            server.listen(8)
+            server.settimeout(0.5)
+        except Exception as exc:
+            log("control: cannot listen on %s: %s" % (path, exc))
+            try:
+                server.close()
+            except Exception:
+                pass
+            return False
+        self.control_server = server
+        self.control_stop_event = threading.Event()
+        thread = threading.Thread(target=self._control_loop,
+                                  name="kms-play-control", daemon=True)
+        thread.start()
+        log("control socket: %s" % path)
+        return True
+
+    def stop_control(self):
+        server = getattr(self, "control_server", None)
+        if server is not None:
+            try:
+                self.control_stop_event.set()
+            except Exception:
+                pass
+            try:
+                server.close()
+            except Exception:
+                pass
+            self.control_server = None
+        try:
+            os.unlink(CONTROL_SOCK)
+        except OSError:
+            pass
+
+    def _control_loop(self):
+        """One request per connection: read a line, answer a line, close.
+
+        Nothing here touches GStreamer: every request is handed to the GLib
+        main loop, which owns the pipeline. A malformed request is answered,
+        never raised, so a broken client cannot take the player down."""
+        while not self.control_stop_event.is_set() and not self.finished:
+            try:
+                connection, _address = self.control_server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                connection.settimeout(CONTROL_TIMEOUT)
+                reply = self._serve_control(connection)
+                connection.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except Exception as exc:
+                log("control: connection failed:", exc)
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def _serve_control(self, connection):
+        data = b""
+        while b"\n" not in data and len(data) <= CONTROL_MAX_LINE:
+            chunk = connection.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > CONTROL_MAX_LINE:
+            log("control: request larger than %d bytes refused" % CONTROL_MAX_LINE)
+            return {"ok": False, "error": "request too large"}
+        line = data.split(b"\n", 1)[0].strip()
+        if not line:
+            return {"ok": False, "error": "empty request"}
+        try:
+            request = json.loads(line.decode("utf-8", "strict"))
+        except Exception:
+            log("control: malformed JSON refused")
+            return {"ok": False, "error": "invalid json"}
+        return self.control_request(request)
+
+    def control_request(self, request):
+        """Marshall a request onto the GLib loop and wait for its reply."""
+        if not isinstance(request, dict):
+            return {"ok": False, "error": "request must be an object"}
+        done = threading.Event()
+        box = {}
+
+        def perform():
+            try:
+                box["reply"] = self._control_perform(request)
+            except Exception as exc:
+                log("control: %s failed: %s" % (request.get("cmd"), exc))
+                box["reply"] = {"ok": False, "error": str(exc)}
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(perform)
+        if not done.wait(CONTROL_TIMEOUT):
+            return {"ok": False, "error": "player busy (timeout)"}
+        return box.get("reply") or {"ok": False, "error": "no reply"}
+
+    def _control_perform(self, request):
+        """Runs on the GLib main loop, i.e. on the thread that owns GStreamer."""
+        command = str(request.get("cmd", ""))
+        if command == "status":
+            reply = {"ok": True}
+            reply.update(self.control_status())
+            return reply
+        if command in ("play", "resume"):
+            if self.finished:
+                return {"ok": False, "error": "player finished"}
+            if self.paused:
+                self.toggle_pause()
+            elif not self.play_started:
+                return {"ok": False, "error": "still starting"}
+            reply = {"ok": True}
+            reply.update(self.control_status())
+            return reply
+        if command == "pause":
+            if self.finished or not self.play_started:
+                return {"ok": False, "error": "nothing playing"}
+            if not self.paused:
+                self.toggle_pause()
+            reply = {"ok": True}
+            reply.update(self.control_status())
+            return reply
+        if command == "stop":
+            if self.finished:
+                return {"ok": True, "state": "stopped"}
+            # Deferred: the reply must leave the socket before the teardown
+            # closes the process. 200 ms is one OSD frame, imperceptible.
+            GLib.timeout_add(200, self._control_stop_timeout)
+            return {"ok": True, "state": "stopping"}
+        if command == "seek":
+            if self.finished or self.pipeline is None:
+                return {"ok": False, "error": "nothing playing"}
+            try:
+                position = float(request.get("position"))
+            except Exception:
+                return {"ok": False, "error": "position must be a number"}
+            if position < 0:
+                return {"ok": False, "error": "position must be positive"}
+            accepted = self.seek_absolute(position)
+            reply = {"ok": True, "accepted": accepted}
+            reply.update(self.control_status())
+            return reply
+        if command == "volume":
+            try:
+                percent = float(request.get("volume"))
+            except Exception:
+                return {"ok": False, "error": "volume must be a number"}
+            applied = self.set_volume_percent(percent)
+            return {"ok": True, "volume": applied, "muted": applied <= 0}
+        if command == "audio_track":
+            ok, error = self.set_audio_track(request.get("index"))
+            if not ok:
+                return {"ok": False, "error": error}
+            return {"ok": True, "current_audio": self.audio_active}
+        if command == "quit":
+            GLib.timeout_add(200, self._control_stop_timeout)
+            return {"ok": True, "state": "stopping"}
+        return {"ok": False, "error": "unknown command: %s" % (command or "-")}
+
+    def _control_stop_timeout(self):
+        try:
+            self.stop("control socket")
+        except Exception as exc:
+            log("control: stop failed:", exc)
+        return False
+
     def run(self):
-        if not os.path.isfile(self.media_path):
+        if not self.remote and not os.path.isfile(self.media_path):
             die("file not found: %s" % self.media_path)
 
         self.switch_vt()
@@ -4918,6 +5317,7 @@ class Player:
         self.play_requested_at = monotonic()
         self.pipeline.set_state(Gst.State.PLAYING)
         self.pipeline.get_state(2 * Gst.SECOND)
+        self.play_started = True
 
         # First subtitle track, extracted in the background.
         if self.subtitles_enabled and self.subs:
@@ -4925,7 +5325,10 @@ class Player:
             threading.Thread(target=self.load_subtitles,
                              args=(self.subs[self.sub_index],), daemon=True).start()
 
+        self.start_control()
         self.main_loop.run()
+
+        self.stop_control()
 
         # Shutdown sequence. A path that ended the loop without stop() must not
         # leave a plane programming the screen, so the teardown is idempotent
@@ -4988,11 +5391,17 @@ def single_instance_lock():
 def main():
     set_language(detect_language())
     if len(sys.argv) < 2:
-        print("usage: kms-play <file>", file=sys.stderr)
+        print("usage: kms-play <file|uri>", file=sys.stderr)
         sys.exit(2)
     single_instance_lock()
-    media_path = os.path.realpath(sys.argv[1])
-    player = Player(media_path)
+    argument = sys.argv[1].strip()
+    if URI_SCHEME.match(argument):
+        # A URI from a UPnP server: http://, https://, upnp:// or file://.
+        # Handing it to realpath() would turn it into a nonsense local path.
+        media, remote = argument, True
+    else:
+        media, remote = os.path.realpath(argument), False
+    player = Player(media, remote=remote)
     player.run()
 
 
