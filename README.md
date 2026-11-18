@@ -128,6 +128,45 @@ Rules (single screen: the goal is to never programme another CRTC's plane):
 `KMS_PLAY_PLANES_TOOL` overrides the path to the binary (used by
 `kms-play-next`). `KMS_PLAY_PLANES` is the override string above, not a path.
 
+### A blanked screen is woken, not fatal
+
+Idle blanking on this box does not just flip the connector's DPMS property to
+`Off`: the compositor also deactivates the CRTC. The connector stays
+`connected` but has no CRTC, so `kms-planes --select` answers `no connected
+display` and (with `KMS_PLAY_CONNECTOR` pinned) `has no CRTC routed`. Treating
+that as fatal makes the appliance unusable exactly when it matters: a cast
+arrives while the television is off.
+
+`select_planes()` therefore wakes the screen instead of giving up. On those two
+messages it switches to the player's own VT (`kms-vt prepare 4`), because a VT
+switch is what makes the kernel console (fbcon) reprogram the CRTC — no X11, no
+GNOME and no DRM master are needed for that. Measured on the BPI-M7, from
+`crtc=0` / `dpms=Off` to a routed CRTC in half a second:
+
+```
+plane selection: plane-select: no connected display
+display: asleep (connector has no CRTC, DPMS off), waking it on VT4
+display: VT tty4 active, retrying the plane selection
+display: woken, now HDMI-A-1 2560x1440 vrefresh=60
+planes: video 57 (NV15 zpos 4) | sub 69 | osd 75 | crtc 81
+```
+
+The retry is bounded: three attempts about a second apart, then the previous
+message is back, unchanged (`no NV15/NV12 video plane on the connected
+display`). Only an inactive display is retried — a bad `KMS_PLAY_PLANES`
+override or a plane that does not exist still fails at once. The VT taken by
+the wake is the one playback would take anyway, so the cost is one transition
+instead of two, and the VT the viewer came from is remembered *before* the
+switch, so the exit path still returns to the desktop and logs it as such.
+When the screen is already on, nothing changes: the first `--select` answers,
+no wake is attempted, and the startup sequence is exactly as fast as before.
+
+Why not set the connector's DPMS property through DRM? It needs the DRM
+master, which the desktop still holds at this point, and it would not help:
+the CRTC is gone, and no DPMS property can bring a CRTC back. The sysfs route
+is closed too — on this kernel `/sys/class/drm/*/dpms` is read-only even for
+root (`-r--r--r--`, writing returns EACCES). Both were measured, not assumed.
+
 `kms-planes --check` dumps the whole topology this algorithm works on: per
 connector (status, encoder, routed CRTC, mode, vrefresh), per CRTC (id, mode,
 active) and per plane (DRM type, zpos range and immutability, formats,
@@ -605,6 +644,14 @@ These cost real debugging time; do not rediscover them.
   text subtitle tracks (`subrip`, `ass`, `ssa`, `mov_text`, `webvtt`); PGS tracks are skipped.
 * **A suspended board freezes the display pipeline** (1 fps, Cloudflare loops, etc.).
   Sleep must be disabled at the systemd, logind and gsettings levels.
+* **A blanked screen has no CRTC, and `/sys/class/drm/*/dpms` is read-only.** GNOME's
+  idle blanking deactivates the CRTC (`crtc=0`, `dpms=Off`), so plane selection finds
+  no display even though the connector says `connected`. The sysfs knob cannot be
+  written back even by root on this kernel, and DRM's DPMS property needs the master the
+  desktop holds. A VT switch is what reprograms the CRTC; the player does that by itself
+  (`kms-vt prepare`), so a cast to a sleeping screen works. After a VT switch made while
+  the screen was blanked, GNOME sometimes stops blanking again until the session is
+  recreated — that is a mutter state-machine quirk, unrelated to the player.
 * **The login prompt shows up in the letterbox.** The video plane does not fill the
   screen when the film's aspect ratio differs from the mode's: on 2560x1440 a 2.39:1
   film scans out at `crtc-pos=2560x1066+0+187`, so 187 px of the console stay visible

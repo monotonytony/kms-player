@@ -396,6 +396,19 @@ def log(*args):
 # (bad arguments, missing file), so the VT number lives at module level.
 ORIGINAL_VT = [None]
 
+# Set when the plane selection had to wake a blanked screen. Waking takes the
+# console VT (fbcon is what reprograms the CRTC), so switch_vt() must not
+# mistake the player's own VT for the one the viewer came from.
+PRE_SELECT_VT = [None]
+# The graphical session's VT, read before that switch: once the console has
+# moved, logind reports an empty ActiveSession for the seat and the desktop
+# would be mislabelled as a plain console.
+PRE_SELECT_DESKTOP = [None]
+DISPLAY_WOKEN = [False]
+# kms-planes wording for "the connector has no CRTC": an asleep screen, not a
+# missing cable. See wake_display() below.
+ASLEEP_RE = re.compile(r"no connected display|has no CRTC routed")
+
 
 def vt_command(action, vt, text=None):
     """Run kms-vt through the single NOPASSWD rule of /etc/sudoers.d/kms-play.
@@ -444,7 +457,7 @@ def session_vt():
     return int(value) if value.isdigit() else None
 
 
-def return_vt(previous):
+def return_vt(previous, desktop=None):
     """The VT to restore: KMS_PLAY_RETURN_VT, else the desktop, else the VT
     that was active before the player took the screen, else 1.
 
@@ -457,7 +470,8 @@ def return_vt(previous):
         return None
     if setting.isdigit():
         return int(setting)
-    desktop = session_vt()
+    if desktop is None:
+        desktop = session_vt()
     if desktop:
         return desktop
     if previous and str(previous).isdigit():
@@ -522,8 +536,9 @@ def die(message, code=1):
     if ORIGINAL_VT[0]:
         # Same rule as a normal exit: a fatal error must not leave the viewer
         # on a console prompt either.
-        target = return_vt(ORIGINAL_VT[0])
-        desktop = session_vt()
+        desktop = PRE_SELECT_DESKTOP[0] if PRE_SELECT_VT[0] is not None \
+            else session_vt()
+        target = return_vt(ORIGINAL_VT[0], desktop)
         exit_to_vt(target, "desktop" if target is not None and target == desktop
                    else "console", console_text("playback failed: " + message))
     sys.exit(code)
@@ -2359,6 +2374,56 @@ def screen_size():
     return 1920, 1080
 
 
+def wake_display():
+    """Turn a blanked screen back on by taking the console VT.
+
+    Idle blanking on this box does not just set the connector's DPMS property
+    to Off: the compositor also deactivates the CRTC, so the connector stays
+    `connected` but has no CRTC and kms-planes --select answers "no connected
+    display" (measured: connector crtc=0, dpms=Off). Nothing can be scanned out
+    in that state, and the DRM DPMS property alone would not help because
+    there is no CRTC left to route.
+
+    A VT switch does help, and needs neither X11, nor GNOME, nor the DRM
+    master: as soon as a text VT becomes active the kernel console (fbcon)
+    takes the display and reprograms the CRTC (measured: crtc=81, dpms=On
+    within ~1 s of a single `chvt 4`). The player keeps that VT - it switches
+    to it anyway right after - so waking costs one VT transition, not a round
+    trip that would flash the desktop twice.
+
+    PRE_SELECT_VT remembers where the viewer was before the wake, so
+    switch_vt() and the exit path still return to the desktop VT."""
+    if PRE_SELECT_VT[0] is None:
+        PRE_SELECT_VT[0] = active_vt()
+        PRE_SELECT_DESKTOP[0] = session_vt()
+    log("display: asleep (connector has no CRTC, DPMS off), waking it"
+        " on VT%s" % PLAYER_VT)
+    result = vt_command("prepare", PLAYER_VT)
+    if result.returncode != 0:
+        log("display: wake failed:", (result.stderr or "").strip(),
+            "- is the sudoers rule installed?")
+        return False
+    want = "tty" + PLAYER_VT
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            if open(ACTIVE_VT_PATH).read().strip() == want:
+                break
+        except OSError:
+            break
+        time.sleep(0.05)
+    # fbcon programs the mode once the VT is active, a moment after chvt.
+    time.sleep(0.3)
+    log("display: VT", want, "active, retrying the plane selection")
+    DISPLAY_WOKEN[0] = True
+    # The player now holds the console: from here a fatal error must still
+    # return the viewer to the VT they came from (see die/exit_to_vt).
+    SWITCHED_TO_PLAYER_VT[0] = True
+    if PRE_SELECT_VT[0]:
+        ORIGINAL_VT[0] = str(PRE_SELECT_VT[0])
+    return True
+
+
 def select_planes():
     """Ask kms-planes --select for the three planes and their CRTC.
 
@@ -2371,19 +2436,40 @@ def select_planes():
 
     Returns {"video": {...} or None, "sub": ..., "osd": ..., "crtc": int}.
     The video entry is mandatory; sub/osd may be None when the board cannot
-    provide them (degraded operation, logged by kms-planes)."""
+    provide them (degraded operation, logged by kms-planes).
+
+    A blanked screen is retried, not fatal: the first refusal that names an
+    inactive connector triggers wake_display(), then two more selections about
+    a second apart (three in total). Anything else - a bad KMS_PLAY_PLANES
+    override, a missing plane - is reported at once, unchanged."""
     result = {"video": None, "sub": None, "osd": None, "crtc": 0}
-    try:
-        proc = subprocess.run([PLANES_TOOL, "--select"], capture_output=True,
-                              text=True, timeout=5, env=CHILD_ENV)
-    except Exception as exc:
-        log("plane selection: cannot run kms-planes --select:", exc)
-        return result
-    detail = (proc.stderr or "").strip()
-    if detail:
-        log("plane selection:", detail.replace("\n", " | "))
-    if proc.returncode != 0:
-        return result
+    attempts = 3
+    proc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = subprocess.run([PLANES_TOOL, "--select"], capture_output=True,
+                                  text=True, timeout=5, env=CHILD_ENV)
+        except Exception as exc:
+            log("plane selection: cannot run kms-planes --select:", exc)
+            return result
+        detail = (proc.stderr or "").strip()
+        if detail:
+            log("plane selection:", detail.replace("\n", " | "))
+        if proc.returncode == 0:
+            break
+        if not ASLEEP_RE.search(detail):
+            return result           # a real selection error, not a blank screen
+        if attempt == 1:
+            if not wake_display():
+                return result
+        elif attempt < attempts:
+            log("plane selection: display still inactive, retrying"
+                " (%d/%d)" % (attempt, attempts))
+            time.sleep(0.8)
+        else:
+            log("plane selection: display did not come back after %d attempts"
+                % attempts)
+            return result
     for line in proc.stdout.splitlines():
         fields = line.split()
         if not fields:
@@ -3154,6 +3240,17 @@ class Player:
         if not self.planes["video"]:
             die("no NV15/NV12 video plane on the connected display "
                 "(run kms-planes --check)")
+        if DISPLAY_WOKEN[0]:
+            # The banner above was read while the screen was still blanked and
+            # therefore reported the preferred mode, not the live one. Read it
+            # again now that the CRTC is routed again.
+            self.display.update({k: v for k, v in display_info().items()
+                                 if v not in (None, 0)})
+            log("display: woken, now %s %dx%d vrefresh=%s"
+                % (self.display.get("name"),
+                   self.display.get("width") or 0,
+                   self.display.get("height") or 0,
+                   self.display.get("vrefresh")))
         self.video_plane = self.planes["video"]["id"]
         self.video_crtc = self.planes["crtc"]
         log("planes: video %d (%s zpos %d) | sub %s | osd %s | crtc %d"
@@ -3283,14 +3380,23 @@ class Player:
         sudo command allowed here, see /etc/sudoers.d/kms-play) switches,
         clears the screen and hides the cursor in one call."""
         active = active_vt()
-        self.previous_vt = str(active) if active else "1"
+        if PRE_SELECT_VT[0] is not None:
+            # The player already took its VT while waking a blanked screen
+            # (select_planes ran before this), so the current VT is our own
+            # and the one to restore is the one remembered before the wake.
+            self.previous_vt = str(PRE_SELECT_VT[0])
+            log("VT: previous tty%s, taken while waking the display"
+                % self.previous_vt)
+        else:
+            self.previous_vt = str(active) if active else "1"
         ORIGINAL_VT[0] = self.previous_vt
         # Resolved here, at startup, not at exit: this is the state the viewer
         # left behind, and logind could answer differently once the player owns
         # the console. The label says what the target actually is, which
         # matters when KMS_PLAY_RETURN_VT pins a VT.
-        self.return_vt = return_vt(self.previous_vt)
-        desktop = session_vt()
+        desktop = PRE_SELECT_DESKTOP[0] if PRE_SELECT_VT[0] is not None \
+            else session_vt()
+        self.return_vt = return_vt(self.previous_vt, desktop)
         self.return_kind = "desktop" if self.return_vt is not None \
             and self.return_vt == desktop else "console"
         log("VT: previous tty%s, returning to %s (%s)"

@@ -126,6 +126,19 @@ Selection, in order:
    video plane, else one retry with the next `--list-video` candidate, then a
    clear log line (two attempts, no loop).
 
+**A blanked screen is woken, not fatal.** Idle blanking deactivates the CRTC
+(the connector stays `connected`, `crtc=0`, `dpms=Off`), so `--select` answers
+`no connected display`. `select_planes()` recognises that message (and
+`has no CRTC routed`), calls `wake_display()` — `kms-vt prepare 4`, because a
+VT switch is what makes fbcon reprogram the CRTC — then retries: three
+attempts, about a second apart, then the historical fatal message. Any other
+selection error is not retried. `wake_display()` records the VT the viewer came
+from in `PRE_SELECT_VT` and the desktop session's VT in `PRE_SELECT_DESKTOP`
+before switching, so `switch_vt()`/`die()/exit_to_vt()` still restore the
+desktop instead of mistaking the player's own VT for it. DRM's DPMS property is
+not used: it needs the master the desktop holds, and it cannot recreate the
+deactivated CRTC; `/sys/class/drm/*/dpms` is read-only on this kernel.
+
 `kms-planes --check` dumps the topology behind those rules: connectors
 (status, encoder, CRTC, mode, vrefresh), CRTCs (mode, active) and, per plane,
 the DRM type, the zpos range with its immutable flag, the formats and
@@ -388,6 +401,14 @@ So the player returns to the desktop VT (GNOME runs on `tty2` here), resolved
 3. the VT that was active before the player took the screen
    (`/sys/class/tty/tty0/active` read at startup);
 4. `1`.
+
+Step 2 is read **before** the player takes its VT, and also before
+`wake_display()` switches VT: once the console has moved, logind reports an
+empty `ActiveSession` for the seat and the desktop would be mislabelled as a
+plain console. When the screen had to be woken, `PRE_SELECT_VT` supplies
+step 3 and `PRE_SELECT_DESKTOP` supplies step 2, so a wake does not change
+where the viewer lands - the log still says `previous tty2, taken while waking
+the display` and `exit, VT 2 (desktop)`.
 
 At exit, after the planes are released, three guards apply before any
 `chvt`:
