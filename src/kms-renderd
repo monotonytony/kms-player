@@ -1,0 +1,1613 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Thony <monotonytony@users.noreply.github.com>
+
+"""kms-renderd - a minimal UPnP/DLNA MediaRenderer that drives kms-play.
+
+============================================================================
+WHAT THIS IS
+============================================================================
+A Digital Media Renderer (DMR, UPnP AV MediaRenderer:1) with no media server
+side. A control point (BubbleUPnP, VLC, Home Assistant, a TV remote app) sends
+SetAVTransportURI then Play, and this daemon starts the existing KMS player on
+the URI it was given. Pause, Seek, Stop and the volume are forwarded to the
+player's own control socket, so the three-plane zero-copy path, the OSD and the
+subtitle plane are exactly the ones the player already had: this daemon never
+touches DRM, GStreamer or the display mode.
+
+    control point --SSDP/HTTP/SOAP--> kms-renderd --unix socket/JSON--> kms-play-py
+                                                                         |
+                                                              kms-subd + GStreamer
+
+============================================================================
+WHY NOT RYGEL / GMRENDER / UPMPDCLI
+============================================================================
+They own their GStreamer pipeline. Using one would mean giving up the
+zero-copy NV15/NV12 plane (their sink is not kmssink with our plane ids), the
+two ARGB planes that draw subtitles and the OSD, the decode-tier fallback and
+the VT/exit handling - i.e. the whole point of this player. A renderer is a
+small state machine plus two protocols, so it is written here, with the Python
+standard library only: no new dependency, nothing to install.
+
+============================================================================
+SECURITY (READ THIS)
+============================================================================
+UPnP has NO authentication and no transport security: anything that can reach
+the HTTP port or the SSDP socket can start a playback and seek. This daemon
+therefore:
+
+  * accepts SSDP M-SEARCH and HTTP requests only from private, link-local or
+    loopback addresses (10/8, 172.16/12, 192.168/16, 169.254/16, 127/8,
+    fe80::/10, fc00::/7, ::1). A request from a public address is refused and
+    logged.
+  * caps the HTTP body at 64 KiB and refuses chunked/oversized requests.
+  * parses XML with xml.etree only, and rejects any document containing a
+    DOCTYPE or ENTITY declaration, so no external entity is ever resolved.
+  * never writes a file on behalf of a request, and never builds a shell
+    command from a received string: the player is started with an argv list,
+    the URI is one element of that list.
+  * one player at a time, bounded timeouts on every socket, per-request
+    try/except so a malformed request can never kill the daemon.
+
+The port must NEVER be forwarded on the internet. There is nothing to gain and
+everything to lose: a remote attacker could start playback on the screen.
+
+============================================================================
+EVENTING
+============================================================================
+SUBSCRIBE creates a subscription with an SID and answers with a Timeout
+(BubbleUPnP and VLC are satisfied with that; they fall back to polling). This
+version does not send NOTIFY state events: the state machine is small and
+GetTransportInfo/GetPositionInfo are always live.
+
+============================================================================
+USAGE
+============================================================================
+    kms-renderd [--http-port 8200] [--friendly-name NAME] [--player PATH]
+
+Environment: KMS_RENDERD_PLAYER, KMS_RENDERD_CONTROL_SOCKET (same default as
+the player: /run/user/<uid>/kms-play.sock), KMS_RENDERD_HTTP_PORT.
+"""
+
+import argparse
+import hashlib
+import http.server
+import ipaddress
+import json
+import logging
+import os
+import re
+import shlex
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
+
+UID = os.getuid()
+
+# ---------------------------------------------------------------------------
+# Protocol constants
+# ---------------------------------------------------------------------------
+SSDP_ADDR = "239.255.255.250"
+SSDP_PORT = 1900
+SSDP_MAX_AGE = 1800
+SERVER_HEADER = "Linux/6 UPnP/1.0 kms-renderd/1.0"
+
+AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+RCS = "urn:schemas-upnp-org:service:RenderingControl:1"
+CMS = "urn:schemas-upnp-org:service:ConnectionManager:1"
+DEVICE_TYPE = "urn:schemas-upnp-org:device:MediaRenderer:1"
+
+SERVICE_PATHS = {
+    "AVTransport": {"scpd": "/avt/scpd.xml", "control": "/avt/control",
+                    "event": "/avt/event", "type": AVT,
+                    "id": "urn:upnp-org:serviceId:AVTransport"},
+    "RenderingControl": {"scpd": "/rcs/scpd.xml", "control": "/rcs/control",
+                         "event": "/rcs/event", "type": RCS,
+                         "id": "urn:upnp-org:serviceId:RenderingControl"},
+    "ConnectionManager": {"scpd": "/cm/scpd.xml", "control": "/cm/control",
+                          "event": "/cm/event", "type": CMS,
+                          "id": "urn:upnp-org:serviceId:ConnectionManager"},
+}
+PATH_SERVICE = {}
+for _name, _paths in SERVICE_PATHS.items():
+    for _key in ("scpd", "control", "event"):
+        PATH_SERVICE[_paths[_key]] = (_name, _key)
+
+# The protocols a sink announces. Anything the player can decode is fair game;
+# the list is intentionally generous because the renderer does not transcode.
+SINK_PROTOCOL_INFO = "".join(
+    "http-get:*:%s:*," % mime for mime in (
+        "video/mp4", "video/x-matroska", "video/mpeg", "video/mp2t",
+        "video/x-msvideo", "video/webm", "video/quicktime",
+        "video/x-flv", "video/ogg", "video/vnd.dlna.mpeg-tts",
+        "audio/mpeg", "audio/mp4", "audio/flac", "audio/x-flac",
+        "audio/wav", "audio/x-wav", "audio/ogg", "audio/aac",
+        "audio/x-ms-wma", "application/octet-stream"))[:-1]
+
+MAX_BODY = 64 * 1024
+MAX_HEADERS = 100
+
+# Private, link-local and loopback networks: the only sources accepted.
+ALLOWED_NETS = [ipaddress.ip_network(text) for text in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "127.0.0.0/8",
+    "fe80::/10", "fc00::/7", "::1/128")]
+
+log = logging.getLogger("kms-renderd")
+
+
+class UPnPError(Exception):
+    """A SOAP fault with a UPnP error code (701, 402, 718, ...)."""
+
+    def __init__(self, code, description=None):
+        super().__init__(description or ERROR_TEXT.get(code, "Action Failed"))
+        self.code = code
+        self.description = description or ERROR_TEXT.get(code, "Action Failed")
+
+
+ERROR_TEXT = {
+    401: "Invalid Action",
+    402: "Invalid Args",
+    501: "Action Failed",
+    701: "Transition not available",
+    702: "No contents",
+    710: "Seek mode not supported",
+    718: "Invalid InstanceID",
+    720: "Cannot process the request",
+    721: "Resource busy",
+}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def address_allowed(text):
+    """True when an address is private, link-local or loopback.
+
+    IPv4-mapped IPv6 addresses (::ffff:192.168.1.2) are unmapped first. A
+    scope id (fe80::1%eth0) is stripped. Anything unparsable is refused.
+    """
+    try:
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in network for network in ALLOWED_NETS)
+
+
+def hms(seconds):
+    """UPnP time format: H+:MM:SS (hours not zero-padded)."""
+    seconds = max(0, int(round(float(seconds or 0))))
+    return "%d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60,
+                             seconds % 60)
+
+
+def parse_time(text):
+    """Parse 'H:MM:SS', 'HH:MM:SS.mmm', 'MM:SS' or a plain number of seconds."""
+    text = (text or "").strip()
+    if not text:
+        raise UPnPError(402, "empty seek target")
+    if ":" not in text:
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            raise UPnPError(402, "invalid seek target")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise UPnPError(402, "invalid seek target")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError:
+        raise UPnPError(402, "invalid seek target")
+    seconds = 0.0
+    for value in values:
+        seconds = seconds * 60.0 + value
+    return max(0.0, seconds)
+
+
+def local_ipv4_addresses():
+    """Every non-loopback IPv4 address of this host, without a subprocess."""
+    addresses = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.add(info[4][0])
+    except Exception:
+        pass
+    # The address of the default route, found without sending a packet.
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))
+            addresses.add(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    return sorted(address for address in addresses
+                  if not address.startswith("127."))
+
+
+def address_for_peer(peer_ip, fallback="127.0.0.1"):
+    """The local address a peer can reach, best effort.
+
+    Choosing the LOCATION interface by hand is what makes SSDP work on a
+    multi-homed board: the reply must announce the address of the interface
+    that received the M-SEARCH, not an arbitrary one.
+    """
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect((peer_ip, 9))
+            return probe.getsockname()[0]
+        finally:
+            probe.close()
+    except OSError:
+        addresses = local_ipv4_addresses()
+        return addresses[0] if addresses else fallback
+
+
+def parse_headers(lines):
+    headers = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def xml_text(text):
+    return xml_escape(str(text or ""))
+
+
+def soap_envelope(body):
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>%s</s:Body></s:Envelope>" % body)
+
+
+def soap_response(service_type, action, arguments):
+    parts = ['<u:%sResponse xmlns:u="%s">' % (action, service_type)]
+    for name, value in arguments.items():
+        parts.append("<%s>%s</%s>" % (name, xml_text(value), name))
+    parts.append("</u:%sResponse>" % action)
+    return soap_envelope("".join(parts))
+
+
+def soap_fault(code, description):
+    return soap_envelope(
+        "<s:Fault><faultcode>s:Client</faultcode>"
+        "<faultstring>UPnPError</faultstring><detail>"
+        '<UPnPError xmlns="urn:schemas-upnp-org:control-1-0">'
+        "<errorCode>%d</errorCode><errorDescription>%s</errorDescription>"
+        "</UPnPError></detail></s:Fault>" % (code, xml_escape(description)))
+
+
+def parse_soap(data):
+    """Parse a SOAP request body, refusing anything with a DTD.
+
+    xml.etree does not fetch external entities, but an internal entity
+    expansion is still a denial of service vector, and DOCTYPE has no reason
+    to appear in a SOAP action. Refusing it outright is cheaper than reasoning
+    about expat's limits.
+    """
+    text = data.decode("utf-8", "strict")
+    upper = text.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
+        raise ValueError("DOCTYPE/ENTITY refused")
+    root = ET.fromstring(text)
+    body = None
+    for child in root:
+        if child.tag.endswith("}Body") or child.tag == "Body":
+            body = child
+            break
+    if body is None or len(body) == 0:
+        raise ValueError("no SOAP body")
+    action_element = body[0]
+    tag = action_element.tag
+    if "}" in tag:
+        namespace, action = tag.split("}", 1)
+        namespace = namespace[1:]
+    else:
+        namespace, action = "", tag
+    arguments = {}
+    for argument in action_element:
+        name = argument.tag.split("}", 1)[-1]
+        arguments[name] = argument.text if argument.text is not None else ""
+    return namespace, action, arguments
+
+
+# ---------------------------------------------------------------------------
+# Device description and SCPDs
+# ---------------------------------------------------------------------------
+def device_description(udn, friendly_name, model_name):
+    services = []
+    for name in ("AVTransport", "RenderingControl", "ConnectionManager"):
+        paths = SERVICE_PATHS[name]
+        services.append(
+            "<service><serviceType>%s</serviceType>"
+            "<serviceId>%s</serviceId>"
+            "<SCPDURL>%s</SCPDURL><controlURL>%s</controlURL>"
+            "<eventSubURL>%s</eventSubURL></service>"
+            % (paths["type"], paths["id"], paths["scpd"],
+               paths["control"], paths["event"]))
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<root xmlns="urn:schemas-upnp-org:device-1-0" '
+        'xmlns:dlna="urn:schemas-dlna-org:device-1-0">'
+        "<specVersion><major>1</major><minor>0</minor></specVersion>"
+        "<device>"
+        "<deviceType>%s</deviceType>"
+        "<friendlyName>%s</friendlyName>"
+        "<manufacturer>kms-player</manufacturer>"
+        "<manufacturerURL>https://github.com/monotonytony/kms-player</manufacturerURL>"
+        "<modelDescription>KMS three-plane video renderer</modelDescription>"
+        "<modelName>%s</modelName>"
+        "<modelNumber>1</modelNumber>"
+        "<serialNumber>%s</serialNumber>"
+        "<UDN>%s</UDN>"
+        "<dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>"
+        "<serviceList>%s</serviceList>"
+        "</device></root>"
+        % (DEVICE_TYPE, xml_text(friendly_name), xml_text(model_name),
+           xml_text(udn.split(":")[-1][:12]), udn, "".join(services)))
+
+
+def _state_variable(name, data_type, values=None, default=None,
+                    send_events="no"):
+    parts = ['<stateVariable sendEvents="%s"><name>%s</name>'
+             "<dataType>%s</dataType>" % (send_events, name, data_type)]
+    if default is not None:
+        parts.append("<defaultValue>%s</defaultValue>" % xml_text(default))
+    if values:
+        parts.append("<allowedValueList>%s</allowedValueList>"
+                     % "".join("<allowedValue>%s</allowedValue>" % xml_text(v)
+                               for v in values))
+    parts.append("</stateVariable>")
+    return "".join(parts)
+
+
+def _action(name, arguments=()):
+    parts = ["<action><name>%s</name>" % name]
+    if arguments:
+        parts.append("<argumentList>")
+        for arg_name, direction, related in arguments:
+            parts.append(
+                "<argument><name>%s</name><direction>%s</direction>"
+                "<relatedStateVariable>%s</relatedStateVariable></argument>"
+                % (arg_name, direction, related))
+        parts.append("</argumentList>")
+    parts.append("</action>")
+    return "".join(parts)
+
+
+def _scpd(actions, variables):
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<scpd xmlns="urn:schemas-upnp-org:service-1-0">'
+        "<specVersion><major>1</major><minor>0</minor></specVersion>"
+        "<actionList>%s</actionList>"
+        "<serviceStateTable>%s</serviceStateTable>"
+        "</scpd>" % ("".join(actions), "".join(variables)))
+
+
+TRANSPORT_STATES = ("STOPPED", "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING",
+                    "NO_MEDIA_PRESENT")
+
+
+def avtransport_scpd():
+    inst = ("InstanceID", "in", "A_ARG_TYPE_InstanceID")
+    actions = [
+        _action("SetAVTransportURI", [inst,
+                                      ("CurrentURI", "in", "AVTransportURI"),
+                                      ("CurrentURIMetaData", "in",
+                                       "AVTransportURIMetaData")]),
+        _action("SetNextAVTransportURI", [inst,
+                                          ("NextURI", "in", "NextAVTransportURI"),
+                                          ("NextURIMetaData", "in",
+                                           "NextAVTransportURIMetaData")]),
+        _action("GetMediaInfo", [inst,
+                                 ("NrTracks", "out", "NumberOfTracks"),
+                                 ("MediaDuration", "out", "CurrentMediaDuration"),
+                                 ("CurrentURI", "out", "AVTransportURI"),
+                                 ("CurrentURIMetaData", "out",
+                                  "AVTransportURIMetaData"),
+                                 ("NextURI", "out", "NextAVTransportURI"),
+                                 ("NextURIMetaData", "out",
+                                  "NextAVTransportURIMetaData"),
+                                 ("PlayMedium", "out", "PlaybackStorageMedium"),
+                                 ("RecordMedium", "out", "RecordStorageMedium"),
+                                 ("WriteStatus", "out", "RecordMediumWriteStatus")]),
+        _action("GetTransportInfo", [inst,
+                                     ("CurrentTransportState", "out",
+                                      "TransportState"),
+                                     ("CurrentTransportStatus", "out",
+                                      "TransportStatus"),
+                                     ("CurrentSpeed", "out", "TransportPlaySpeed")]),
+        _action("GetPositionInfo", [inst,
+                                    ("Track", "out", "CurrentTrack"),
+                                    ("TrackDuration", "out",
+                                     "CurrentTrackDuration"),
+                                    ("TrackMetaData", "out",
+                                     "CurrentTrackMetaData"),
+                                    ("TrackURI", "out", "CurrentTrackURI"),
+                                    ("RelTime", "out", "RelativeTimePosition"),
+                                    ("AbsTime", "out", "AbsoluteTimePosition"),
+                                    ("RelCount", "out", "RelativeCounterPosition"),
+                                    ("AbsCount", "out", "AbsoluteCounterPosition")]),
+        _action("GetDeviceCapabilities", [inst,
+                                          ("PlayMedia", "out",
+                                           "PossiblePlaybackStorageMedia"),
+                                          ("RecMedia", "out",
+                                           "PossibleRecordStorageMedia"),
+                                          ("RecQualityModes", "out",
+                                           "PossibleRecordQualityModes")]),
+        _action("GetTransportSettings", [inst,
+                                         ("PlayMode", "out", "CurrentPlayMode"),
+                                         ("RecQualityMode", "out",
+                                          "CurrentRecordQualityMode")]),
+        _action("Stop", [inst]),
+        _action("Play", [inst, ("Speed", "in", "TransportPlaySpeed")]),
+        _action("Pause", [inst]),
+        _action("Seek", [inst, ("Unit", "in", "A_ARG_TYPE_SeekMode"),
+                         ("Target", "in", "A_ARG_TYPE_SeekTarget")]),
+        _action("Next", [inst]),
+        _action("Previous", [inst]),
+        _action("GetCurrentTransportActions",
+                [inst, ("Actions", "out", "CurrentTransportActions")]),
+    ]
+    variables = [
+        _state_variable("A_ARG_TYPE_InstanceID", "ui4", default="0"),
+        _state_variable("TransportState", "string", values=TRANSPORT_STATES,
+                        default="STOPPED", send_events="yes"),
+        _state_variable("TransportStatus", "string",
+                        values=("OK", "ERROR_OCCURRED"), default="OK"),
+        _state_variable("PlaybackStorageMedium", "string",
+                        values=("NONE", "NETWORK"), default="NETWORK"),
+        _state_variable("RecordStorageMedium", "string",
+                        values=("NOT_IMPLEMENTED",),
+                        default="NOT_IMPLEMENTED"),
+        _state_variable("PossiblePlaybackStorageMedia", "string",
+                        default="NETWORK"),
+        _state_variable("PossibleRecordStorageMedia", "string",
+                        default="NOT_IMPLEMENTED"),
+        _state_variable("CurrentPlayMode", "string",
+                        values=("NORMAL",), default="NORMAL"),
+        _state_variable("TransportPlaySpeed", "string", values=("1",),
+                        default="1"),
+        _state_variable("RecordMediumWriteStatus", "string",
+                        values=("NOT_IMPLEMENTED",),
+                        default="NOT_IMPLEMENTED"),
+        _state_variable("CurrentRecordQualityMode", "string",
+                        values=("NOT_IMPLEMENTED",),
+                        default="NOT_IMPLEMENTED"),
+        _state_variable("PossibleRecordQualityModes", "string",
+                        default="NOT_IMPLEMENTED"),
+        _state_variable("NumberOfTracks", "ui4", default="0"),
+        _state_variable("CurrentTrack", "ui4", default="0"),
+        _state_variable("CurrentTrackDuration", "string", default="0:00:00"),
+        _state_variable("CurrentMediaDuration", "string", default="0:00:00"),
+        _state_variable("CurrentTrackMetaData", "string", default=""),
+        _state_variable("CurrentTrackURI", "string", default=""),
+        _state_variable("AVTransportURI", "string", default=""),
+        _state_variable("AVTransportURIMetaData", "string", default=""),
+        _state_variable("NextAVTransportURI", "string", default=""),
+        _state_variable("NextAVTransportURIMetaData", "string", default=""),
+        _state_variable("RelativeTimePosition", "string", default="0:00:00"),
+        _state_variable("AbsoluteTimePosition", "string", default="0:00:00"),
+        _state_variable("RelativeCounterPosition", "i4", default="0"),
+        _state_variable("AbsoluteCounterPosition", "i4", default="0"),
+        _state_variable("CurrentTransportActions", "string",
+                        default="Play,Stop,Pause,Seek"),
+        _state_variable("A_ARG_TYPE_SeekMode", "string",
+                        values=("REL_TIME", "ABS_TIME", "TRACK_NR")),
+        _state_variable("A_ARG_TYPE_SeekTarget", "string"),
+        _state_variable("LastChange", "string", send_events="yes"),
+    ]
+    return _scpd(actions, variables)
+
+
+def renderingcontrol_scpd():
+    inst = ("InstanceID", "in", "A_ARG_TYPE_InstanceID")
+    channel = ("Channel", "in", "A_ARG_TYPE_Channel")
+    actions = [
+        _action("ListPresets", [inst,
+                                ("CurrentPresetNameList", "out",
+                                 "PresetNameList")]),
+        _action("SelectPreset", [inst,
+                                 ("PresetName", "in", "A_ARG_TYPE_PresetName")]),
+        _action("GetMute", [inst, channel, ("CurrentMute", "out", "Mute")]),
+        _action("SetMute", [inst, channel, ("DesiredMute", "in", "Mute")]),
+        _action("GetVolume", [inst, channel, ("CurrentVolume", "out", "Volume")]),
+        _action("SetVolume", [inst, channel,
+                              ("DesiredVolume", "in", "Volume")]),
+    ]
+    variables = [
+        _state_variable("A_ARG_TYPE_InstanceID", "ui4", default="0"),
+        _state_variable("A_ARG_TYPE_Channel", "string", values=("Master",),
+                        default="Master"),
+        _state_variable("PresetNameList", "string", default="FactoryDefaults"),
+        _state_variable("A_ARG_TYPE_PresetName", "string",
+                        values=("FactoryDefaults",), default="FactoryDefaults"),
+        _state_variable("Mute", "boolean", default="0", send_events="yes"),
+        _state_variable("Volume", "ui2", default="100",
+                        send_events="yes"),
+        _state_variable("LastChange", "string", send_events="yes"),
+    ]
+    return _scpd(actions, variables)
+
+
+def connectionmanager_scpd():
+    actions = [
+        _action("GetProtocolInfo",
+                [("Source", "out", "SourceProtocolInfo"),
+                 ("Sink", "out", "SinkProtocolInfo")]),
+        _action("GetCurrentConnectionIDs",
+                [("ConnectionIDs", "out", "CurrentConnectionIDs")]),
+        _action("GetCurrentConnectionInfo",
+                [("ConnectionID", "in", "A_ARG_TYPE_ConnectionID"),
+                 ("RcsID", "out", "A_ARG_TYPE_RcsID"),
+                 ("AVTransportID", "out", "A_ARG_TYPE_AVTransportID"),
+                 ("ProtocolInfo", "out", "A_ARG_TYPE_ProtocolInfo"),
+                 ("PeerConnectionManager", "out",
+                  "A_ARG_TYPE_ConnectionManager"),
+                 ("PeerConnectionID", "out", "A_ARG_TYPE_ConnectionID"),
+                 ("Direction", "out", "A_ARG_TYPE_Direction"),
+                 ("Status", "out", "A_ARG_TYPE_ConnectionStatus")]),
+    ]
+    variables = [
+        _state_variable("SourceProtocolInfo", "string", send_events="yes"),
+        _state_variable("SinkProtocolInfo", "string", send_events="yes"),
+        _state_variable("CurrentConnectionIDs", "string", send_events="yes"),
+        _state_variable("A_ARG_TYPE_ConnectionStatus", "string",
+                        values=("OK", "ContentFormatMismatch",
+                                "InsufficientBandwidth", "UnreliableChannel",
+                                "Unknown"), default="OK"),
+        _state_variable("A_ARG_TYPE_ConnectionManager", "string"),
+        _state_variable("A_ARG_TYPE_Direction", "string",
+                        values=("Input", "Output"), default="Input"),
+        _state_variable("A_ARG_TYPE_ProtocolInfo", "string"),
+        _state_variable("A_ARG_TYPE_ConnectionID", "i4"),
+        _state_variable("A_ARG_TYPE_AVTransportID", "i4"),
+        _state_variable("A_ARG_TYPE_RcsID", "i4"),
+    ]
+    return _scpd(actions, variables)
+
+
+# ---------------------------------------------------------------------------
+# Player manager: one player at a time, driven over its unix socket
+# ---------------------------------------------------------------------------
+class PlayerManager:
+    """Owns the single player process and mirrors its state for UPnP.
+
+    Every UPnP query reads the cache in `self`; a background thread refreshes
+    it from the player's control socket every half second. Commands are sent
+    synchronously with a short timeout, so a stuck player never blocks a SOAP
+    reply for longer than that timeout.
+    """
+
+    def __init__(self, control_socket, player_command):
+        self.control_socket = control_socket
+        self.player_command = list(player_command)
+        self.lock = threading.RLock()
+        self.process = None
+        self.uri = ""
+        self.metadata = ""
+        self.next_uri = ""
+        self.next_metadata = ""
+        self.state = "NO_MEDIA_PRESENT"
+        self.status = "OK"
+        self.position = 0.0
+        self.duration = 0.0
+        self.volume = 100
+        self.muted = False
+        self.saved_volume = 100
+        self.audio_tracks = []
+        self.current_audio = 0
+        self.tier = 0
+        self.video = {}
+        self.player_seen = False
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._monitor,
+                                        name="kms-renderd-monitor",
+                                        daemon=True)
+        self.thread.start()
+
+    # -- player process ----------------------------------------------------
+
+    def _spawn(self, uri):
+        command = self.player_command + [uri]
+        environment = dict(os.environ)
+        environment["KMS_PLAY_CTL_SOCK"] = self.control_socket
+        log.info("starting player: %s", " ".join(command))
+        self.process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            env=environment)
+        self.state = "TRANSITIONING"
+        self.position = 0.0
+        self.duration = 0.0
+        self.player_seen = False
+        log.info("player pid %d", self.process.pid)
+
+    def _player_alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def _stop_player(self, wait=4.0):
+        with self.lock:
+            process = self.process
+        if process is None:
+            return
+        if process.poll() is not None:
+            with self.lock:
+                if self.process is process:
+                    self.process = None
+            return
+        try:
+            self._command({"cmd": "stop"}, timeout=2.0, quiet=True)
+        except Exception:
+            pass
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        if process.poll() is None:
+            log.warning("player did not stop in %.1f s, sending SIGTERM", wait)
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and process.poll() is None:
+                time.sleep(0.1)
+        if process.poll() is None:
+            log.warning("player still alive, killing pid %d", process.pid)
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=2.0)
+        except Exception:
+            pass
+        with self.lock:
+            if self.process is process:
+                self.process = None
+
+    # -- control socket ----------------------------------------------------
+
+    def _command(self, request, timeout=2.0, quiet=False):
+        """One JSON request to the player's unix socket, one JSON reply."""
+        if not quiet:
+            log.debug("player <- %s", request)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        try:
+            client.connect(self.control_socket)
+            client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+            data = b""
+            while b"\n" not in data and len(data) < 65536:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        line = data.split(b"\n", 1)[0].strip()
+        if not line:
+            raise OSError("empty reply from the player")
+        reply = json.loads(line.decode("utf-8"))
+        if not quiet:
+            log.debug("player -> %s", reply)
+        return reply
+
+    def _monitor(self):
+        """Refresh the cache, notice a dead player, keep the volume in sync."""
+        while not self.stopping.is_set():
+            try:
+                with self.lock:
+                    alive = self._player_alive()
+                    process = self.process
+                if process is not None and not alive:
+                    code = process.returncode
+                    log.info("player exited (code %s)", code)
+                    with self.lock:
+                        self.process = None
+                        self.state = "STOPPED" if self.uri else "NO_MEDIA_PRESENT"
+                        self.position = 0.0
+                        self.audio_tracks = []
+                        self.current_audio = 0
+                elif alive:
+                    try:
+                        reply = self._command({"cmd": "status"}, timeout=1.5,
+                                              quiet=True)
+                    except Exception:
+                        reply = None
+                    if reply and reply.get("ok"):
+                        push_volume = False
+                        with self.lock:
+                            if not self.player_seen:
+                                self.player_seen = True
+                                push_volume = True
+                                log.info("player ready: state=%s duration=%.1f",
+                                         reply.get("state"), reply.get("duration", 0))
+                            self.position = float(reply.get("position") or 0.0)
+                            duration = float(reply.get("duration") or 0.0)
+                            if duration > 0:
+                                self.duration = duration
+                            self.audio_tracks = reply.get("audio_tracks") or []
+                            self.current_audio = int(reply.get("current_audio") or 0)
+                            self.tier = int(reply.get("tier") or 0)
+                            self.video = reply.get("video") or {}
+                            player_state = reply.get("state")
+                            if player_state == "playing":
+                                self.state = "PLAYING"
+                            elif player_state == "paused":
+                                self.state = "PAUSED_PLAYBACK"
+                            elif player_state in ("starting",):
+                                self.state = "TRANSITIONING"
+                            elif player_state == "stopped":
+                                self.state = "STOPPED"
+                        # The renderer's volume wins over the player's default
+                        # 100 %: push it once the socket answers, outside the
+                        # lock so a slow player cannot block a SOAP reply.
+                        if push_volume:
+                            self._apply_volume()
+            except Exception as exc:
+                log.debug("monitor: %s", exc)
+            self.stopping.wait(0.5)
+
+    def _apply_volume(self):
+        with self.lock:
+            level = 0 if self.muted else self.volume
+        try:
+            self._command({"cmd": "volume", "volume": level}, timeout=1.5,
+                          quiet=True)
+        except Exception as exc:
+            log.debug("volume: %s", exc)
+
+    # -- UPnP commands -----------------------------------------------------
+
+    def set_uri(self, uri, metadata):
+        uri = (uri or "").strip()
+        if not uri:
+            raise UPnPError(402, "empty CurrentURI")
+        scheme = uri.split(":", 1)[0].lower() if ":" in uri else ""
+        if scheme not in ("http", "https", "file", "upnp", "rtsp"):
+            raise UPnPError(402, "unsupported URI scheme: %s" % (scheme or "-"))
+        # A new URI replaces the current transport: stop the player first so
+        # the next Play starts from a clean plane, and so a failed decode does
+        # not leave a zombie behind the new media.
+        with self.lock:
+            playing = self._player_alive()
+        if playing:
+            self._stop_player()
+        with self.lock:
+            self.uri = uri
+            self.metadata = metadata or ""
+            self.state = "STOPPED"
+            self.position = 0.0
+            self.duration = 0.0
+            self.audio_tracks = []
+            self.current_audio = 0
+            self.player_seen = False
+        log.info("SetAVTransportURI: %s", uri)
+
+    def set_next_uri(self, uri, metadata):
+        # Accepted and remembered; this renderer does not chain on EOS.
+        with self.lock:
+            self.next_uri = (uri or "").strip()
+            self.next_metadata = metadata or ""
+        log.info("SetNextAVTransportURI (not chained): %s", uri)
+
+    def play(self):
+        with self.lock:
+            if not self.uri:
+                raise UPnPError(701, "no media set")
+            if self._player_alive():
+                if self.state == "PAUSED_PLAYBACK":
+                    reply = self._command({"cmd": "resume"}, timeout=2.0)
+                    if not reply.get("ok"):
+                        raise UPnPError(701, reply.get("error"))
+                return
+            self._spawn(self.uri)
+
+    def pause(self):
+        with self.lock:
+            if not self._player_alive() or self.state != "PLAYING":
+                raise UPnPError(701, "not playing")
+            reply = self._command({"cmd": "pause"}, timeout=2.0)
+            if not reply.get("ok"):
+                raise UPnPError(701, reply.get("error"))
+            self.state = "PAUSED_PLAYBACK"
+
+    def stop(self):
+        with self.lock:
+            playing = self._player_alive()
+        if playing:
+            self._stop_player()
+        with self.lock:
+            self.state = "STOPPED" if self.uri else "NO_MEDIA_PRESENT"
+            self.position = 0.0
+            self.player_seen = False
+
+    def seek(self, unit, target):
+        unit = (unit or "").strip().upper()
+        if unit not in ("REL_TIME", "ABS_TIME"):
+            raise UPnPError(710, "seek mode %s not supported" % (unit or "-"))
+        position = parse_time(target)
+        with self.lock:
+            if not self._player_alive():
+                raise UPnPError(701, "not playing")
+            reply = self._command({"cmd": "seek", "position": position},
+                                  timeout=3.0)
+            if not reply.get("ok"):
+                raise UPnPError(701, reply.get("error"))
+            self.position = position
+        log.info("seek to %s", hms(position))
+
+    def set_volume(self, percent):
+        try:
+            percent = int(round(float(percent)))
+        except (TypeError, ValueError):
+            raise UPnPError(402, "invalid volume")
+        percent = max(0, min(100, percent))
+        with self.lock:
+            self.volume = percent
+            self.muted = percent == 0
+            playing = self._player_alive()
+        if playing:
+            self._apply_volume()
+        log.info("volume %d %%", percent)
+
+    def get_volume(self):
+        with self.lock:
+            return 0 if self.muted else self.volume
+
+    def set_mute(self, muted):
+        with self.lock:
+            wanted = bool(muted)
+            if wanted == self.muted:
+                return
+            if wanted:
+                self.saved_volume = max(1, self.volume)
+                self.volume = 0
+            else:
+                self.volume = self.saved_volume or 100
+            self.muted = wanted
+            playing = self._player_alive()
+        if playing:
+            self._apply_volume()
+        log.info("mute %s", "on" if muted else "off")
+
+    def get_mute(self):
+        with self.lock:
+            return self.muted
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "state": self.state, "status": self.status,
+                "uri": self.uri, "metadata": self.metadata,
+                "next_uri": self.next_uri,
+                "next_metadata": self.next_metadata,
+                "position": self.position, "duration": self.duration,
+                "volume": self.get_volume(), "muted": self.muted,
+                "audio_tracks": list(self.audio_tracks),
+                "current_audio": self.current_audio, "tier": self.tier,
+                "video": dict(self.video),
+            }
+
+    def shutdown(self):
+        self.stopping.set()
+        with self.lock:
+            alive = self._player_alive()
+        if alive:
+            self._stop_player(wait=3.0)
+
+
+# ---------------------------------------------------------------------------
+# SOAP dispatch
+# ---------------------------------------------------------------------------
+class Renderer:
+    """Stateless view over PlayerManager: one method per UPnP action."""
+
+    def __init__(self, players):
+        self.players = players
+
+    def handle(self, service, action, arguments):
+        handler = getattr(self, "_%s_%s" % (service, action), None)
+        if handler is None:
+            raise UPnPError(401, "unknown action %s" % action)
+        return handler(arguments) or {}
+
+    # -- AVTransport -------------------------------------------------------
+
+    def _AVTransport_SetAVTransportURI(self, args):
+        self.players.set_uri(args.get("CurrentURI"),
+                             args.get("CurrentURIMetaData"))
+        return {}
+
+    def _AVTransport_SetNextAVTransportURI(self, args):
+        self.players.set_next_uri(args.get("NextURI"),
+                                  args.get("NextURIMetaData"))
+        return {}
+
+    def _AVTransport_GetMediaInfo(self, args):
+        state = self.players.snapshot()
+        return {
+            "NrTracks": "1" if state["uri"] else "0",
+            "MediaDuration": hms(state["duration"]),
+            "CurrentURI": state["uri"],
+            "CurrentURIMetaData": state["metadata"],
+            "NextURI": state["next_uri"],
+            "NextURIMetaData": state["next_metadata"],
+            "PlayMedium": "NETWORK" if state["uri"] else "NONE",
+            "RecordMedium": "NOT_IMPLEMENTED",
+            "WriteStatus": "NOT_IMPLEMENTED",
+        }
+
+    def _AVTransport_GetTransportInfo(self, args):
+        state = self.players.snapshot()
+        return {
+            "CurrentTransportState": state["state"],
+            "CurrentTransportStatus": state["status"],
+            "CurrentSpeed": "1",
+        }
+
+    def _AVTransport_GetPositionInfo(self, args):
+        state = self.players.snapshot()
+        return {
+            "Track": "1" if state["uri"] else "0",
+            "TrackDuration": hms(state["duration"]),
+            "TrackMetaData": state["metadata"],
+            "TrackURI": state["uri"],
+            "RelTime": hms(state["position"]),
+            "AbsTime": hms(state["position"]),
+            "RelCount": "2147483647",
+            "AbsCount": "2147483647",
+        }
+
+    def _AVTransport_GetDeviceCapabilities(self, args):
+        return {
+            "PlayMedia": "NETWORK",
+            "RecMedia": "NOT_IMPLEMENTED",
+            "RecQualityModes": "NOT_IMPLEMENTED",
+        }
+
+    def _AVTransport_GetTransportSettings(self, args):
+        return {"PlayMode": "NORMAL", "RecQualityMode": "NOT_IMPLEMENTED"}
+
+    def _AVTransport_GetCurrentTransportActions(self, args):
+        state = self.players.snapshot()["state"]
+        actions = {
+            "STOPPED": "Play,Seek",
+            "PLAYING": "Pause,Stop,Seek",
+            "PAUSED_PLAYBACK": "Play,Stop,Seek",
+            "TRANSITIONING": "Stop",
+            "NO_MEDIA_PRESENT": "",
+        }.get(state, "Play,Stop,Pause,Seek")
+        return {"Actions": actions}
+
+    def _AVTransport_Play(self, args):
+        speed = (args.get("Speed") or "1").strip()
+        if speed not in ("1", "1.0", ""):
+            raise UPnPError(717, "play speed not supported")
+        self.players.play()
+        return {}
+
+    def _AVTransport_Pause(self, args):
+        self.players.pause()
+        return {}
+
+    def _AVTransport_Stop(self, args):
+        self.players.stop()
+        return {}
+
+    def _AVTransport_Seek(self, args):
+        self.players.seek(args.get("Unit"), args.get("Target"))
+        return {}
+
+    def _AVTransport_Next(self, args):
+        raise UPnPError(701, "no next track")
+
+    def _AVTransport_Previous(self, args):
+        raise UPnPError(701, "no previous track")
+
+    # -- RenderingControl --------------------------------------------------
+
+    def _RenderingControl_GetVolume(self, args):
+        return {"CurrentVolume": str(self.players.get_volume())}
+
+    def _RenderingControl_SetVolume(self, args):
+        self.players.set_volume(args.get("DesiredVolume"))
+        return {}
+
+    def _RenderingControl_GetMute(self, args):
+        return {"CurrentMute": "1" if self.players.get_mute() else "0"}
+
+    def _RenderingControl_SetMute(self, args):
+        value = (args.get("DesiredMute") or "").strip().lower()
+        if value not in ("0", "1", "true", "false", "yes", "no"):
+            raise UPnPError(402, "invalid mute value")
+        self.players.set_mute(value in ("1", "true", "yes"))
+        return {}
+
+    def _RenderingControl_ListPresets(self, args):
+        return {"CurrentPresetNameList": "FactoryDefaults"}
+
+    def _RenderingControl_SelectPreset(self, args):
+        name = (args.get("PresetName") or "").strip()
+        if name != "FactoryDefaults":
+            raise UPnPError(701, "unknown preset")
+        return {}
+
+    # -- ConnectionManager -------------------------------------------------
+
+    def _ConnectionManager_GetProtocolInfo(self, args):
+        return {"Source": "", "Sink": SINK_PROTOCOL_INFO}
+
+    def _ConnectionManager_GetCurrentConnectionIDs(self, args):
+        return {"ConnectionIDs": "0"}
+
+    def _ConnectionManager_GetCurrentConnectionInfo(self, args):
+        try:
+            connection = int(args.get("ConnectionID") or 0)
+        except ValueError:
+            raise UPnPError(402, "invalid ConnectionID")
+        if connection != 0:
+            raise UPnPError(706, "invalid connection")
+        return {
+            "RcsID": "0", "AVTransportID": "0", "ProtocolInfo": "",
+            "PeerConnectionManager": "", "PeerConnectionID": "-1",
+            "Direction": "Input", "Status": "OK",
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+class RendererHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "kms-renderd/1.0"
+    sys_version = ""
+
+    # -- plumbing ----------------------------------------------------------
+
+    def log_message(self, fmt, *args):
+        log.debug("%s %s", self.client_address[0], fmt % args)
+
+    def _allowed(self):
+        peer = self.client_address[0]
+        if address_allowed(peer):
+            return True
+        log.warning("refused %s %s from non-private address %s",
+                    self.command, self.path, peer)
+        return False
+
+    def _send(self, status, body=b"", content_type="text/xml; charset=\"utf-8\"",
+              extra_headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        if body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _body(self):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            raise ValueError("chunked requests refused")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("invalid Content-Length")
+        if length < 0:
+            raise ValueError("invalid Content-Length")
+        if length > MAX_BODY:
+            raise OverflowError("body larger than %d bytes" % MAX_BODY)
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            raise ValueError("short body")
+        return body
+
+    # -- GET ---------------------------------------------------------------
+
+    def do_GET(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        path = urllib.parse.urlparse(self.path).path
+        renderer = self.server.renderer
+        if path in ("/", "/description.xml"):
+            body = device_description(self.server.udn, self.server.friendly_name,
+                                      self.server.model_name).encode("utf-8")
+            return self._send(200, body)
+        service = PATH_SERVICE.get(path)
+        if service and service[1] == "scpd":
+            scpd = {
+                "AVTransport": avtransport_scpd,
+                "RenderingControl": renderingcontrol_scpd,
+                "ConnectionManager": connectionmanager_scpd,
+            }[service[0]]()
+            return self._send(200, scpd.encode("utf-8"))
+        log.info("GET %s -> 404", path)
+        return self._send(404, b"not found", "text/plain")
+
+    def do_HEAD(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        self._send(200, b"")
+
+    # -- POST (SOAP) -------------------------------------------------------
+
+    def do_POST(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        path = urllib.parse.urlparse(self.path).path
+        service = PATH_SERVICE.get(path)
+        if not service or service[1] != "control":
+            return self._send(404, b"not found", "text/plain")
+        service_name = service[0]
+        try:
+            body = self._body()
+        except OverflowError as exc:
+            log.warning("refused oversized body from %s: %s",
+                        self.client_address[0], exc)
+            return self._send(413, b"request too large", "text/plain")
+        except ValueError as exc:
+            log.warning("refused malformed request from %s: %s",
+                        self.client_address[0], exc)
+            return self._send(400, b"bad request", "text/plain")
+        try:
+            _namespace, action, arguments = parse_soap(body)
+        except Exception as exc:
+            log.warning("unparsable SOAP from %s: %s",
+                        self.client_address[0], exc)
+            return self._send(400, b"invalid XML", "text/plain")
+        header = (self.headers.get("SOAPAction") or "").strip()
+        if header:
+            header = header.strip('"')
+            if "#" in header:
+                header_service, header_action = header.rsplit("#", 1)
+                if header_action and header_action != action:
+                    log.warning("SOAPAction %s does not match body action %s",
+                                header_action, action)
+                    return self._send(500, soap_fault(
+                        401, "SOAPAction does not match the body").encode("utf-8"))
+                if header_service and header_service != SERVICE_PATHS[service_name]["type"]:
+                    # Some control points stamp the wrong namespace; the URL
+                    # is authoritative. Log it, answer anyway.
+                    log.warning("SOAPAction names %s on the %s endpoint",
+                                header_service, service_name)
+        else:
+            # SOAPAction is mandatory in SOAP 1.1. Accepting the body action
+            # keeps sloppy control points working, but the deviation is
+            # logged: a clean answer beats a 400 the user cannot act on.
+            log.info("SOAP request without SOAPAction from %s, using %s#%s",
+                     self.client_address[0], service_name, action)
+        try:
+            result = self.server.renderer.handle(service_name, action, arguments)
+        except UPnPError as exc:
+            log.info("%s#%s refused: %d %s", service_name, action,
+                     exc.code, exc.description)
+            return self._send(500, soap_fault(exc.code, exc.description)
+                              .encode("utf-8"))
+        except Exception as exc:
+            log.exception("%s#%s failed", service_name, action)
+            return self._send(500, soap_fault(501, str(exc)[:120])
+                              .encode("utf-8"))
+        log.info("%s#%s ok", service_name, action)
+        body = soap_response(SERVICE_PATHS[service_name]["type"], action,
+                             result).encode("utf-8")
+        return self._send(200, body)
+
+    # -- SUBSCRIBE / UNSUBSCRIBE ------------------------------------------
+
+    def _event_target(self):
+        path = urllib.parse.urlparse(self.path).path
+        service = PATH_SERVICE.get(path)
+        if not service or service[1] != "event":
+            return None
+        return service[0]
+
+    def do_SUBSCRIBE(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        service = self._event_target()
+        if service is None:
+            return self._send(404, b"not found", "text/plain")
+        sid = (self.headers.get("SID") or "").strip()
+        timeout = self.headers.get("TIMEOUT") or "Second-1800"
+        if not re.match(r"^(Second-\d+|Second-infinite)$", timeout.strip()):
+            timeout = "Second-1800"
+        if sid:
+            if not self.server.events.renew(sid):
+                return self._send(412, b"unknown subscription", "text/plain")
+            log.info("SUBSCRIBE renew %s", sid)
+            return self._send(200, b"", 'text/xml; charset="utf-8"',
+                              {"SID": sid, "TIMEOUT": timeout})
+        callback = (self.headers.get("CALLBACK") or "").strip()
+        nt = (self.headers.get("NT") or "").strip()
+        if nt != "upnp:event" or not callback.startswith("<"):
+            return self._send(412, b"missing CALLBACK or NT", "text/plain")
+        new_sid = self.server.events.create(service, callback, timeout)
+        log.info("SUBSCRIBE %s %s (%s)", service, new_sid, callback[:80])
+        return self._send(200, b"", 'text/xml; charset="utf-8"',
+                          {"SID": new_sid, "TIMEOUT": timeout})
+
+    def do_UNSUBSCRIBE(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        if self._event_target() is None:
+            return self._send(404, b"not found", "text/plain")
+        sid = (self.headers.get("SID") or "").strip()
+        if not sid or not self.server.events.remove(sid):
+            return self._send(412, b"unknown subscription", "text/plain")
+        log.info("UNSUBSCRIBE %s", sid)
+        return self._send(200)
+
+
+class SubscriptionRegistry:
+    """SIDs only: no NOTIFY is sent, but renewal and removal behave."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items = {}
+
+    def create(self, service, callback, timeout):
+        sid = "uuid:%s" % hashlib.md5(
+            ("%s|%s|%s" % (service, callback, time.time())).encode()).hexdigest()
+        with self.lock:
+            self.items[sid] = {"service": service, "callback": callback,
+                               "timeout": timeout, "created": time.time()}
+        return sid
+
+    def renew(self, sid):
+        with self.lock:
+            return sid in self.items
+
+    def remove(self, sid):
+        with self.lock:
+            return self.items.pop(sid, None) is not None
+
+
+class RendererHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 16
+
+    def handle_error(self, request, client_address):
+        # A malformed request must never take the daemon down: the handler
+        # already answers what it can, this is the last line of defence.
+        log.exception("HTTP handler error from %s", client_address)
+
+
+# ---------------------------------------------------------------------------
+# SSDP
+# ---------------------------------------------------------------------------
+class SSDPServer(threading.Thread):
+    def __init__(self, udn, http_port, friendly_name):
+        super().__init__(name="kms-renderd-ssdp", daemon=True)
+        self.udn = udn
+        self.http_port = http_port
+        self.friendly_name = friendly_name
+        self.stopping = threading.Event()
+        self.socket = None
+        self.interface_addresses = local_ipv4_addresses()
+        self.last_announce = 0.0
+
+    def targets(self):
+        """(NT/ST, USN) pairs this device answers for."""
+        return [
+            ("upnp:rootdevice", "%s::upnp:rootdevice" % self.udn),
+            (self.udn, self.udn),
+            (DEVICE_TYPE, "%s::%s" % (self.udn, DEVICE_TYPE)),
+            (AVT, "%s::%s" % (self.udn, AVT)),
+            (RCS, "%s::%s" % (self.udn, RCS)),
+            (CMS, "%s::%s" % (self.udn, CMS)),
+        ]
+
+    def location(self, peer_ip):
+        return "http://%s:%d/description.xml" % (
+            address_for_peer(peer_ip), self.http_port)
+
+    def _open(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        sock.bind(("", SSDP_PORT))
+        joined = 0
+        for address in self.interface_addresses:
+            try:
+                membership = struct.pack("4s4s", socket.inet_aton(SSDP_ADDR),
+                                         socket.inet_aton(address))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                membership)
+                joined += 1
+            except OSError as exc:
+                log.debug("SSDP: cannot join on %s: %s", address, exc)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+        except OSError:
+            pass
+        sock.settimeout(1.0)
+        log.info("SSDP listening on %s:%d (joined %d interface(s))",
+                 SSDP_ADDR, SSDP_PORT, joined)
+        return sock
+
+    def run(self):
+        try:
+            self.socket = self._open()
+        except OSError as exc:
+            log.error("SSDP: cannot bind %s:%d: %s", SSDP_ADDR, SSDP_PORT, exc)
+            return
+        try:
+            self.announce("alive")
+            self.last_announce = time.monotonic()
+            while not self.stopping.is_set():
+                try:
+                    data, peer = self.socket.recvfrom(4096)
+                except socket.timeout:
+                    data = None
+                except OSError as exc:
+                    log.debug("SSDP recv: %s", exc)
+                    continue
+                if data:
+                    try:
+                        self._handle_datagram(data, peer)
+                    except Exception:
+                        log.exception("SSDP: bad datagram from %s", peer)
+                if time.monotonic() - self.last_announce > SSDP_MAX_AGE / 2:
+                    self.announce("alive")
+                    self.last_announce = time.monotonic()
+        finally:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+
+    def _handle_datagram(self, data, peer):
+        text = data.decode("utf-8", "replace")
+        lines = text.splitlines()
+        if not lines:
+            return
+        if not lines[0].upper().startswith("M-SEARCH"):
+            return
+        headers = parse_headers(lines[1:MAX_HEADERS])
+        man = headers.get("man", "").strip().strip('"').lower()
+        if man != "ssdp:discover":
+            log.debug("SSDP: M-SEARCH without MAN ssdp:discover from %s", peer[0])
+            return
+        if not address_allowed(peer[0]):
+            log.warning("SSDP: M-SEARCH refused from non-private address %s",
+                        peer[0])
+            return
+        requested = headers.get("st", "").strip()
+        if not requested:
+            return
+        if requested == "ssdp:all":
+            self._send_replies(peer, self.targets())
+            return
+        matches = [pair for pair in self.targets() if pair[0] == requested]
+        if matches:
+            self._send_replies(peer, matches)
+        else:
+            log.debug("SSDP: no match for ST %s", requested)
+
+    def _send_replies(self, peer, pairs):
+        location = self.location(peer[0])
+        for st, usn in pairs:
+            reply = (
+                "HTTP/1.1 200 OK\r\n"
+                "CACHE-CONTROL: max-age=%d\r\n"
+                "DATE: %s\r\n"
+                "EXT:\r\n"
+                "LOCATION: %s\r\n"
+                "SERVER: %s\r\n"
+                "ST: %s\r\n"
+                "USN: %s\r\n"
+                "BOOTID.UPNP.ORG: 1\r\n"
+                "CONFIGID.UPNP.ORG: 1\r\n"
+                "\r\n" % (SSDP_MAX_AGE,
+                          time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                        time.gmtime()),
+                          location, SERVER_HEADER, st, usn))
+            try:
+                self.socket.sendto(reply.encode("utf-8"), peer)
+            except OSError as exc:
+                log.debug("SSDP reply to %s failed: %s", peer, exc)
+        log.info("SSDP: answered M-SEARCH from %s (%d entr%s)", peer[0],
+                 len(pairs), "y" if len(pairs) == 1 else "ies")
+
+    def announce(self, kind):
+        """NOTIFY ssdp:alive or ssdp:byebye on every interface."""
+        location = "http://%s:%d/description.xml" % (
+            self.interface_addresses[0] if self.interface_addresses else "127.0.0.1",
+            self.http_port)
+        payloads = []
+        for nt, usn in self.targets():
+            lines = [
+                "NOTIFY * HTTP/1.1",
+                "HOST: %s:%d" % (SSDP_ADDR, SSDP_PORT),
+                "NT: %s" % nt,
+                "NTS: ssdp:%s" % kind,
+                "USN: %s" % usn,
+            ]
+            if kind == "alive":
+                lines += ["CACHE-CONTROL: max-age=%d" % SSDP_MAX_AGE,
+                          "LOCATION: %s" % location,
+                          "SERVER: %s" % SERVER_HEADER,
+                          "BOOTID.UPNP.ORG: 1",
+                          "CONFIGID.UPNP.ORG: 1"]
+            payloads.append(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+        if self.socket is None:
+            return
+        sent = 0
+        for address in self.interface_addresses or ["127.0.0.1"]:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                       socket.inet_aton(address))
+            except OSError:
+                continue
+            for payload in payloads:
+                try:
+                    self.socket.sendto(payload, (SSDP_ADDR, SSDP_PORT))
+                    sent += 1
+                except OSError as exc:
+                    log.debug("SSDP notify via %s: %s", address, exc)
+        log.info("SSDP: %s announced (%d packets)", kind, sent)
+
+    def shutdown(self):
+        self.stopping.set()
+        try:
+            self.announce("byebye")
+        except Exception:
+            log.exception("SSDP: byebye failed")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+DEFAULT_CONTROL_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or ("/run/user/%d" % UID),
+    "kms-play.sock")
+if not os.path.isdir(os.path.dirname(DEFAULT_CONTROL_SOCKET)):
+    DEFAULT_CONTROL_SOCKET = "/tmp/kms-play-%d.sock" % UID
+
+
+def stable_uuid(friendly_name):
+    """A UDN that survives restarts, kept next to the player's cache."""
+    directory = os.path.expanduser("~/.cache/kms-renderd")
+    path = os.path.join(directory, "uuid")
+    try:
+        with open(path) as handle:
+            value = handle.read().strip()
+            if re.match(r"^uuid:[0-9a-f-]{36}$", value):
+                return value
+    except OSError:
+        pass
+    seed = "%s|%s|%s" % (socket.gethostname(), friendly_name, os.uname().machine)
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    value = "uuid:%s-%s-%s-%s-%s" % (digest[:8], digest[8:12], digest[12:16],
+                                    digest[16:20], digest[20:32])
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(value + "\n")
+    except OSError as exc:
+        log.warning("cannot persist the UDN in %s: %s", path, exc)
+    return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Minimal UPnP MediaRenderer driving kms-play")
+    parser.add_argument("--http-port", type=int,
+                        default=int(os.environ.get("KMS_RENDERD_HTTP_PORT",
+                                                   "8200")),
+                        help="HTTP port for description, SOAP and eventing")
+    parser.add_argument("--friendly-name",
+                        default=os.environ.get("KMS_RENDERD_NAME",
+                                               "KMS Player (BPI-M7)"))
+    parser.add_argument("--model-name", default="kms-renderd")
+    parser.add_argument("--player",
+                        default=os.environ.get("KMS_RENDERD_PLAYER",
+                                               "/usr/local/bin/kms-play"),
+                        help="player command, run as '<player> <uri>'")
+    parser.add_argument("--control-socket",
+                        default=os.environ.get("KMS_RENDERD_CONTROL_SOCKET",
+                                               DEFAULT_CONTROL_SOCKET))
+    parser.add_argument("--uuid", default=None,
+                        help="UDN override (default: stable, cached)")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s kms-renderd %(levelname)s %(message)s")
+
+    import shlex
+    player_command = shlex.split(args.player)
+    if not player_command:
+        parser.error("--player is empty")
+
+    udn = args.uuid or stable_uuid(args.friendly_name)
+    if not udn.startswith("uuid:"):
+        udn = "uuid:" + udn
+
+    players = PlayerManager(args.control_socket, player_command)
+    renderer = Renderer(players)
+
+    try:
+        httpd = RendererHTTPServer(("0.0.0.0", args.http_port),
+                                   RendererHTTPRequestHandler)
+    except OSError as exc:
+        log.error("cannot listen on port %d: %s", args.http_port, exc)
+        players.shutdown()
+        return 1
+    httpd.renderer = renderer
+    httpd.udn = udn
+    httpd.friendly_name = args.friendly_name
+    httpd.model_name = args.model_name
+    httpd.events = SubscriptionRegistry()
+
+    ssdp = SSDPServer(udn, args.http_port, args.friendly_name)
+
+    stop = threading.Event()
+
+    def on_signal(signum, _frame):
+        log.info("signal %d, shutting down", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    http_thread = threading.Thread(target=httpd.serve_forever,
+                                   name="kms-renderd-http", daemon=True)
+    http_thread.start()
+    ssdp.start()
+
+    log.info("ready: %s | %s | http://0.0.0.0:%d/description.xml",
+             udn, args.friendly_name, args.http_port)
+    log.info("player command: %s", " ".join(player_command))
+    log.info("player control socket: %s", args.control_socket)
+    log.info("UPnP has no authentication: never expose port %d on the internet",
+             args.http_port)
+
+    while not stop.wait(0.5):
+        pass
+
+    ssdp.shutdown()
+    httpd.shutdown()
+    httpd.server_close()
+    players.shutdown()
+    log.info("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
