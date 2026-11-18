@@ -788,7 +788,10 @@ class PlayerManager:
         if not uri:
             raise UPnPError(402, "empty CurrentURI")
         scheme = uri.split(":", 1)[0].lower() if ":" in uri else ""
-        if scheme not in ("http", "https", "file", "upnp", "rtsp"):
+        # file:// is deliberately not accepted here: a control point is not
+        # allowed to name a path on this machine. The player itself still takes
+        # file:// when it is launched by hand.
+        if scheme not in ("http", "https", "upnp", "rtsp"):
             raise UPnPError(402, "unsupported URI scheme: %s" % (scheme or "-"))
         # A new URI replaces the current transport: stop the player first so
         # the next Play starts from a clean plane, and so a failed decode does

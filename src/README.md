@@ -730,9 +730,10 @@ back to polling — BubbleUPnP and VLC are content with that, and
 ### Lifecycle
 
 1. Idle: SSDP answers, HTTP serves, no player process exists.
-2. `SetAVTransportURI` stores the URL (schemes `http`, `https`, `file`,
-   `upnp`, `rtsp`) and reports `STOPPED`. A URI arriving while a film plays
-   stops the player first.
+2. `SetAVTransportURI` stores the URL (schemes `http`, `https`, `upnp`,
+   `rtsp`; `file://` is refused, a control point must not name a local path)
+   and reports `STOPPED`. A URI arriving while a film plays stops the player
+   first.
 3. `Play` starts `kms-play` with the URL as its only argument. The player
    switches to VT4, builds the three planes and plays; the renderer reports
    `TRANSITIONING` until the bus confirms `PLAYING`.
