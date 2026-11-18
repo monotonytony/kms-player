@@ -3259,8 +3259,11 @@ class Player:
         self.keylayout = KeyLayout()
         self.keyboard = None
         # Set once the pipeline has been asked to play: the control socket
-        # reports "starting" before that and "playing" after it.
+        # reports "starting" before that and "playing" after it. The bus
+        # STATE_CHANGED message sets pipeline_playing, so a control point
+        # never sees PLAYING before the sink really owns the picture.
         self.play_started = False
+        self.pipeline_playing = False
         self.control_server = None
         self.control_stop_event = None
 
@@ -3517,6 +3520,7 @@ class Player:
         # the first audio stream is the default selection again.
         self.stream_ids = {"video": [], "audio": [], "text": []}
         self.audio_active = 0
+        self.pipeline_playing = False
         pipeline.set_property("uri", self.uri)
         # GST_PLAY_FLAG_VIDEO = 1, GST_PLAY_FLAG_AUDIO = 2, GST_PLAY_FLAG_TEXT = 4,
         # GST_PLAY_FLAG_SOFT_VOLUME = 0x10, GST_PLAY_FLAG_NATIVE_VIDEO = 0x40,
@@ -4897,6 +4901,8 @@ class Player:
             _old, new, _pending = message.parse_state_changed()
             if new in (Gst.State.PLAYING, Gst.State.PAUSED):
                 log("pipeline state:", new.value_nick)
+            if new == Gst.State.PLAYING:
+                self.pipeline_playing = True
 
     def _on_stream_collection(self, message):
         """Remember the stream ids playbin3 exposes, for select-streams.
@@ -5043,10 +5049,18 @@ class Player:
     # -- control socket (kms-renderd) --------------------------------------
 
     def transport_state(self):
-        """One word for the control socket, mapped to UPnP by the caller."""
+        """One word for the control socket, mapped to UPnP by the caller.
+
+        "starting" covers the window between set_state(PLAYING) and the bus
+        confirming PLAYING: the pipeline has been asked to play but may still
+        be prerolling, and a control point that seeks during that window gets
+        a refused seek. Reporting TRANSITIONING there is both honest and what
+        makes a client wait half a second instead of failing."""
         if self.finished:
             return "stopped"
         if self.pipeline is None or not self.play_started:
+            return "starting"
+        if not self.pipeline_playing:
             return "starting"
         if self.paused:
             return "paused"
@@ -5160,8 +5174,11 @@ class Player:
         main loop, which owns the pipeline. A malformed request is answered,
         never raised, so a broken client cannot take the player down."""
         while not self.control_stop_event.is_set() and not self.finished:
+            server = self.control_server
+            if server is None:
+                break
             try:
-                connection, _address = self.control_server.accept()
+                connection, _address = server.accept()
             except socket.timeout:
                 continue
             except OSError:

@@ -854,10 +854,23 @@ class PlayerManager:
         with self.lock:
             if not self._player_alive():
                 raise UPnPError(701, "not playing")
+        # A control point often seeks the instant it sees PLAYING. The player
+        # reports PLAYING only once the bus confirms it, but the sink may
+        # still be prerolling for a fraction of a second; a refused seek is
+        # retried briefly instead of surfacing as a 701.
+        reply = None
+        for attempt in range(4):
             reply = self._command({"cmd": "seek", "position": position},
                                   timeout=3.0)
             if not reply.get("ok"):
-                raise UPnPError(701, reply.get("error"))
+                raise UPnPError(701, reply.get("error") or "seek refused")
+            if reply.get("accepted", True):
+                break
+            log.debug("seek refused by the player, retry %d", attempt + 1)
+            time.sleep(0.4)
+        else:
+            raise UPnPError(701, "the pipeline refused the seek")
+        with self.lock:
             self.position = position
         log.info("seek to %s", hms(position))
 
@@ -934,6 +947,19 @@ class Renderer:
         handler = getattr(self, "_%s_%s" % (service, action), None)
         if handler is None:
             raise UPnPError(401, "unknown action %s" % action)
+        # UPnP AV defines exactly one instance per renderer; anything else is
+        # 718. Checked here rather than in every action so no handler can
+        # forget it.
+        if service in ("AVTransport", "RenderingControl"):
+            instance = arguments.get("InstanceID")
+            if instance is None:
+                raise UPnPError(402, "missing InstanceID")
+            try:
+                instance = int(str(instance).strip())
+            except ValueError:
+                raise UPnPError(718, "invalid InstanceID")
+            if instance != 0:
+                raise UPnPError(718, "invalid InstanceID")
         return handler(arguments) or {}
 
     # -- AVTransport -------------------------------------------------------
@@ -1444,26 +1470,11 @@ class SSDPServer(threading.Thread):
                  len(pairs), "y" if len(pairs) == 1 else "ies")
 
     def announce(self, kind):
-        """NOTIFY ssdp:alive or ssdp:byebye on every interface."""
-        location = "http://%s:%d/description.xml" % (
-            self.interface_addresses[0] if self.interface_addresses else "127.0.0.1",
-            self.http_port)
-        payloads = []
-        for nt, usn in self.targets():
-            lines = [
-                "NOTIFY * HTTP/1.1",
-                "HOST: %s:%d" % (SSDP_ADDR, SSDP_PORT),
-                "NT: %s" % nt,
-                "NTS: ssdp:%s" % kind,
-                "USN: %s" % usn,
-            ]
-            if kind == "alive":
-                lines += ["CACHE-CONTROL: max-age=%d" % SSDP_MAX_AGE,
-                          "LOCATION: %s" % location,
-                          "SERVER: %s" % SERVER_HEADER,
-                          "BOOTID.UPNP.ORG: 1",
-                          "CONFIGID.UPNP.ORG: 1"]
-            payloads.append(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+        """NOTIFY ssdp:alive or ssdp:byebye on every interface.
+
+        One LOCATION per interface, not one for the whole host: a multi-homed
+        board must announce an address that the interface it sends on can
+        actually reach, or a client on the other LAN gets an unreachable URL."""
         if self.socket is None:
             return
         sent = 0
@@ -1473,7 +1484,22 @@ class SSDPServer(threading.Thread):
                                        socket.inet_aton(address))
             except OSError:
                 continue
-            for payload in payloads:
+            location = "http://%s:%d/description.xml" % (address, self.http_port)
+            for nt, usn in self.targets():
+                lines = [
+                    "NOTIFY * HTTP/1.1",
+                    "HOST: %s:%d" % (SSDP_ADDR, SSDP_PORT),
+                    "NT: %s" % nt,
+                    "NTS: ssdp:%s" % kind,
+                    "USN: %s" % usn,
+                ]
+                if kind == "alive":
+                    lines += ["CACHE-CONTROL: max-age=%d" % SSDP_MAX_AGE,
+                              "LOCATION: %s" % location,
+                              "SERVER: %s" % SERVER_HEADER,
+                              "BOOTID.UPNP.ORG: 1",
+                              "CONFIGID.UPNP.ORG: 1"]
+                payload = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
                 try:
                     self.socket.sendto(payload, (SSDP_ADDR, SSDP_PORT))
                     sent += 1
