@@ -1,0 +1,41 @@
+[Unit]
+# UPnP/DLNA MediaRenderer for the KMS player.
+#
+# This is a USER unit: the player must run as the desktop user, because root's
+# XDG_RUNTIME_DIR and PipeWire session are not the ones the audio sink needs.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp kms-renderd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kms-renderd.service
+#   loginctl enable-linger armbian     # optional: start at boot, no login
+#
+# For a system unit instead, add User=armbian and
+# Environment=XDG_RUNTIME_DIR=/run/user/1000 (plus DBUS_SESSION_BUS_ADDRESS if
+# the session bus is needed); a user unit is preferred.
+Description=UPnP/DLNA MediaRenderer driving the KMS player
+Documentation=file:/usr/local/share/doc/kms-player/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --player defaults to /usr/local/bin/kms-play (the LD_PRELOAD wrapper).
+# --control-socket defaults to /run/user/<uid>/kms-play.sock, the same path
+# the player uses.
+ExecStart=/usr/local/bin/kms-renderd --http-port 8200 --friendly-name "KMS Player (BPI-M7)"
+Restart=on-failure
+RestartSec=3
+# A renderer that dies must be restarted, but not in a tight loop: a missing
+# player binary is a configuration error, not a transient failure.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# The player is started as a child and needs no privileges beyond the
+# existing sudo -n rule for /usr/local/sbin/kms-vt (installed separately by
+# the player's own install.sh). No new capability is granted here.
+NoNewPrivileges=no
+PrivateTmp=no
+
+[Install]
+WantedBy=default.target

@@ -67,6 +67,8 @@ the original VT on exit.
 | `kms-play` | Launcher: sets `LD_PRELOAD` and `KMS_SHARE_SOCK` and runs the installed player. |
 | `kms-play-next` | Same, but runs everything from this source directory (used for testing before installing). |
 | `install.sh` | Copies the compiled binaries and scripts to `/usr/local/bin` after a backup. |
+| `kms-renderd` | UPnP/DLNA MediaRenderer: SSDP, description, SOAP and eventing, in the standard library only. Drives the player over its Unix control socket; never touches DRM or GStreamer. See "UPnP/DLNA renderer" below. |
+| `kms-renderd.service` | systemd **user** unit for the renderer. |
 | `Makefile` | Builds every C component and the shim, and checks that licence headers are present. |
 
 ### Subtitle and OSD planes
@@ -649,6 +651,9 @@ cc -O2 -Wall -Wextra -fPIC -shared -o libkmsshare.so kmsshare.c -ldl
 # installed version
 kms-play /path/to/movie.mkv
 
+# a remote stream (UPnP hands out http:// URLs); subtitles are skipped
+kms-play http://192.168.10.14:8000/film.mp4
+
 # test the sources in this directory without installing
 ./kms-play-next /path/to/movie.mkv
 ```
@@ -665,6 +670,233 @@ sudo make install          # builds, then runs install.sh and installs libkmssha
 `install.sh` backs the previous binaries up to `/root/gst-hevc-patch-<date>/`
 first: on this board the player is the only way to watch a film, so every
 install must be reversible by hand.
+
+---
+
+## UPnP/DLNA renderer: `kms-renderd`
+
+`kms-renderd` is a Digital Media Renderer (DMR, `MediaRenderer:1`). A phone, a
+TV app or Home Assistant lists it in the "play on" menu, sends a URL, and the
+film starts on the three planes exactly as if it had been launched from the
+console. It renders only: there is no media server, no library browsing and no
+transcoding.
+
+```
+control point --SSDP / HTTP / SOAP--> kms-renderd --unix socket, JSON--> kms-play-py
+                                                                          |
+                                                              kms-subd (DRM master)
+                                                              GStreamer -> kmssink
+```
+
+### Why not Rygel, gmrender-resurrect or upmpdcli
+
+They own their GStreamer pipeline. Using one would drop the zero-copy
+NV15/NV12 plane (their sink is not `kmssink` with our plane ids), the two ARGB
+planes that draw the subtitles and the OSD, the decode-tier fallback and the
+VT/exit handling — i.e. the whole point of this player. A renderer is a state
+machine plus two protocols, so it is written here with the Python standard
+library only: no new dependency, nothing to install, and the player stays the
+only thing that touches DRM.
+
+### What the renderer implements
+
+| Endpoint | Role |
+|---|---|
+| `/description.xml` | device description: `MediaRenderer:1`, three services, `DMR-1.50` |
+| `/avt/scpd.xml`, `/avt/control`, `/avt/event` | AVTransport |
+| `/rcs/scpd.xml`, `/rcs/control`, `/rcs/event` | RenderingControl |
+| `/cm/scpd.xml`, `/cm/control`, `/cm/event` | ConnectionManager |
+| UDP 1900 | SSDP: `M-SEARCH` answers, `NOTIFY ssdp:alive` at start and every `max-age/2`, `ssdp:byebye` on exit |
+
+AVTransport: `SetAVTransportURI`, `SetNextAVTransportURI` (stored, not
+chained), `Play`, `Pause`, `Stop`, `Seek` (`REL_TIME`/`ABS_TIME`), `Next`,
+`Previous`, `GetTransportInfo`, `GetPositionInfo`, `GetMediaInfo`,
+`GetDeviceCapabilities`, `GetTransportSettings`,
+`GetCurrentTransportActions`.
+RenderingControl: `GetVolume`, `SetVolume`, `GetMute`, `SetMute`,
+`ListPresets`, `SelectPreset`.
+ConnectionManager: `GetProtocolInfo`, `GetCurrentConnectionIDs`,
+`GetCurrentConnectionInfo`.
+
+Failures use the UPnP fault form with `701` (transition not available), `402`
+(invalid args), `710` (seek mode not supported), `718` (invalid InstanceID),
+`401` (invalid action) and `717` (play speed not supported).
+
+Eventing answers `SUBSCRIBE` with a SID and a `Timeout` and accepts renewal
+and `UNSUBSCRIBE`; it does not send `NOTIFY` state events yet, so clients fall
+back to polling — BubbleUPnP and VLC are content with that, and
+`GetTransportInfo`/`GetPositionInfo` are always live.
+
+### Lifecycle
+
+1. Idle: SSDP answers, HTTP serves, no player process exists.
+2. `SetAVTransportURI` stores the URL (schemes `http`, `https`, `file`,
+   `upnp`, `rtsp`) and reports `STOPPED`. A URI arriving while a film plays
+   stops the player first.
+3. `Play` starts `kms-play` with the URL as its only argument. The player
+   switches to VT4, builds the three planes and plays; the renderer reports
+   `TRANSITIONING` until the bus confirms `PLAYING`.
+4. `Pause`, `Seek`, `SetVolume` and `SetMute` are forwarded to the player's
+   Unix control socket. State and position are polled there every 0.5 s, so
+   `GetPositionInfo` is live to half a second.
+5. `Stop`, end of stream or a decode error: the player tears its planes down
+   and exits to the desktop VT; the renderer reports `STOPPED` and stays in
+   the idle state. A player killed from outside is detected the same way.
+
+### The control socket (player side)
+
+`kms-play-py` listens on a Unix socket, by default
+`/run/user/<uid>/kms-play.sock` (override: `KMS_PLAY_CTL_SOCK`), mode `0600`,
+created at start and unlinked at exit. One JSON request per line, one JSON
+reply per line:
+
+```json
+{"cmd": "status"}
+{"ok": true, "state": "playing", "position": 12.4, "duration": 1452.0,
+ "volume": 100, "muted": false, "audio_tracks": [{"index": 0, "label": "English"}],
+ "current_audio": 0, "uri": "http://…", "tier": 1,
+ "video": {"width": 3840, "height": 2160, "drm_format": "NV15", "memory": "DMABuf"}}
+```
+
+Commands: `status`, `play`, `pause`, `resume`, `stop`, `seek`
+(`{"position": seconds}`), `volume` (`{"volume": 0..100}`), `audio_track`
+(`{"index": n}`), `quit`. Every request is marshalled onto the GLib main
+loop, which owns GStreamer; the socket thread never calls the pipeline. The
+socket is also usable by hand:
+
+```sh
+printf '{"cmd":"status"}\n' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/kms-play.sock
+```
+
+### Security model
+
+UPnP has **no authentication and no transport security**: anything that can
+reach the HTTP port or the SSDP socket can start a playback and seek. The
+daemon bounds the surface instead of pretending to secure it:
+
+* **Source filtering.** SSDP `M-SEARCH` and every HTTP method are accepted
+  only from private, link-local and loopback addresses (`10/8`, `172.16/12`,
+  `192.168/16`, `169.254/16`, `127/8`, `fe80::/10`, `fc00::/7`, `::1`),
+  IPv4-mapped IPv6 included. Anything else is refused and logged.
+* **Bounded input.** HTTP bodies are capped at 64 KiB, chunked requests are
+  refused, and a request with a bad `Content-Length` is a 400.
+* **Hardened XML.** `xml.etree` only; any document containing `DOCTYPE` or
+  `ENTITY` is rejected before parsing, so no external entity is resolved and
+  no entity expansion can be used as a bomb.
+* **No writes, no shell.** No file is written on behalf of a request and no
+  shell command is built from a received string: the player is started with an
+  argv list, the URI is one element of it.
+* **One player.** A single process at a time, owned by the renderer; its
+  stdin/stdout/stderr are not connected to the network.
+* **Timeouts and isolation.** Every socket has a timeout and every request a
+  `try/except`: a malformed request is answered, never fatal.
+* **The port must never be forwarded on the internet.** There is nothing to
+  gain and everything to lose: a remote attacker could start playback on the
+  screen. If the renderer must be reachable from another VLAN, put an
+  authenticated reverse proxy in front of it or restrict it with firewall
+  rules; do not expose it.
+
+### Install
+
+`kms-renderd` is a user service: the player must run as the desktop user,
+because root's `XDG_RUNTIME_DIR` and PipeWire session are not the ones the
+audio sink needs.
+
+```sh
+sudo install -m 0755 src/kms-renderd /usr/local/bin/kms-renderd
+mkdir -p ~/.config/systemd/user
+cp src/kms-renderd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now kms-renderd.service
+# optional: start at boot without a login session
+loginctl enable-linger armbian
+```
+
+Options: `--http-port` (default 8200), `--friendly-name`, `--player` (default
+`/usr/local/bin/kms-play`), `--control-socket` (default
+`/run/user/<uid>/kms-play.sock`), `--uuid`, `--log-level`. The environment
+variables `KMS_RENDERD_HTTP_PORT`, `KMS_RENDERD_NAME`, `KMS_RENDERD_PLAYER`
+and `KMS_RENDERD_CONTROL_SOCKET` do the same. The UDN is stable: it is cached
+in `~/.cache/kms-renderd/uuid`, so clients keep recognising the renderer
+across restarts.
+
+The player's own `install.sh` still provides `/usr/local/sbin/kms-vt` and its
+`sudo -n` rule; the renderer needs nothing else.
+
+### Verifying it from another machine
+
+```sh
+# 1. SSDP: the renderer must answer with a LOCATION on the board's address
+python3 - <<'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n'
+         b'MAN: "ssdp:discover"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n',
+         ("239.255.255.250", 1900))
+print(s.recvfrom(4096)[0].decode())
+EOF
+
+# 2. description and SCPDs
+curl -s http://192.168.10.14:8200/description.xml | head -30
+
+# 3. a full playback, with curl
+curl -s -X POST http://192.168.10.14:8200/avt/control \
+  -H 'Content-Type: text/xml; charset="utf-8"' \
+  -H 'SOAPAction: "urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI"' \
+  --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><CurrentURI>http://192.168.10.14:8000/film.mp4</CurrentURI><CurrentURIMetaData></CurrentURIMetaData></u:SetAVTransportURI></s:Body></s:Envelope>'
+```
+
+Then `Play`, and watch `~/.cache/kms-play/last.log`: it must show
+`decode tier: hardware`, `video caps: … memory=DMABuf` and the plane ids.
+`kms-planes --short` must show `fb=0` on every plane after `Stop`, and the
+active VT must be back on the desktop (`cat /sys/class/tty/tty0/active`).
+
+Measured on the BPI-M7 (19/11/2026), 4K HEVC 10-bit and 4K H.264, both served
+over HTTP with Range support:
+
+| Check | Result |
+|---|---|
+| M-SEARCH / `description.xml` / three SCPDs | answered, valid XML |
+| `SetAVTransportURI` + `Play` | `STOPPED` → `TRANSITIONING` → `PLAYING` |
+| decode tier / caps | `hardware`, `format=DMA_DRM memory=DMABuf 3840x2160` |
+| `Pause` | position identical 2 s apart |
+| `Seek` 10 s | applied in 16 ms, position 0:00:12 afterwards |
+| `SetVolume 42` / `GetVolume` | 42, software gain applied to the pipeline |
+| `Stop` | planes `fb=0`, VT back to `tty2`, no player process |
+| dead URI | `STOPPED`, no zombie player, daemon alive |
+| body > 64 KiB / invalid XML / DOCTYPE | 413 / 400 / 400, daemon alive |
+
+### Known limits
+
+* **No authentication**: see the security model; private networks only.
+* **No eventing NOTIFY**: subscriptions exist, state is polled by clients.
+* **No media server**: the renderer cannot browse a library; the control point
+  supplies the URL.
+* **No transcoding**: `SinkProtocolInfo` lists what GStreamer can decode. A
+  server that only offers an unsupported codec will fail, as it would from
+  the console.
+* **Range support is required** for MP4 files whose `moov` atom is at the end
+  (most non-faststart files): qtdemux seeks to the tail to read the index.
+  Measured failure with `python3 -m http.server`, which ignores `Range`:
+  `no 'moov' atom within the first 10 MB`. Real DLNA servers (Jellyfin,
+  MiniDLNA, Plex) support ranges.
+* **Embedded subtitles of a remote stream are skipped**, not extracted: a
+  second download for a side file would stall the film. Local files keep the
+  full subtitle path; remote streams log `subtitles: N embedded track(s)
+  ignored for a remote stream`.
+* **`NextAVTransportURI` is stored but not chained** at end of stream; playback
+  stops and the renderer reports `STOPPED`.
+* **One player, one transport.** A second `SetAVTransportURI` stops the first.
+* **`Seek` supports `REL_TIME` and `ABS_TIME` only**; `TRACK_NR` is refused
+  with `710`. The target is clamped to `duration - 0.25 s`, so seeking to the
+  very end stops playback rather than hanging on a frozen frame.
+* **Volume is the player's software gain** (0–100 %, 0 = silence), independent
+  from the PipeWire sink volume used by the multimedia keys; mute remembers
+  the previous level.
+* **Position resolution is 0.5 s** (monitor poll), which is finer than the
+  `H:MM:SS` UPnP time format can express.
+* **SSDP needs UDP 1900**; if another SSDP daemon already owns it without
+  `SO_REUSEPORT`, the renderer logs the bind failure and HTTP still works.
 
 ---
 

@@ -78,6 +78,7 @@ Result: one master, three writers, no tearing, no extra copies.
 | `kms-vt` | shell | Prepares the console VT: switch, clear, hide cursor; restores it on exit. The only command the player runs through sudo. |
 | `kms-planes` | C | Diagnostic: lists every plane (formats, zpos, alpha, attached framebuffer) and every connector with its live mode and refresh rate. |
 | `kms-inject` | C (`uinput`) | Diagnostic: injects synthetic key events, used to measure input latency. |
+| `kms-renderd` | Python (stdlib only) | Optional UPnP/DLNA MediaRenderer. A phone sends SetAVTransportURI + Play, the renderer starts the player on that URL and forwards pause/seek/volume/stop over a Unix control socket. |
 
 ## Plane selection
 
@@ -543,6 +544,31 @@ you came from (never to VT4, which has no getty — you would land on a blank sc
 Logs go to `~/.cache/kms-play/last.log` and record every decision the player makes:
 which planes were selected, which subtitle track was used, every seek, every track change.
 
+A URI is accepted as well as a path: anything with a scheme (`http://`, `https://`,
+`file://`, `upnp://`) goes to GStreamer untouched. Embedded subtitles of a remote
+stream are logged and skipped.
+
+## Playback from a phone: UPnP/DLNA
+
+`kms-renderd` makes the board appear in the "play on" list of BubbleUPnP, VLC or a TV
+app. It is a renderer only (no library, no transcoding): the control point sends a URL,
+the renderer starts `kms-play` with it and forwards pause, seek, volume and stop through
+a Unix control socket — the three planes, the OSD and the subtitle path are untouched.
+
+```sh
+sudo install -m 0755 src/kms-renderd /usr/local/bin/kms-renderd
+mkdir -p ~/.config/systemd/user
+cp src/kms-renderd.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now kms-renderd
+```
+
+The renderer accepts SSDP and HTTP requests from private and link-local addresses only,
+caps bodies at 64 KiB, refuses DOCTYPEs, never writes a file and never builds a shell
+command from a request. **UPnP has no authentication: never expose port 8200 on the
+internet.** Architecture, the action list, the control-socket protocol and the known
+limits (no eventing NOTIFY, Range support required for non-faststart MP4, remote
+subtitles skipped) are in [`src/README.md`](src/README.md#upnpdlna-renderer-kms-renderd).
+
 ## Testing
 
 The player is designed to be verified **without a screen**, because that is how it was
@@ -618,6 +644,7 @@ for every codec. Verified on the board with the 4K H.264 film and the three 4K s
 | Seek ±60 s, pause/resume | seek 13-77 ms, pause and resume clean, subtitles re-sync on their own plane |
 | End of stream | clean EOS, planes released, desktop returned |
 | Software tier | `I420` in system memory, audio and track change still work, resume seek deferred to the first frame |
+| UPnP renderer, 4K HEVC 10-bit and 4K H.264 over HTTP | `hardware`, `DMA_DRM`/`DMABuf`, 3840x2160; Play → Pause (position stable) → Seek 10 s (16 ms) → SetVolume → Stop with `fb=0` on every plane and VT back to `tty2` |
 
 All seven Jellyfin samples are **video-only** (no audio stream at all): they play,
 seek, pause and reach EOS with `audio_buffers=0`, which is the correct value there, not
