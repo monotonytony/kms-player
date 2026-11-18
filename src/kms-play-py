@@ -45,11 +45,9 @@ tier 2 rebuilds the same route with force-sw-decoders, hardware decoders
 demoted to rank NONE and "videoconvert ! kmssink", then seeks back to the
 position reached. One attempt: a second failure stops with a clear message.
 
-playbin3 is the single playback route since 2026-11-18: its decodebin3
-negotiates DMABuf output with kmssink for every codec this board decodes,
-including the stateless H.264 decoder. The old hand-linked uridecodebin3
-route stays reachable with KMS_PLAY_STRATEGY=uridecodebin, for comparisons
-only (it exposes a single audio pad, and select-streams tears it down).
+playbin3 is the single playback route: its decodebin3 negotiates DMABuf
+output with kmssink for every codec this board decodes, including the
+stateless H.264 decoder. There is no second route to keep in step.
 
 ============================================================================
 STARTUP BANNER
@@ -300,11 +298,8 @@ AUDIO_SWITCH_SELFTEST = os.environ.get("KMS_PLAY_AUDIO_SELFTEST") == "1"
 PLAYBIN3_FLAGS = 0x1 | 0x2 | 0x4 | 0x10 | 0x40
 #
 # A playbin3 route never reaches PLAYING? The watchdog below falls back.
-# The manual uridecodebin3 route (build_pipeline_uridecodebin) is no longer
-# taken automatically: it exposes one audio pad and select-streams tears it
-# down, so a track change was a rebuild. It remains reachable with
-# KMS_PLAY_STRATEGY=uridecodebin, as a comparison tool. KMS_PLAY_STRATEGY=
-# playbin forces the legacy playbin, to check that fallback by hand.
+# KMS_PLAY_STRATEGY=playbin forces the legacy playbin, to check that fallback
+# by hand on a GStreamer that still has playbin3.
 STRATEGY_OVERRIDE = os.environ.get("KMS_PLAY_STRATEGY", "").strip()
 #
 # A tier 1 that never reaches PLAYING is treated as a failure too: some broken
@@ -3130,15 +3125,12 @@ class Player:
         self.subtitles = None
         self.osd = None
         self.pipeline = None
-        # Playback route: "playbin3" (default), "playbin" for a GStreamer
-        # without playbin3 (or KMS_PLAY_STRATEGY=playbin), "uridecodebin" only
-        # with KMS_PLAY_STRATEGY=uridecodebin (comparison tool).
+        # Playback route: "playbin3" (default), "playbin" only for a GStreamer
+        # without playbin3, or forced by KMS_PLAY_STRATEGY=playbin.
         self.strategy = "playbin3"
         # Stream ids from the STREAM_COLLECTION bus message, in container
         # order, per kind: playbin3 selects audio with select-streams only.
         self.stream_ids = {"video": [], "audio": [], "text": []}
-        self.audio_selector = None
-        self.audio_pads = []
         self.audio_active = 0
         # Buffers that reached the audio sink: the in-process proof that sound
         # really flows (reported with the stats line).
@@ -3433,8 +3425,6 @@ class Player:
         software=True is tier 2: force-sw-decoders, hardware decoders demoted
         to rank NONE, and a videoconvert bridging the system-memory frames to
         kmssink. Slower, but it plays every codec GStreamer can decode."""
-        if not software and self._needs_uridecodebin():
-            return self.build_pipeline_uridecodebin()
         pipeline = None
         strategy = "playbin3"
         if STRATEGY_OVERRIDE != "playbin":
@@ -3568,232 +3558,6 @@ class Player:
                                 "start": monotonic()}
             pad.add_probe(Gst.PadProbeType.BUFFER, self._on_stats_buffer)
             GLib.timeout_add(int(STATS_WINDOW * 1000), self._stats_report)
-
-    def _needs_uridecodebin(self):
-        """True only when KMS_PLAY_STRATEGY=uridecodebin asks for the manual route.
-
-        playbin3 negotiates the stateless H.264 decoder correctly, which was
-        the only reason this route existed; nothing selects it automatically
-        any more. It stays reachable as a comparison tool, but note its known
-        limit: uridecodebin3 exposes a single audio pad, and select-streams
-        tears that pad down, so a track change is not possible on it."""
-        return STRATEGY_OVERRIDE == "uridecodebin"
-
-    def build_pipeline_uridecodebin(self):
-        """Comparison route, only with KMS_PLAY_STRATEGY=uridecodebin:
-        uridecodebin3 linked by hand to kmssink.
-
-        Only the transport changes. The video pad goes to queue ! kmssink on
-        the selected plane (same sink bin and same probes as the playbin3
-        route); every audio pad gets its own input-selector pad, so a track
-        change is one property write instead of a branch rebuild. Seek,
-        position, duration, EOS and the bus are pipeline-level; subtitles and
-        the OSD never went through playbin3 in the first place.
-
-        Kept because it is the only way to compare the two demuxers on a new
-        file, not as a production route: see _needs_uridecodebin."""
-        pipeline = Gst.Pipeline.new("player")
-        if pipeline is None:
-            die("pipeline unavailable")
-        # Published before any element is added: the audio chain is built from
-        # here (and from the pad-added callback), and both need it.
-        self.pipeline = pipeline
-        src = Gst.ElementFactory.make("uridecodebin3", "src")
-        if src is None:
-            # decodebin3 is what negotiates DMABuf correctly; the legacy
-            # uridecodebin is only a last resort and is expected to fall back
-            # to system memory (one copy) on this board.
-            src = Gst.ElementFactory.make("uridecodebin", "src")
-            log("uridecodebin3 unavailable, falling back to uridecodebin "
-                "(expect a copy before the plane)")
-        if src is None:
-            die("uridecodebin3 unavailable")
-        src.set_property("uri", Gst.filename_to_uri(self.media_path))
-
-        video_description = ("queue ! kmssink plane-id=%d restore-crtc=true"
-                             % self.video_plane)
-        queue = Gst.ElementFactory.make("queue", "video_queue")
-        kmssink = Gst.ElementFactory.make("kmssink", "video_sink")
-        if queue is None or kmssink is None:
-            die("queue/kmssink unavailable")
-        kmssink.set_property("plane-id", self.video_plane)
-        try:
-            kmssink.set_property("restore-crtc", True)
-        except Exception:
-            pass
-
-        pipeline.add(src)
-        pipeline.add(queue)
-        pipeline.add(kmssink)
-        if queue.link(kmssink) != True:
-            die("cannot link the video branch")
-
-        self.audio_selector = None
-        self.audio_pads = []
-        self.audio_active = 0
-        self.volume_element = None
-
-        self.video_sink_bin = queue
-        self.kmssink_element = kmssink
-        try:
-            self.kmssink_element.set_property("force-modesetting", False)
-            log("kmssink: force-modesetting=false (keep the active CRTC mode)")
-        except Exception as exc:
-            log("kmssink: cannot set force-modesetting:", exc)
-
-        src.connect("pad-added", self._on_uri_pad_added)
-        self._attach_video_probes(queue)
-        # The chain is built before PLAYING when the container declares audio:
-        # building it from the pad-added callback is late enough for the
-        # demuxer to see NOT_NEGOTIATED on its audio branch and stop the file.
-        if self.audio:
-            self._build_audio_branch()
-        else:
-            log("audio branch: no audio stream in the container, none built")
-
-        self.strategy = "uridecodebin"
-        self.pipeline = pipeline
-        log("pipeline: %s uri=%s video-sink='%s' audio=selector+%s "
-            "(comparison route, KMS_PLAY_STRATEGY=uridecodebin)"
-            % (src.get_factory().get_name(), self.media_path, video_description,
-               "audioconvert ! volume ! audioresample ! "
-               "pipewiresink|autoaudiosink"))
-
-    def _on_uri_pad_added(self, src, pad):
-        """Link one decoded uridecodebin pad: video to the plane, audio to the
-        selector. Returns nothing; every failure is logged and leaves that
-        stream unlinked, which is exactly what the OSD then reports."""
-        caps = pad.get_current_caps() or pad.query_caps(None)
-        name = ""
-        if caps is not None and caps.get_size():
-            name = caps.get_structure(0).get_name()
-        if name.startswith("video/"):
-            sinkpad = self.video_sink_bin.get_static_pad("sink")
-            # NOTHING: uridecodebin3 exposes a pad before it carries caps, so a
-            # checked link answers NOFORMAT (-4) even though the pads match.
-            if sinkpad is None or pad.link_full(
-                    sinkpad, Gst.PadLinkCheck.NOTHING) != Gst.PadLinkReturn.OK:
-                log("uridecodebin: cannot link video pad (%s)" % (name or "?"))
-                return
-            log("uridecodebin: video pad linked (%s)" % name)
-        elif name.startswith("audio/"):
-            if self.audio_selector is None and not self._build_audio_branch():
-                return
-            target = self.audio_selector.request_pad_simple("sink_%u")
-            if target is None:
-                log("uridecodebin: no free audio selector pad")
-                return
-            result = pad.link_full(target, Gst.PadLinkCheck.NOTHING)
-            if result != Gst.PadLinkReturn.OK:
-                self.audio_selector.release_request_pad(target)
-                log("uridecodebin: cannot link audio pad (%s): %s"
-                    % (name, result))
-                self._drop_audio_branch()
-                return
-            self.audio_pads.append(target)
-            if len(self.audio_pads) == 1:
-                self.audio_selector.set_property("active-pad", target)
-                self.audio_active = 0
-            log("uridecodebin: audio pad %d linked (%s)"
-                % (len(self.audio_pads) - 1, name))
-        else:
-            # Subtitles and anything else: a sink is still needed. An unlinked
-            # pad in decodebin3 blocks its branch and the demuxer then stops
-            # with not-negotiated, taking the whole film with it.
-            dummy = Gst.ElementFactory.make("fakesink", None)
-            if dummy is None:
-                log("uridecodebin: cannot create a sink for pad (%s)" % name)
-                return
-            dummy.set_property("sync", False)
-            dummy.set_property("async", False)
-            self.pipeline.add(dummy)
-            dummy.sync_state_with_parent()
-            result = pad.link_full(dummy.get_static_pad("sink"),
-                                   Gst.PadLinkCheck.NOTHING)
-            if result != Gst.PadLinkReturn.OK:
-                log("uridecodebin: cannot link pad (%s): %s" % (name, result))
-                self.pipeline.remove(dummy)
-                return
-            log("uridecodebin: pad %s discarded into a fakesink" % name)
-
-    def _build_audio_branch(self):
-        """Create the audio chain when the first audio pad appears.
-
-        It is deliberately not built with the pipeline: a sink that no stream
-        feeds never prerolls, and the whole pipeline would then sit in PAUSED
-        while the picture is already up (logged as "tier 1 did not reach
-        PLAYING"). playbin3 removes its audio sink the same way for a file with
-        no audio track."""
-        elements = []
-        # pipewiresink first: the board's audio server is PipeWire, and the
-        # fallback autoaudiosink tries PulseAudio first, which is not reachable
-        # from a session without its environment (SSH): the pad then fails to
-        # negotiate and the whole pipeline errors on the first audio frame.
-        # audioconvert sits *before* volume: decodebin3 hands out a
-        # non-interleaved F32 layout, and volume does not accept it, which
-        # surfaces as not-negotiated at the demuxer (measured).
-        sink_factory = "pipewiresink" if Gst.ElementFactory.find("pipewiresink") \
-            else "autoaudiosink"
-        for factory, name in (("input-selector", "audiosel"),
-                              ("audioconvert", "conv"),
-                              ("volume", "gain"), ("audioresample", "resample"),
-                              (sink_factory, "audio_sink")):
-            element = Gst.ElementFactory.make(factory, name)
-            if element is None:
-                log("audio branch: %s unavailable" % factory)
-                return False
-            elements.append(element)
-        selector, convert, volume, resample, audio_sink = elements
-        for element in elements:
-            self.pipeline.add(element)
-        if (selector.link(convert) != True or convert.link(volume) != True
-                or volume.link(resample) != True
-                or resample.link(audio_sink) != True):
-            log("audio branch: cannot link the chain")
-            return False
-        volume.set_property("volume", self.gain)
-        volume.get_static_pad("sink").add_probe(
-            Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_audio_caps)
-        for element in elements:
-            element.sync_state_with_parent()
-        self.audio_selector = selector
-        self.volume_element = volume
-        log("audio branch: built (%s, input-selector + software gain at %d %%)"
-            % (sink_factory, round(self.gain * 100)))
-        return True
-
-    def _drop_audio_branch(self):
-        """Remove the audio chain when no audio pad could be linked.
-
-        A sink that receives nothing prevents the pipeline from prerolling, so
-        a file whose audio cannot be linked would freeze on the first frame.
-        Removing the chain restarts the video alone, and the OSD reports that
-        there is no audio."""
-        selector = self.audio_selector
-        if selector is None:
-            return
-        self.audio_selector = None
-        self.volume_element = None
-        self.audio_pads = []
-        parent = selector.get_parent()
-        if parent is not None:
-            # The chain is selector -> volume -> convert -> resample -> sink.
-            to_remove = []
-            iterator = parent.iterate_elements()
-            while True:
-                try:
-                    result, element = iterator.next()
-                except Exception:
-                    break
-                if result != Gst.IteratorResult.OK:
-                    break
-                if element.get_name() in ("audiosel", "gain", "conv",
-                                          "resample", "audio_sink"):
-                    to_remove.append(element)
-            for element in to_remove:
-                element.set_state(Gst.State.NULL)
-                parent.remove(element)
-        log("audio branch: removed (no audio pad could be linked)")
 
     def _demote_hardware_decoders(self):
         """Drop every Hardware decoder to rank NONE for the software tier.
@@ -4621,12 +4385,7 @@ class Player:
             self.osd.show(label=tr("osd.no_audio"), right="")
             return
         count = len(self.audio)
-        if self.strategy == "uridecodebin":
-            # Selector pads appear as the streams are linked; the container
-            # count is only the fallback for the label.
-            count = len(self.audio_pads) or count
-            current = self.audio_active
-        elif self.strategy == "playbin3":
+        if self.strategy == "playbin3":
             # No current-audio property on playbin3: the player keeps its own
             # index, in step with the ids of the STREAM_COLLECTION. The
             # collection is authoritative for the number of switchable tracks
@@ -4661,25 +4420,6 @@ class Player:
             # Single track: a switch to itself would rebuild the audio branch
             # for nothing, which is pure risk for no gain.
             log("audio track: only one, no switch")
-            self.osd.show(label=tr("osd.audio", name=label), duration=1.5)
-            return
-        if self.strategy == "uridecodebin":
-            if following >= len(self.audio_pads):
-                log("audio switch: pad %d not linked yet" % following)
-                self.osd.show(label=tr("osd.audio_unavailable"), duration=2.0)
-                return
-            self.audio_previous = current
-            self.audio_switch_at = monotonic()
-            try:
-                self.audio_selector.set_property(
-                    "active-pad", self.audio_pads[following])
-            except Exception as exc:
-                log("audio switch refused:", exc)
-                self.osd.show(label=tr("osd.audio_unavailable"), duration=2.0)
-                self.audio_switch_at = 0.0
-                return
-            self.audio_active = following
-            log("audio track ->", following, "/", count, label, "|", title)
             self.osd.show(label=tr("osd.audio", name=label), duration=1.5)
             return
         if self.strategy == "playbin3":
@@ -4725,10 +4465,6 @@ class Player:
 
         Returns True when the message was absorbed, False when it must still be
         treated as a real error or a real end of stream."""
-        if self.strategy == "uridecodebin":
-            # Switching a selector pad reconfigures nothing: an error or an EOS
-            # inside the grace window is real and must be handled as such.
-            return False
         if not self.audio_switch_at:
             return False
         if monotonic() - self.audio_switch_at > AUDIO_SWITCH_GRACE:

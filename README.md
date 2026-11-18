@@ -333,12 +333,11 @@ seek sent earlier is refused, and one sent inside the preroll window deadlocks t
 pipeline; measured). One attempt only: a second failure stops cleanly with a clear
 message.
 
-playbin3 replaced the hand-linked `uridecodebin3` route on 2026-11-18 and is now the
-single route: `decodebin3` negotiates the same DMABuf link for every codec on this
-board, H.264 included. The manual route stays reachable with
-`KMS_PLAY_STRATEGY=uridecodebin` as a comparison tool — it exposes a single audio pad,
-and `select-streams` tears that pad down, so audio track changes are not possible on it.
-`KMS_PLAY_STRATEGY=playbin` forces the legacy playbin, to compare the two.
+playbin3 is the single route: `decodebin3` negotiates the same DMABuf link to
+`kmssink` for every codec on this board, H.264 included, and its `select-streams` is the
+only mechanism that changes audio track without tearing the pipeline down. `playbin` is
+kept solely as a fallback for a GStreamer without playbin3; `KMS_PLAY_STRATEGY=playbin`
+forces it, to exercise that fallback by hand.
 
 What that means in practice, measured on the board at 1080p unless stated:
 
