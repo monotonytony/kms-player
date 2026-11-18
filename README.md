@@ -314,22 +314,41 @@ conversion — exactly the cost this project exists to avoid.
 
 ## Codecs: hardware first, software as a fallback
 
-Every file is first played on the hardware path: `playbin` → decoder → `kmssink`, with
-the decoder's DMA-BUFs scanned out without a single copy. If that fails — an error, or
-no `PLAYING` state within 12 s — the player rebuilds the pipeline once with software
-decoders (`videoconvert ! kmssink`, hardware decoders demoted to rank `NONE`), seeks back
-to the current position, shows « Décodage logiciel » and keeps going. One attempt only:
-a second failure stops cleanly with a clear message.
+Every file is played through one route: `playbin3` → `decodebin3` → decoder → `kmssink`,
+with the decoder's DMA-BUFs scanned out without a single copy. The flags are
+`VIDEO | AUDIO | TEXT | SOFT_VOLUME | NATIVE_VIDEO` (`0x57`), and each bit matters:
+
+* `NATIVE_VIDEO` keeps playbin3 from inserting its own converter; without it the sink
+  sees `memory:SystemMemory` and every frame crosses the CPU once;
+* `NATIVE_AUDIO` is deliberately **off** — with it the audio branch fails with
+  `not-negotiated` and no sample ever flows (measured);
+* `TEXT` is what makes playbin3 list the text streams in its stream collection; the
+  text-sink is a `fakesink`, because the subtitles are drawn on the player's own plane.
+
+If the hardware path fails — an error, or no `PLAYING` state within 12 s — the player
+rebuilds the pipeline once with software decoders (`videoconvert ! kmssink`, hardware
+decoders demoted to rank `NONE`), shows « Décodage logiciel », and seeks back to the
+position the failed tier had reached **once the first software frame has arrived** (a
+seek sent earlier is refused, and one sent inside the preroll window deadlocks the
+pipeline; measured). One attempt only: a second failure stops cleanly with a clear
+message.
+
+playbin3 replaced the hand-linked `uridecodebin3` route on 2026-11-18 and is now the
+single route: `decodebin3` negotiates the same DMABuf link for every codec on this
+board, H.264 included. The manual route stays reachable with
+`KMS_PLAY_STRATEGY=uridecodebin` as a comparison tool — it exposes a single audio pad,
+and `select-streams` tears that pad down, so audio track changes are not possible on it.
+`KMS_PLAY_STRATEGY=playbin` forces the legacy playbin, to compare the two.
 
 What that means in practice, measured on the board at 1080p unless stated:
 
 | Codec | Tier | CPU |
 |---|---|---|
 | H.265 10-bit, 4K | hardware, zero copy | 0.19 core |
-| AV1 | hardware, zero copy | ~0.06 core |
+| AV1 10-bit, 4K | hardware, zero copy | ~0.06 core |
 | MPEG-2 | hardware, zero copy | ~0.09 core |
 | VP8 | `v4l2slvp8dec` present, not tested | — |
-| H.264 8-bit | software | ~0.57 core |
+| H.264 8-bit, 4K24 | hardware, zero copy (`playbin3`) | ~0.10 core |
 | H.264 High 10 | software | ~0.85 core |
 | VP9 | software (720p) | ~0.31 core |
 
@@ -338,11 +357,31 @@ What that means in practice, measured on the board at 1080p unless stated:
 and `rk3588-av1-vpu-dec`. That is a kernel limitation, not a GStreamer one: there is no
 VP9 decoder element to plug. Playback uses `avdec_vp9` automatically.
 
-**H.264 hardware decoding is blocked by a plugin limitation.** `v4l2slh264dec` refuses to
-negotiate its DMABuf caps with `kmssink` (`DMABuf caps negotiated without the mandatory
-support of VideoMeta`), and forcing system memory is not supported by that decoder. The
-software tier is the answer; details and the failed workarounds are in
-[`src/README.md`](src/README.md#decode-tiers).
+**H.264 hardware works through playbin3 too.** The long-standing conclusion that
+`v4l2slh264dec` cannot hand DMABufs to `kmssink` was true only of the legacy `decodebin2`
+inside playbin: the decoder aborted with `DMABuf caps negotiated without the mandatory
+support of VideoMeta` because `decodebin2` never delivered the sink's allocation query.
+`decodebin3` does deliver it, so the same decoder scans out NV12 DMA-BUF frames on
+plane 57 with no copy at all: measured `video/x-raw format=DMA_DRM drm-format=NV12
+3840x2160 24/1`, feature `memory:DMABuf`. The measurements and the experiments that
+ruled out the other hypotheses are in [`src/README.md`](src/README.md#decode-tiers).
+
+### Audio: one chain, and track changes through `select-streams`
+
+The audio sink is a bin: `audioconvert ! volume name=gain ! audioresample !
+pipewiresink`. `audioconvert` **must** come before `volume`: decodebin3 hands out a
+non-interleaved F32 layout that `volume` refuses, and the refusal surfaces as
+`not-negotiated` at the demuxer — with the filter after the gain, the whole film dies
+on the first audio buffer (measured).
+
+playbin3 has no `current-audio` property and no `n-audio` count (checked with
+`gst-inspect` on GStreamer 1.28). The player therefore reads the `STREAM_COLLECTION`
+bus message, keeps the video, audio and text stream ids in container order, and changes
+track with `Gst.Event.new_select_streams()` carrying **all video ids + the chosen audio
+id + the first text id**. The selection replaces the whole set: a selection built
+without the video ids would disable the picture, so nothing is sent until the
+collection has arrived. The ids are long strings that share a container prefix and
+differ only in their `/NNN:…` suffix, which is what the log prints.
 
 ## Startup banner and information panel
 
@@ -528,6 +567,15 @@ These cost real debugging time; do not rediscover them.
 * **`kmssink` needs a plane that actually accepts the format.** Primary planes on this
   board only do `AR24`; feeding them `NV15` gives `not-negotiated`.
 * **`textoverlay` has no `halign` property**, and is far too slow for 4K anyway.
+* **`audioconvert` must sit before `volume`.** decodebin3 emits a non-interleaved F32
+  layout that `volume` refuses; the error surfaces as `not-negotiated` at the demuxer
+  and the film dies on the first audio buffer.
+* **`NATIVE_AUDIO` (`0x20`) breaks the audio branch.** With it, every buffer is refused
+  with `not-negotiated` and silence follows. Do not set it.
+* **Never seek a freshly rebuilt pipeline.** playbin3 refuses a seek before its sinks
+  are prerolled, and a seek sent in the preroll window deadlocked the pipeline and the
+  main loop (measured on the 4K H.264 film). Seek after the first frame, a short delay
+  later; the same seek then answers in ~80 ms.
 * **PGS (image-based) subtitles cannot be converted to text.** The player selects only
   text subtitle tracks (`subrip`, `ass`, `ssa`, `mov_text`, `webvtt`); PGS tracks are skipped.
 * **A suspended board freezes the display pipeline** (1 fps, Cloudflare loops, etc.).
@@ -553,6 +601,35 @@ These cost real debugging time; do not rediscover them.
 
 Working and installed on the board. The three-plane path, the full keyboard map, the
 cumulative seek ladder and the two independent volumes are implemented and measured.
+
+Since 2026-11-18 the whole player runs on **playbin3** (flags `0x57`), the single route
+for every codec. Verified on the board with the 4K H.264 film and the three 4K samples:
+
+| Check | Result |
+|---|---|
+| 4K H.264 24p | `video/x-raw, format=DMA_DRM, drm-format=NV12, 3840x2160, 24/1`, `memory:DMABuf` |
+| 4K HEVC 10-bit | same, plane scans out `NV15` (10-bit, no conversion) |
+| 4K HEVC 8-bit | same, plane scans out `NV12` (8-bit source stays 8-bit) |
+| 4K HEVC HDR10 | same, plane scans out `NV15` |
+| 4K AVC sample | same, `DMA_DRM` / `NV12` |
+| 4K AV1 10-bit | same, hardware `v4l2slav1dec` |
+| 4K AV1 10-bit HDR10 | same, hardware `v4l2slav1dec`, `NV15` at the plane |
+| Audio | `audio/x-raw 48000 Hz`, PipeWire stream on the EDIFIER M60, ~31 buffers/s |
+| Track FR → EN → FR | `select-streams` on ids `…/002` and `…/003`, label and language correct, video uninterrupted (~24 fps throughout) |
+| Seek ±60 s, pause/resume | seek 13-77 ms, pause and resume clean, subtitles re-sync on their own plane |
+| End of stream | clean EOS, planes released, desktop returned |
+| Software tier | `I420` in system memory, audio and track change still work, resume seek deferred to the first frame |
+
+All seven Jellyfin samples are **video-only** (no audio stream at all): they play,
+seek, pause and reach EOS with `audio_buffers=0`, which is the correct value there, not
+a failure. One of them carries an extra `data` stream, which playbin3 lists in its
+collection and simply does not link — no error, no stall.
+
+**HDR10 is decoded, not converted.** The AV1 and HEVC HDR10 samples decode to `NV15`
+and scan out untouched; the player passes the PQ/BT.2020 signal through and does no
+tone mapping, so the picture is exactly what an HDR-aware panel would get. On an SDR
+screen it looks washed out — that is a known limitation, not a decode failure, and tone
+mapping is tracked as future work (a renderer job, not a decoder one).
 
 Verified from the hardware, not from impressions:
 

@@ -458,25 +458,27 @@ second one is the system level.
 
 The player decodes in two passes, and only the first one is zero copy.
 
-**Tier 1 — hardware, unchanged.** `playbin` picks the highest-ranked decoder and
-`kmssink` takes its DMA-BUFs directly (`video caps: … format=DMA_DRM
-memory=DMABuf`). Nothing is converted, nothing goes through system memory. This is
-the path for everything the kernel really decodes.
+**Tier 1 — hardware, playbin3.** `playbin3` picks the highest-ranked decoder through
+`decodebin3` and `kmssink` takes its DMA-BUFs directly (`video caps: … format=DMA_DRM
+memory=DMABuf`). Nothing is converted, nothing goes through system memory. This is the
+single route for every codec on this board since 2026-11-18, H.264 included.
 
 **Tier 2 — software, on demand.** If tier 1 posts an error (the common one is
 `not-negotiated (-4)`, because a hardware decoder cannot negotiate DMABuf caps with
 `kmssink`) or never reaches `PLAYING` within `FALLBACK_START_TIMEOUT` (12 s), the
-player rebuilds a `playbin` with software decoders and restarts at the position it
-had reached:
+player rebuilds the same playbin3 route with software decoders:
 
-* `video-sink="videoconvert ! kmssink plane-id=57"`, so system-memory frames still
-  scan out on the video plane;
-* `GST_PLAY_FLAG_FORCE_SW_DECODERS` and `force-sw-decoders` on `uridecodebin`;
-* every decoder whose class contains `Hardware` demoted to rank `NONE` — on this
-  GStreamer the first two were not enough, `v4l2slh264dec` (rank 257) was still
-  selected inside `decodebin`, and rank is what auto-plugging obeys;
-* a `FLUSH | KEY_UNIT` seek to the previous position, and the OSD label
-  « Décodage logiciel ».
+* flags `0x1057` (`PLAYBIN3_FLAGS | FORCE_SW_DECODERS`) and
+  `video-sink="queue ! videoconvert ! kmssink plane-id=57"`, so system-memory frames
+  still scan out on the video plane;
+* every decoder whose class contains `Hardware` demoted to rank `NONE` — that is what
+  actually works here: `decodebin3` has **no** `force-sw-decoders` property (checked with
+  `gst-inspect`, GStreamer 1.28), unlike the old `uridecodebin`;
+* a `FLUSH | KEY_UNIT` seek back to the previous position, **deferred to two seconds
+  after the first software frame**: playbin3 refuses a seek before preroll, and a seek
+  sent inside the preroll window froze the pipeline and the main loop (measured). With
+  the delay, the same seek answers in ~80 ms;
+* the OSD label « Décodage logiciel ».
 
 There is exactly one fallback attempt: a second failure stops playback with
 « Lecture impossible » and `decode tier: none (software fallback failed)`. No loop.
@@ -489,17 +491,60 @@ decode tier: software (reason: not-negotiated)
 decode tier: software (confirmed, I420 in system memory)
 ```
 
+### playbin3: the flags, and why each one is there
+
+`PLAYBIN3_FLAGS = 0x57` — `VIDEO (1) | AUDIO (2) | TEXT (4) | SOFT_VOLUME (0x10) |
+NATIVE_VIDEO (0x40)`. Measured on the BPI-M7 with the 4K H.264 film, the 4K HEVC 10-bit
+sample and the 4K AV1 sample:
+
+| Bit | Effect if wrong |
+|---|---|
+| `NATIVE_VIDEO` | without it playbin3 inserts its own converter: the sink sees `memory:SystemMemory`, one copy per frame |
+| `NATIVE_AUDIO` | must stay **off**: with it the audio branch fails with `not-negotiated` and no audio buffer ever flows |
+| `TEXT` | needed for the text streams to appear in `STREAM_COLLECTION`; the text-sink is a `fakesink`, the subtitles are drawn on the "sub" plane |
+| `SOFT_VOLUME` | keeps playsink's software volume; the player's own gain element is inside the audio-sink bin |
+
+The audio sink is the other half of the recipe:
+
+```
+audioconvert ! volume name=gain ! audioresample ! pipewiresink
+```
+
+`audioconvert` **before** `volume`: decodebin3 hands out a non-interleaved F32 layout
+that `volume` refuses, and that refusal surfaced as `not-negotiated` at the demuxer,
+ending the film on its first audio buffer. With this order the sink sees
+`audio/x-raw rate=48000` and buffers flow continuously (counted by a probe on the audio
+bin and reported as `audio_buffers=` in the stats line).
+
+This also explains the earlier "playbin3 fails for H.264" measurement: that test had a
+plain sink on the audio side, so the failure came from the audio branch, not from the
+video decoder. Same decoder, same sink, same zero copy once the audio chain is right.
+
+### Audio track changes: `select-streams`
+
+playbin3 exposes no `current-audio` property and no `n-audio` count. The player reads
+the `STREAM_COLLECTION` bus message, keeps the ids per kind (container order), and
+switches with `Gst.Event.new_select_streams([video ids] + [first text id] + [audio id])`
+sent on the pipeline. The selection **replaces** everything: without the video ids the
+picture would be disabled, so nothing is sent until the collection has arrived. The ids
+are 96-character container ids sharing a prefix, which differ only in their `/NNN:…`
+suffix — the log prints that suffix, and the 4K film's two E-AC-3 tracks read
+`002:…` (French) and `003:…` (English).
+
 ### What lands where on this board (measured)
 
-| Codec | Decoder | Tier | Caps at the sink | CPU, 1080p |
+| Codec | Decoder | Tier | Caps at the sink | CPU (1080p unless stated) |
 |---|---|---|---|---|
 | H.265 10-bit (4K) | `v4l2slh265dec` | hardware | `DMA_DRM` / DMABuf | 0.19 core |
+| H.265 8-bit (4K) | `v4l2slh265dec` | hardware | `DMA_DRM` / DMABuf, plane `NV12` | — |
+| H.265 10-bit HDR10 (4K) | `v4l2slh265dec` | hardware | `DMA_DRM` / DMABuf, plane `NV15` | — |
 | AV1 | `v4l2slav1dec` | hardware | `DMA_DRM` / DMABuf | ~0.06 core |
+| AV1 10-bit, HDR10 (4K) | `v4l2slav1dec` | hardware | `DMA_DRM` / DMABuf, plane `NV15` | — |
 | MPEG-2 | `v4l2slmpeg2dec` | hardware | `DMA_DRM` / DMABuf | ~0.09 core |
 | VP8 | `v4l2slvp8dec` | hardware | `DMA_DRM` / DMABuf | ~0.03 core |
-| H.264 8-bit | `avdec_h264` | software | `I420` / system | ~0.57 core |
+| H.264 8-bit | `v4l2slh264dec` | hardware | `DMA_DRM` / DMABuf | 0.12 core (4K60) |
 | H.264 High 10 | `avdec_h264` | software | `I420_10LE` / system | ~0.85 core |
-| H.264 8-bit, 4K | `avdec_h264` | software | `I420` / system | ~1.4 core (2160p30) |
+| H.264 8-bit, 4K | `v4l2slh264dec` | hardware | `DMA_DRM` / DMABuf | 0.12 core (2160p60) |
 | VP9 | `avdec_vp9` | software | `NV12` / system | ~0.31 core (720p) |
 
 **VP8 is hardware too.** `v4l2slvp8dec` decodes a 1920x1080 clip at `DMA_DRM` in
@@ -507,15 +552,41 @@ zero copy, 0.03 core once running (0.20 at startup), exactly like
 HEVC/AV1/MPEG-2 — tier 1 never falls back and the log confirms
 `decode tier: hardware (zero copy, DMA_DRM -> kmssink)`.
 
-**H.264 4K in software is sustainable, but only just.** A 3840x2160 10 s clip at
-30 fps played from the first frame to EOS in 9.97 s of wall time, i.e. real time,
-with a steady 1.3-1.7 core (average ~1.4). The ceiling was measured separately
-(`avdec_h264 ! videoconvert ! fakesink sync=false`): 300 frames in 3.10 s, so
-~97 fps at 5.1 cores. At 30 fps that leaves roughly a factor of three of headroom,
-which a real 4K film — more entropy, higher bitrate, 60 fps or 10-bit H.264 — will
-consume. 4K H.264 therefore still ends up in the software tier by design (the
-hardware decoder cannot negotiate with `kmssink`), and it is the one case where the
-fallback costs most of a core.
+**H.264 is hardware too, through playbin3.** The old conclusion — that `v4l2slh264dec`
+cannot hand DMABufs to `kmssink` on this board — was only true of the legacy `decodebin2`
+inside playbin, and the culprit was not kmssink. Measured on a 3840x2160 60 fps AVC
+sample (147 Mbit/s):
+
+| Pipeline | Result |
+|---|---|
+| `v4l2slh264dec ! kmssink` | hardware, `DMA_DRM` NV12, plane 57 programmed, 0.10 core |
+| `v4l2slh264dec ! queue ! kmssink` | same, a queue does not break the negotiation |
+| `decodebin ! kmssink`, `decodebin3 ! kmssink`, `uridecodebin ! queue ! kmssink` | hardware, `DMA_DRM` |
+| `uridecodebin3 ! queue ! kmssink` | hardware, `DMA_DRM` |
+| `playbin` (`video-sink=kmssink`), playbin2 **and** `playbin3` with a plain audio sink | **fails**: `not-negotiated`, decoder says `DMABuf caps negotiated without the mandatory support of VideoMeta`, kmssink's `propose_allocation` is never called |
+| `playbin3`, flags `0x57`, audio bin `audioconvert ! volume ! audioresample ! pipewiresink` | **hardware, zero copy**: `video/x-raw format=DMA_DRM drm-format=NV12 3840x2160 24/1`, `memory:DMABuf` |
+
+The decoder and the sink were always compatible. Two things broke the old attempts:
+playbin's own uridecodebin still contains the legacy `decodebin2`, which loses the
+decoder's allocation query (the decoder treats that as fatal for `DMA_DRM` caps instead
+of falling back); and the audio branch of those test pipelines had no `audioconvert`
+before `volume`, so the demuxer died of `not-negotiated` on the first audio buffer and
+took the video with it. With `decodebin3` (playbin3) and the audio chain in the right
+order, the same decoder scans out NV12 DMA-BUF frames on plane 57 with no copy.
+
+For files with no audio track nothing special is needed any more: playbin3 simply never
+creates an audio stream for them and playsink builds no audio sink. Measured with the
+seven video-only Jellyfin samples (H.264, HEVC 8-bit, HEVC 10-bit, HEVC HDR10, AV1
+10-bit, AV1 HDR10): each plays, seeks, pauses and reaches `end of stream (EOS)` with
+`audio_buffers=0` and no error. The HEVC 8-bit sample also carries a `data` stream,
+which playbin3 lists in the collection, never links, and never complains about.
+
+HDR10 is a pass-through: the decoder outputs `NV15`, kmssink scans it out, and the
+PQ/BT.2020 signal reaches the panel untouched. There is no tone mapping — on an SDR
+screen the picture looks washed out, by design rather than by failure.
+
+The software tier remains the answer for H.264 High 10 (no hardware decoder for that
+profile) and VP9.
 
 **VP9 has no hardware decoder on this kernel, and that is a kernel problem, not a
 GStreamer one.** The rkvdec instance does not register (`missing multi-core support,
@@ -526,14 +597,16 @@ decoder can be plugged because there is nothing to plug. Tier 1 already selects
 log says `decode tier: software (reason: no hardware decoder selected, system memory)`
 without any fallback.
 
-**Why H.264 hardware does not work (measured, not guessed).** `v4l2slh264dec` fails in
-`decide_allocation`: `DMABuf caps negotiated without the mandatory support of
-VideoMeta`, then `Failed to negotiate with downstream`. Forcing system-memory caps
-fails earlier (`No support for 1920x1080 format UNKNOWN`), and inserting `v4l2convert`
-— which does fix the chain as far as `fakesink` — still fails once `kmssink` is the
-sink. Making H.264 hardware work would need a `kmssink` that advertises
-`GstVideoMeta` on its `DMA_DRM` pad, i.e. a change in the plugin, not in the player.
-Hence the software tier.
+**The H.264 diagnosis that was wrong, and how it was settled.** `v4l2slh264dec` fails
+inside playbin (legacy `decodebin2`) in `decide_allocation`: `DMABuf caps negotiated
+without the mandatory support of VideoMeta`, then `Failed to negotiate with downstream`.
+That message is a plugin check on the allocation query — it is not a kmssink limitation:
+kmssink does support `GstVideoMeta` (the installed library imports
+`gst_query_add_allocation_meta` and logs `adding GstVideoMeta`), and the decoder's check
+passes whenever the sink is its direct peer. Replacing the transport settles it:
+`decodebin3` — which is what playbin3 builds — negotiates the same decoder to the same
+sink in zero copy. Forcing system-memory caps still fails (`No support for 1920x1080
+format UNKNOWN`), which is why an intermediate `videoconvert` is not a workaround either.
 
 ---
 
@@ -729,12 +802,13 @@ source file carries an SPDX header with the same information.
 
 ## Audio switch resilience
 
-`current-audio` makes playbin rebuild the whole audio branch (decoder, resample,
-sink). On this board that reconfiguration can post **ERROR** or even **EOS** from
-the audio side while the video keeps running perfectly. Ending the film there is
-wrong, so `recover_audio_switch()` catches these messages when they arrive within
-`AUDIO_SWITCH_GRACE` (3 s) of a switch: it restores the previous track, re-anchors
-the pipeline with a seek, shows "Piste audio indisponible" and keeps playing. Two
+A track change reconfigures the audio branch: `current-audio` on playbin,
+`select-streams` on playbin3. On this board that reconfiguration can post **ERROR**
+or even **EOS** from the audio side while the video keeps running perfectly. Ending
+the film there is wrong, so `recover_audio_switch()` catches these messages when they
+arrive within `AUDIO_SWITCH_GRACE` (3 s) of a switch: it restores the previous track
+(another `select-streams` with the previous audio id on playbin3), re-anchors the
+pipeline with a flush seek, shows "Piste audio indisponible" and keeps playing. Two
 attempts maximum, then the message is treated normally.
 
 A file with a single audio track is never reconfigured at all — pressing `A` just
@@ -773,15 +847,17 @@ tier fails too, `decode tier: none (software fallback failed)`.
 
 `KMS_PLAY_FORCE_SOFT_AT=<seconds>` drops to the software tier once playback
 reaches that position. Real H.264 failures happen at 0 s, so this is what
-validates the resume seek:
+validates the resume seek. It has to fire before the watchdog disarms itself, i.e.
+within the first 12 s of playback; 5 works, 20 does not:
 
 ```sh
 KMS_PLAY_FORCE_SOFT_AT=5 kms-play clip.webm   # a hardware codec, e.g. VP8/HEVC
 ```
 
 The log must show `test hook: forcing software tier at 0:05`, `fallback:
-rebuilding playbin with software decoders at 0:05`, then `fallback: seek to
-0:05 -> ok`, then `decode tier: software (confirmed, ...)`, and the video plane
+rebuilding playbin with software decoders at 0:05`, `fallback: resume at 0:05,
+seek deferred to the first frame`, then `decode tier: software (confirmed, ...)`,
+then `fallback: seek to 0:05 -> ok` about two seconds later, and the video plane
 must keep changing framebuffers (`plane[57] fb=`) after the switch.
 
 ## Keyboard layout
